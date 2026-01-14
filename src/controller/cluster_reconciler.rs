@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     controller::{context::Context, error::Error, cluster_state_machine::ClusterStateMachine},
-    crd::{Condition, ValkeyCluster, ValkeyClusterStatus, Phase},
+    crd::{Condition, ValkeyCluster, ValkeyClusterStatus, ClusterPhase, total_pods},
     resources,
 };
 
@@ -55,7 +55,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
         .status
         .as_ref()
         .map(|s| s.phase)
-        .unwrap_or(Phase::Pending);
+        .unwrap_or(ClusterPhase::Pending);
 
     // Check if spec changed
     let observed_gen = obj.status.as_ref().and_then(|s| s.observed_generation);
@@ -76,7 +76,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
 
     // Determine next phase based on current state
     let next_phase = match current_phase {
-        Phase::Pending => {
+        ClusterPhase::Pending => {
             // Validate and start creating
             if let Err(e) = validate_spec(&obj) {
                 error!(name = %name, error = %e, "Validation failed");
@@ -87,7 +87,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     Some(e.to_string()),
                 )
                 .await;
-                update_status(&api, &name, Phase::Failed, 0, Some(&e.to_string())).await?;
+                update_status(&api, &name, ClusterPhase::Failed, 0, Some(&e.to_string())).await?;
                 return Err(e);
             }
             ctx.publish_normal_event(
@@ -97,31 +97,32 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                 Some("Starting resource creation".to_string()),
             )
             .await;
-            Phase::Creating
+            ClusterPhase::Creating
         }
-        Phase::Creating => {
+        ClusterPhase::Creating => {
             // Create owned resources
             create_owned_resources(&obj, &ctx, &namespace).await?;
 
             // Check if resources are ready
             let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
-            if ready_replicas >= obj.spec.replicas {
+            let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+            if ready_replicas >= desired_replicas {
                 ctx.publish_normal_event(
                     &obj,
                     "Ready",
                     "Reconciling",
                     Some(format!(
                         "Resource is ready with {}/{} replicas",
-                        ready_replicas, obj.spec.replicas
+                        ready_replicas, desired_replicas
                     )),
                 )
                 .await;
-                Phase::Running
+                ClusterPhase::Running
             } else {
-                Phase::Creating
+                ClusterPhase::Creating
             }
         }
-        Phase::Running => {
+        ClusterPhase::Running => {
             // Check if update needed
             if spec_changed {
                 ctx.publish_normal_event(
@@ -131,35 +132,37 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     Some("Resource spec changed, applying updates".to_string()),
                 )
                 .await;
-                Phase::Updating
+                ClusterPhase::Updating
             } else {
                 // Ensure resources are in sync
                 create_owned_resources(&obj, &ctx, &namespace).await?;
 
                 let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
-                if ready_replicas < obj.spec.replicas {
+                let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+                if ready_replicas < desired_replicas {
                     ctx.publish_warning_event(
                         &obj,
                         "Degraded",
                         "Reconciling",
                         Some(format!(
                             "Resource degraded: {}/{} replicas ready",
-                            ready_replicas, obj.spec.replicas
+                            ready_replicas, desired_replicas
                         )),
                     )
                     .await;
-                    Phase::Degraded
+                    ClusterPhase::Degraded
                 } else {
-                    Phase::Running
+                    ClusterPhase::Running
                 }
             }
         }
-        Phase::Updating => {
+        ClusterPhase::Updating => {
             // Apply updates
             create_owned_resources(&obj, &ctx, &namespace).await?;
 
             let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
-            if ready_replicas >= obj.spec.replicas {
+            let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+            if ready_replicas >= desired_replicas {
                 ctx.publish_normal_event(
                     &obj,
                     "Updated",
@@ -167,26 +170,27 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     Some("Resource update completed successfully".to_string()),
                 )
                 .await;
-                Phase::Running
+                ClusterPhase::Running
             } else {
-                Phase::Updating
+                ClusterPhase::Updating
             }
         }
-        Phase::Degraded => {
+        ClusterPhase::Degraded => {
             // Check if recovered
             let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
-            if ready_replicas >= obj.spec.replicas {
+            let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+            if ready_replicas >= desired_replicas {
                 ctx.publish_normal_event(
                     &obj,
                     "Recovered",
                     "Reconciling",
                     Some(format!(
                         "Resource recovered: {}/{} replicas ready",
-                        ready_replicas, obj.spec.replicas
+                        ready_replicas, desired_replicas
                     )),
                 )
                 .await;
-                Phase::Running
+                ClusterPhase::Running
             } else if ready_replicas == 0 {
                 ctx.publish_warning_event(
                     &obj,
@@ -195,19 +199,40 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     Some("Resource failed: no replicas available".to_string()),
                 )
                 .await;
-                Phase::Failed
+                ClusterPhase::Failed
             } else {
-                Phase::Degraded
+                ClusterPhase::Degraded
             }
         }
-        Phase::Failed => {
+        ClusterPhase::Initializing => {
+            // Cluster nodes are up, performing CLUSTER MEET
+            // TODO: Implement cluster initialization logic
+            let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
+            let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+            if ready_replicas >= desired_replicas {
+                ClusterPhase::AssigningSlots
+            } else {
+                ClusterPhase::Initializing
+            }
+        }
+        ClusterPhase::AssigningSlots => {
+            // Hash slots are being assigned to masters
+            // TODO: Implement slot assignment logic
+            ClusterPhase::Running
+        }
+        ClusterPhase::Resharding => {
+            // Hash slots are being migrated (scaling operation)
+            // TODO: Implement resharding logic
+            ClusterPhase::Running
+        }
+        ClusterPhase::Failed => {
             // Manual intervention required
             warn!(name = %name, "Resource in Failed state, waiting for intervention");
-            Phase::Failed
+            ClusterPhase::Failed
         }
-        Phase::Deleting => {
+        ClusterPhase::Deleting => {
             // Should be handled by deletion branch above
-            Phase::Deleting
+            ClusterPhase::Deleting
         }
     };
 
@@ -223,24 +248,27 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
     // Record metrics
     if let Some(ref health_state) = ctx.health_state {
         let duration = start_time.elapsed().as_secs_f64();
+        let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
         health_state
             .metrics
             .record_reconcile(&namespace, &name, duration);
         health_state.metrics.set_resource_replicas(
             &namespace,
             &name,
-            i64::from(obj.spec.replicas),
+            i64::from(desired_replicas),
             i64::from(ready_replicas),
         );
     }
 
     // Determine requeue interval based on state
     let requeue_duration = match next_phase {
-        Phase::Running => std::time::Duration::from_secs(60),
-        Phase::Creating | Phase::Updating => std::time::Duration::from_secs(10),
-        Phase::Degraded => std::time::Duration::from_secs(30),
-        Phase::Failed => std::time::Duration::from_secs(300),
-        _ => std::time::Duration::from_secs(30),
+        ClusterPhase::Running => std::time::Duration::from_secs(60),
+        ClusterPhase::Creating | ClusterPhase::Updating => std::time::Duration::from_secs(10),
+        ClusterPhase::Initializing | ClusterPhase::AssigningSlots => std::time::Duration::from_secs(5),
+        ClusterPhase::Resharding => std::time::Duration::from_secs(15),
+        ClusterPhase::Degraded => std::time::Duration::from_secs(30),
+        ClusterPhase::Failed => std::time::Duration::from_secs(300),
+        ClusterPhase::Pending | ClusterPhase::Deleting => std::time::Duration::from_secs(30),
     };
 
     Ok(Action::requeue(requeue_duration))
@@ -272,11 +300,26 @@ pub fn error_policy(obj: Arc<ValkeyCluster>, error: &Error, ctx: Arc<Context>) -
 
 /// Validate the resource spec
 fn validate_spec(obj: &ValkeyCluster) -> Result<(), Error> {
-    if obj.spec.replicas < 1 {
-        return Err(Error::Validation("replicas must be at least 1".to_string()));
+    // Valkey cluster requires minimum 3 masters for proper quorum
+    if obj.spec.masters < 3 {
+        return Err(Error::Validation("masters must be at least 3 for cluster quorum".to_string()));
     }
-    if obj.spec.replicas > 10 {
-        return Err(Error::Validation("replicas cannot exceed 10".to_string()));
+    if obj.spec.masters > 100 {
+        return Err(Error::Validation("masters cannot exceed 100".to_string()));
+    }
+    if obj.spec.replicas_per_master < 0 {
+        return Err(Error::Validation("replicasPerMaster cannot be negative".to_string()));
+    }
+    if obj.spec.replicas_per_master > 5 {
+        return Err(Error::Validation("replicasPerMaster cannot exceed 5".to_string()));
+    }
+    // TLS is required - validate issuer ref
+    if obj.spec.tls.issuer_ref.name.is_empty() {
+        return Err(Error::Validation("tls.issuerRef.name is required".to_string()));
+    }
+    // Auth is required - validate secret ref
+    if obj.spec.auth.secret_ref.name.is_empty() {
+        return Err(Error::Validation("auth.secretRef.name is required".to_string()));
     }
     Ok(())
 }
@@ -408,20 +451,20 @@ async fn check_ready_replicas(
 async fn update_status(
     api: &Api<ValkeyCluster>,
     name: &str,
-    phase: Phase,
+    phase: ClusterPhase,
     ready_replicas: i32,
     error_message: Option<&str>,
 ) -> Result<(), Error> {
     let generation = api.get(name).await?.metadata.generation;
 
-    let conditions = if phase == Phase::Running {
+    let conditions = if phase == ClusterPhase::Running {
         vec![Condition::ready(
             true,
             "AllReplicasReady",
             "All replicas are ready",
             generation,
         )]
-    } else if phase == Phase::Failed {
+    } else if phase == ClusterPhase::Failed {
         vec![Condition::ready(
             false,
             "ReconciliationFailed",
@@ -439,9 +482,17 @@ async fn update_status(
 
     let status = ValkeyClusterStatus {
         phase,
+        ready_nodes: String::new(), // TODO: Calculate properly
+        ready_masters: 0,           // TODO: Calculate properly
         ready_replicas,
+        assigned_slots: String::new(), // TODO: Calculate properly
         observed_generation: generation,
         conditions,
+        topology: None,
+        valkey_version: None,
+        connection_endpoint: None,
+        connection_secret: None,
+        tls_secret: None,
     };
 
     let patch = serde_json::json!({

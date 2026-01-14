@@ -11,7 +11,7 @@ use std::fmt::Debug;
 use std::time::Duration;
 use tokio::time::timeout;
 
-use valkey_operator::crd::{ValkeyCluster, Phase};
+use valkey_operator::crd::{ValkeyCluster, ClusterPhase};
 
 /// Error type for wait operations.
 #[derive(Debug, thiserror::Error)]
@@ -178,7 +178,7 @@ where
 // ============================================================
 
 /// Check if a ValkeyCluster is in a specific phase.
-pub fn is_phase(resource: &ValkeyCluster, phase: Phase) -> bool {
+pub fn is_phase(resource: &ValkeyCluster, phase: ClusterPhase) -> bool {
     resource
         .status
         .as_ref()
@@ -197,10 +197,14 @@ pub fn has_ready_replicas(resource: &ValkeyCluster, count: i32) -> bool {
 
 /// Check if a ValkeyCluster is operational (Running phase with all replicas ready).
 pub fn is_operational(resource: &ValkeyCluster) -> bool {
+    let total_pods = valkey_operator::crd::total_pods(
+        resource.spec.masters,
+        resource.spec.replicas_per_master,
+    );
     resource
         .status
         .as_ref()
-        .map(|s| s.phase == Phase::Running && s.ready_replicas >= resource.spec.replicas)
+        .map(|s| s.phase == ClusterPhase::Running && s.ready_replicas >= total_pods)
         .unwrap_or(false)
 }
 
@@ -216,7 +220,7 @@ pub fn generation_observed(resource: &ValkeyCluster) -> bool {
 pub async fn wait_for_phase(
     api: &Api<ValkeyCluster>,
     name: &str,
-    phase: Phase,
+    phase: ClusterPhase,
     timeout_duration: Duration,
 ) -> Result<ValkeyCluster, WaitError> {
     wait_for_condition(api, name, |r| is_phase(r, phase), timeout_duration).await

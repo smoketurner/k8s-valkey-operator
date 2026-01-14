@@ -3,6 +3,7 @@
 //! This module exports the controller, CRD definitions, and resource generators
 //! for managing Valkey Clusters on Kubernetes.
 
+pub mod client;
 pub mod controller;
 pub mod crd;
 pub mod health;

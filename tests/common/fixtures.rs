@@ -1,8 +1,10 @@
 //! Test fixtures and builder patterns for ValkeyCluster.
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use valkey_operator::crd::{ValkeyCluster, ValkeyClusterSpec};
 use std::collections::BTreeMap;
+use valkey_operator::crd::{
+    AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyCluster, ValkeyClusterSpec,
+};
 
 /// Builder for creating ValkeyCluster test fixtures.
 ///
@@ -10,16 +12,18 @@ use std::collections::BTreeMap;
 /// ```
 /// let resource = ValkeyClusterBuilder::new("test-resource")
 ///     .namespace("test-ns")
-///     .replicas(3)
-///     .message("Hello, World!")
+///     .masters(3)
+///     .replicas_per_master(1)
 ///     .build();
 /// ```
 #[derive(Clone, Debug)]
 pub struct ValkeyClusterBuilder {
     name: String,
     namespace: Option<String>,
-    replicas: i32,
-    message: String,
+    masters: i32,
+    replicas_per_master: i32,
+    issuer_name: String,
+    secret_name: String,
     labels: BTreeMap<String, String>,
     annotations: BTreeMap<String, String>,
     generation: Option<i64>,
@@ -32,8 +36,10 @@ impl ValkeyClusterBuilder {
         Self {
             name: name.into(),
             namespace: None,
-            replicas: 1,
-            message: "Hello from ValkeyCluster".to_string(),
+            masters: 3,
+            replicas_per_master: 1,
+            issuer_name: "test-issuer".to_string(),
+            secret_name: "test-secret".to_string(),
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             generation: None,
@@ -47,15 +53,27 @@ impl ValkeyClusterBuilder {
         self
     }
 
-    /// Set the number of replicas.
-    pub fn replicas(mut self, replicas: i32) -> Self {
-        self.replicas = replicas;
+    /// Set the number of masters.
+    pub fn masters(mut self, masters: i32) -> Self {
+        self.masters = masters;
         self
     }
 
-    /// Set the message field.
-    pub fn message(mut self, message: impl Into<String>) -> Self {
-        self.message = message.into();
+    /// Set the number of replicas per master.
+    pub fn replicas_per_master(mut self, replicas: i32) -> Self {
+        self.replicas_per_master = replicas;
+        self
+    }
+
+    /// Set the cert-manager issuer name.
+    pub fn issuer_name(mut self, name: impl Into<String>) -> Self {
+        self.issuer_name = name.into();
+        self
+    }
+
+    /// Set the auth secret name.
+    pub fn secret_name(mut self, name: impl Into<String>) -> Self {
+        self.secret_name = name.into();
         self
     }
 
@@ -110,9 +128,22 @@ impl ValkeyClusterBuilder {
                 ..Default::default()
             },
             spec: ValkeyClusterSpec {
-                replicas: self.replicas,
-                message: self.message,
-                labels: BTreeMap::new(),
+                masters: self.masters,
+                replicas_per_master: self.replicas_per_master,
+                tls: TlsSpec {
+                    issuer_ref: IssuerRef {
+                        name: self.issuer_name,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                auth: AuthSpec {
+                    secret_ref: SecretKeyRef {
+                        name: self.secret_name,
+                        ..Default::default()
+                    },
+                },
+                ..Default::default()
             },
             status: None,
         }
@@ -134,7 +165,8 @@ pub fn minimal_resource(name: &str) -> ValkeyCluster {
 pub fn test_resource(name: &str, namespace: &str) -> ValkeyCluster {
     ValkeyClusterBuilder::new(name)
         .namespace(namespace)
-        .replicas(1)
+        .masters(3)
+        .replicas_per_master(1)
         .generation(1)
         .uid(format!("test-uid-{}", name))
         .build()
@@ -148,21 +180,22 @@ mod tests {
     fn test_builder_defaults() {
         let resource = ValkeyClusterBuilder::new("test").build();
         assert_eq!(resource.metadata.name, Some("test".to_string()));
-        assert_eq!(resource.spec.replicas, 1);
+        assert_eq!(resource.spec.masters, 3);
+        assert_eq!(resource.spec.replicas_per_master, 1);
     }
 
     #[test]
     fn test_builder_with_options() {
         let resource = ValkeyClusterBuilder::new("test")
             .namespace("my-ns")
-            .replicas(3)
-            .message("Custom message")
+            .masters(6)
+            .replicas_per_master(2)
             .label("app", "test")
             .build();
 
         assert_eq!(resource.metadata.namespace, Some("my-ns".to_string()));
-        assert_eq!(resource.spec.replicas, 3);
-        assert_eq!(resource.spec.message, "Custom message");
+        assert_eq!(resource.spec.masters, 6);
+        assert_eq!(resource.spec.replicas_per_master, 2);
         assert!(resource.metadata.labels.is_some());
     }
 }

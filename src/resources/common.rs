@@ -2,6 +2,9 @@
 //!
 //! Provides functions for creating standard Kubernetes resources with proper
 //! labels, owner references, and configurations.
+//!
+//! NOTE: This is a placeholder implementation. Phase 6 will replace Deployment
+//! with StatefulSet and add proper Valkey cluster configuration.
 
 use k8s_openapi::api::{
     apps::v1::Deployment,
@@ -11,7 +14,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
 use std::collections::BTreeMap;
 
-use crate::crd::ValkeyCluster;
+use crate::crd::{ValkeyCluster, total_pods};
 
 /// Standard labels applied to all managed resources
 pub fn standard_labels(resource: &ValkeyCluster) -> BTreeMap<String, String> {
@@ -47,6 +50,8 @@ pub fn owner_reference(resource: &ValkeyCluster) -> OwnerReference {
 }
 
 /// Generate a ConfigMap for a ValkeyCluster
+///
+/// NOTE: In Phase 6, this will be replaced with configuration via VALKEY_EXTRA_FLAGS env var.
 pub fn generate_configmap(resource: &ValkeyCluster) -> ConfigMap {
     let name = resource.name_any();
     let labels = standard_labels(resource);
@@ -61,8 +66,15 @@ pub fn generate_configmap(resource: &ValkeyCluster) -> ConfigMap {
         },
         data: Some({
             let mut data = BTreeMap::new();
-            data.insert("message".to_string(), resource.spec.message.clone());
-            data.insert("replicas".to_string(), resource.spec.replicas.to_string());
+            data.insert("masters".to_string(), resource.spec.masters.to_string());
+            data.insert(
+                "replicas_per_master".to_string(),
+                resource.spec.replicas_per_master.to_string(),
+            );
+            data.insert(
+                "total_pods".to_string(),
+                total_pods(resource.spec.masters, resource.spec.replicas_per_master).to_string(),
+            );
             data
         }),
         ..Default::default()
@@ -70,10 +82,12 @@ pub fn generate_configmap(resource: &ValkeyCluster) -> ConfigMap {
 }
 
 /// Generate a Deployment for a ValkeyCluster
+///
+/// NOTE: Phase 6 will replace this with a StatefulSet for proper Valkey cluster operation.
 pub fn generate_deployment(resource: &ValkeyCluster) -> Deployment {
     let name = resource.name_any();
     let labels = standard_labels(resource);
-    let replicas = resource.spec.replicas;
+    let replicas = total_pods(resource.spec.masters, resource.spec.replicas_per_master);
 
     Deployment {
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
@@ -100,32 +114,36 @@ pub fn generate_deployment(resource: &ValkeyCluster) -> Deployment {
                 }),
                 spec: Some(k8s_openapi::api::core::v1::PodSpec {
                     containers: vec![k8s_openapi::api::core::v1::Container {
-                        name: "main".to_string(),
-                        // Use a simple nginx image as placeholder
-                        image: Some("nginx:alpine".to_string()),
-                        ports: Some(vec![k8s_openapi::api::core::v1::ContainerPort {
-                            container_port: 80,
-                            name: Some("http".to_string()),
-                            ..Default::default()
-                        }]),
-                        env: Some(vec![k8s_openapi::api::core::v1::EnvVar {
-                            name: "MESSAGE".to_string(),
-                            value: Some(resource.spec.message.clone()),
-                            ..Default::default()
-                        }]),
+                        name: "valkey".to_string(),
+                        image: Some(format!(
+                            "{}:{}",
+                            resource.spec.image.repository, resource.spec.image.tag
+                        )),
+                        ports: Some(vec![
+                            k8s_openapi::api::core::v1::ContainerPort {
+                                container_port: 6379,
+                                name: Some("client".to_string()),
+                                ..Default::default()
+                            },
+                            k8s_openapi::api::core::v1::ContainerPort {
+                                container_port: 16379,
+                                name: Some("cluster-bus".to_string()),
+                                ..Default::default()
+                            },
+                        ]),
                         resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
                             limits: Some({
                                 let mut limits = BTreeMap::new();
                                 limits.insert(
                                     "cpu".to_string(),
                                     k8s_openapi::apimachinery::pkg::api::resource::Quantity(
-                                        "100m".to_string(),
+                                        resource.spec.resources.limits.cpu.clone(),
                                     ),
                                 );
                                 limits.insert(
                                     "memory".to_string(),
                                     k8s_openapi::apimachinery::pkg::api::resource::Quantity(
-                                        "128Mi".to_string(),
+                                        resource.spec.resources.limits.memory.clone(),
                                     ),
                                 );
                                 limits
@@ -135,13 +153,13 @@ pub fn generate_deployment(resource: &ValkeyCluster) -> Deployment {
                                 requests.insert(
                                     "cpu".to_string(),
                                     k8s_openapi::apimachinery::pkg::api::resource::Quantity(
-                                        "50m".to_string(),
+                                        resource.spec.resources.requests.cpu.clone(),
                                     ),
                                 );
                                 requests.insert(
                                     "memory".to_string(),
                                     k8s_openapi::apimachinery::pkg::api::resource::Quantity(
-                                        "64Mi".to_string(),
+                                        resource.spec.resources.requests.memory.clone(),
                                     ),
                                 );
                                 requests
@@ -150,7 +168,7 @@ pub fn generate_deployment(resource: &ValkeyCluster) -> Deployment {
                         }),
                         security_context: Some(k8s_openapi::api::core::v1::SecurityContext {
                             allow_privilege_escalation: Some(false),
-                            read_only_root_filesystem: Some(true),
+                            read_only_root_filesystem: Some(false), // Valkey needs /data
                             run_as_non_root: Some(true),
                             capabilities: Some(k8s_openapi::api::core::v1::Capabilities {
                                 drop: Some(vec!["ALL".to_string()]),
@@ -162,8 +180,8 @@ pub fn generate_deployment(resource: &ValkeyCluster) -> Deployment {
                     }],
                     security_context: Some(k8s_openapi::api::core::v1::PodSecurityContext {
                         run_as_non_root: Some(true),
-                        run_as_user: Some(1000),
-                        fs_group: Some(1000),
+                        run_as_user: Some(999), // Valkey user
+                        fs_group: Some(999),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -196,13 +214,13 @@ pub fn generate_service(resource: &ValkeyCluster) -> Service {
                 selector
             }),
             ports: Some(vec![k8s_openapi::api::core::v1::ServicePort {
-                port: 80,
+                port: 6379,
                 target_port: Some(
                     k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(
-                        "http".to_string(),
+                        "client".to_string(),
                     ),
                 ),
-                name: Some("http".to_string()),
+                name: Some("client".to_string()),
                 ..Default::default()
             }]),
             ..Default::default()

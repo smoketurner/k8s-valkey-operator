@@ -208,10 +208,11 @@ mod tests {
     use super::*;
     use crate::crd::{ValkeyCluster, ValkeyClusterSpec};
     use crate::webhooks::policies::ValidationContext;
+    use crate::crd::{TlsSpec, AuthSpec, IssuerRef, SecretKeyRef};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::collections::BTreeMap;
 
-    fn create_resource(replicas: i32, message: &str) -> ValkeyCluster {
+    fn create_resource(masters: i32) -> ValkeyCluster {
         ValkeyCluster {
             metadata: ObjectMeta {
                 name: Some("test".to_string()),
@@ -220,9 +221,23 @@ mod tests {
                 ..Default::default()
             },
             spec: ValkeyClusterSpec {
-                replicas,
-                message: message.to_string(),
+                masters,
+                replicas_per_master: 1,
+                tls: TlsSpec {
+                    issuer_ref: IssuerRef {
+                        name: "test-issuer".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                auth: AuthSpec {
+                    secret_ref: SecretKeyRef {
+                        name: "test-secret".to_string(),
+                        ..Default::default()
+                    },
+                },
                 labels: BTreeMap::new(),
+                ..Default::default()
             },
             status: None,
         }
@@ -230,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_valid_create_request() {
-        let resource = create_resource(3, "test");
+        let resource = create_resource(3);
         let ctx = ValidationContext {
             resource: &resource,
             old_resource: None,
@@ -243,8 +258,8 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_replicas_on_create() {
-        let resource = create_resource(0, "test");
+    fn test_invalid_masters_on_create() {
+        let resource = create_resource(2); // Below minimum of 3
         let ctx = ValidationContext {
             resource: &resource,
             old_resource: None,
@@ -258,8 +273,8 @@ mod tests {
 
     #[test]
     fn test_valid_update_request() {
-        let old = create_resource(2, "old");
-        let new = create_resource(3, "new");
+        let old = create_resource(3);
+        let new = create_resource(6);
         let ctx = ValidationContext {
             resource: &new,
             old_resource: Some(&old),
@@ -272,9 +287,9 @@ mod tests {
     }
 
     #[test]
-    fn test_scale_to_zero_on_update() {
-        let old = create_resource(2, "old");
-        let new = create_resource(0, "new");
+    fn test_scale_below_minimum_on_update() {
+        let old = create_resource(3);
+        let new = create_resource(2);
         let ctx = ValidationContext {
             resource: &new,
             old_resource: Some(&old),
@@ -284,7 +299,7 @@ mod tests {
 
         let result = validate_all(&ctx);
         assert!(!result.allowed);
-        // Tier 1 (replicas) policy rejects this before Tier 2 (immutability) runs
+        // Tier 1 (masters) policy rejects this before Tier 2 (immutability) runs
         assert!(result.message.unwrap().contains("at least"));
     }
 }

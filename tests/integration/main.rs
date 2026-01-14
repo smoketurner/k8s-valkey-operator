@@ -98,7 +98,7 @@ async fn test_valkeycluster_lifecycle() {
 
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), test_ns.name());
 
-    // Create a ValkeyCluster
+    // Create a ValkeyCluster with the new spec structure
     let resource = serde_json::from_value(serde_json::json!({
         "apiVersion": "valkeyoperator.smoketurner.com/v1alpha1",
         "kind": "ValkeyCluster",
@@ -106,8 +106,18 @@ async fn test_valkeycluster_lifecycle() {
             "name": "test-resource"
         },
         "spec": {
-            "replicas": 1,
-            "message": "Hello from integration test"
+            "masters": 3,
+            "replicasPerMaster": 1,
+            "tls": {
+                "issuerRef": {
+                    "name": "test-issuer"
+                }
+            },
+            "auth": {
+                "secretRef": {
+                    "name": "test-secret"
+                }
+            }
         }
     }))
     .expect("Failed to parse ValkeyCluster");
@@ -118,7 +128,8 @@ async fn test_valkeycluster_lifecycle() {
         .expect("Failed to create ValkeyCluster");
 
     assert_eq!(created.metadata.name, Some("test-resource".to_string()));
-    assert_eq!(created.spec.replicas, 1);
+    assert_eq!(created.spec.masters, 3);
+    assert_eq!(created.spec.replicas_per_master, 1);
 
     // Clean up happens automatically when test_ns is dropped
 }

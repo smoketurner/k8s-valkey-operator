@@ -7,14 +7,14 @@ use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::Client;
 use kube::api::Api;
 
-use valkey_operator::crd::{ValkeyCluster, Phase};
+use valkey_operator::crd::{ValkeyCluster, ClusterPhase};
 
 /// Assert that a ValkeyCluster exists and has the expected phase.
 pub async fn assert_valkeycluster_phase(
     client: Client,
     namespace: &str,
     name: &str,
-    expected_phase: Phase,
+    expected_phase: ClusterPhase,
 ) {
     let api: Api<ValkeyCluster> = Api::namespaced(client, namespace);
     let resource = api
@@ -37,7 +37,7 @@ pub async fn assert_valkeycluster_phase(
 
 /// Assert that a ValkeyCluster is in the Ready phase.
 pub async fn assert_valkeycluster_ready(client: Client, namespace: &str, name: &str) {
-    assert_valkeycluster_phase(client, namespace, name, Phase::Running).await;
+    assert_valkeycluster_phase(client, namespace, name, ClusterPhase::Running).await;
 }
 
 /// Assert that a Deployment exists with expected replica count.

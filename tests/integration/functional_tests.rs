@@ -11,18 +11,18 @@ use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::api::{Api, Patch, PatchParams, PostParams};
 
-use valkey_operator::crd::{ValkeyCluster, Phase};
+use valkey_operator::crd::{ClusterPhase, ValkeyCluster};
 
 use crate::assertions::{
     assert_configmap_has_key, assert_deployment_replicas, assert_has_owner_reference,
-    assert_valkeycluster_phase, assert_service_exists,
+    assert_service_exists, assert_valkeycluster_phase,
 };
 use crate::namespace::TestNamespace;
 use crate::wait::{wait_for_condition, wait_for_operational, wait_for_phase};
 use crate::{init_test, wait};
 
-/// Helper to create a test ValkeyCluster.
-fn test_resource(name: &str, replicas: i32, message: &str) -> ValkeyCluster {
+/// Helper to create a test ValkeyCluster with the new spec structure.
+fn test_resource(name: &str, masters: i32, replicas_per_master: i32) -> ValkeyCluster {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "valkeyoperator.smoketurner.com/v1alpha1",
         "kind": "ValkeyCluster",
@@ -30,8 +30,18 @@ fn test_resource(name: &str, replicas: i32, message: &str) -> ValkeyCluster {
             "name": name
         },
         "spec": {
-            "replicas": replicas,
-            "message": message
+            "masters": masters,
+            "replicasPerMaster": replicas_per_master,
+            "tls": {
+                "issuerRef": {
+                    "name": "test-issuer"
+                }
+            },
+            "auth": {
+                "secretRef": {
+                    "name": "test-secret"
+                }
+            }
         }
     }))
     .expect("Failed to create test resource")
@@ -48,8 +58,8 @@ async fn test_creates_deployment() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create resource
-    let resource = test_resource("test-deploy", 1, "test message");
+    // Create resource with 3 masters and 1 replica per master = 6 total pods
+    let resource = test_resource("test-deploy", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -58,7 +68,7 @@ async fn test_creates_deployment() {
     wait_for_phase(
         &api,
         "test-deploy",
-        Phase::Creating,
+        ClusterPhase::Creating,
         Duration::from_secs(30),
     )
     .await
@@ -69,8 +79,8 @@ async fn test_creates_deployment() {
         .await
         .expect("Deployment should be created");
 
-    // Verify deployment properties
-    assert_deployment_replicas(client.clone(), &ns_name, "test-deploy", 1).await;
+    // Verify deployment properties (3 masters + 3 replicas = 6 pods)
+    assert_deployment_replicas(client.clone(), &ns_name, "test-deploy", 6).await;
 
     // Verify owner reference
     let deployment = deploy_api.get("test-deploy").await.unwrap();
@@ -89,7 +99,7 @@ async fn test_creates_configmap() {
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
-    let resource = test_resource("test-cm", 1, "hello world");
+    let resource = test_resource("test-cm", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -99,8 +109,10 @@ async fn test_creates_configmap() {
         .await
         .expect("ConfigMap should be created");
 
-    // Verify configmap has expected keys
-    assert_configmap_has_key(client.clone(), &ns_name, "test-cm", "message").await;
+    // Verify configmap has expected keys (masters, replicas_per_master, total_pods)
+    assert_configmap_has_key(client.clone(), &ns_name, "test-cm", "masters").await;
+    assert_configmap_has_key(client.clone(), &ns_name, "test-cm", "replicas_per_master").await;
+    assert_configmap_has_key(client.clone(), &ns_name, "test-cm", "total_pods").await;
 
     // Verify owner reference
     let configmap = cm_api.get("test-cm").await.unwrap();
@@ -119,7 +131,7 @@ async fn test_creates_service() {
     let svc_api: Api<Service> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
-    let resource = test_resource("test-svc", 1, "service test");
+    let resource = test_resource("test-svc", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -148,7 +160,7 @@ async fn test_resource_becomes_running() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
-    let resource = test_resource("test-running", 1, "running test");
+    let resource = test_resource("test-running", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -159,7 +171,8 @@ async fn test_resource_becomes_running() {
         .expect("Resource should become operational");
 
     // Verify final state
-    assert_valkeycluster_phase(client.clone(), &ns_name, "test-running", Phase::Running).await;
+    assert_valkeycluster_phase(client.clone(), &ns_name, "test-running", ClusterPhase::Running)
+        .await;
 }
 
 /// Test that updating a ValkeyCluster spec triggers reconciliation.
@@ -173,8 +186,8 @@ async fn test_spec_update() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create resource
-    let resource = test_resource("test-update", 1, "original message");
+    // Create resource with 3 masters
+    let resource = test_resource("test-update", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -184,10 +197,22 @@ async fn test_spec_update() {
         .await
         .expect("Resource should become operational");
 
-    // Update the message
+    // Verify initial ConfigMap
+    let configmap = cm_api
+        .get("test-update")
+        .await
+        .expect("ConfigMap should exist");
+    let masters = configmap
+        .data
+        .as_ref()
+        .and_then(|d| d.get("masters"))
+        .expect("ConfigMap should have masters key");
+    assert_eq!(masters, "3", "Initial masters should be 3");
+
+    // Update to 6 masters (scale up)
     let patch = serde_json::json!({
         "spec": {
-            "message": "updated message"
+            "masters": 6
         }
     });
     api.patch(
@@ -201,21 +226,18 @@ async fn test_spec_update() {
     // Wait for the update to be processed
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Verify ConfigMap was updated with new message
+    // Verify ConfigMap was updated with new masters count
     let configmap = cm_api
         .get("test-update")
         .await
         .expect("ConfigMap should exist");
-    let message = configmap
+    let masters = configmap
         .data
         .as_ref()
-        .and_then(|d| d.get("message"))
-        .expect("ConfigMap should have message key");
+        .and_then(|d| d.get("masters"))
+        .expect("ConfigMap should have masters key");
 
-    assert_eq!(
-        message, "updated message",
-        "ConfigMap should have updated message"
-    );
+    assert_eq!(masters, "6", "ConfigMap should have updated masters count");
 }
 
 /// Test that deleting a ValkeyCluster triggers cleanup.
@@ -230,7 +252,7 @@ async fn test_resource_deletion() {
     let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
-    let resource = test_resource("test-delete", 1, "deletion test");
+    let resource = test_resource("test-delete", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -260,18 +282,18 @@ async fn test_resource_deletion() {
     );
 }
 
-/// Test that validation rejects invalid replica counts.
+/// Test that validation rejects invalid master counts.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
-async fn test_validation_rejects_invalid_replicas() {
+async fn test_validation_rejects_invalid_masters() {
     let (_cluster, client) = init_test().await;
     let test_ns = TestNamespace::create(client.clone(), "validation-test").await;
     let ns_name = test_ns.name().to_string();
 
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
-    // Try to create resource with invalid replicas (0)
-    let invalid_resource = test_resource("invalid-replicas", 0, "should fail");
+    // Try to create resource with invalid masters count (2 < minimum of 3)
+    let invalid_resource = test_resource("invalid-masters", 2, 1);
     let result = api.create(&PostParams::default(), &invalid_resource).await;
 
     // The resource might be created but should transition to Failed phase
@@ -280,11 +302,11 @@ async fn test_validation_rejects_invalid_replicas() {
         // If created, wait for it to reach Failed phase
         let resource = wait_for_condition(
             &api,
-            "invalid-replicas",
+            "invalid-masters",
             |r| {
                 r.status
                     .as_ref()
-                    .map(|s| s.phase == Phase::Failed)
+                    .map(|s| s.phase == ClusterPhase::Failed)
                     .unwrap_or(false)
             },
             Duration::from_secs(30),
@@ -294,8 +316,8 @@ async fn test_validation_rejects_invalid_replicas() {
 
         assert_eq!(
             resource.status.as_ref().map(|s| s.phase),
-            Some(Phase::Failed),
-            "Resource with invalid replicas should be in Failed phase"
+            Some(ClusterPhase::Failed),
+            "Resource with invalid masters should be in Failed phase"
         );
     }
     // If rejected by webhook, the test passes (validation worked)

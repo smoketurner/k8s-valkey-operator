@@ -4,9 +4,10 @@
 //!
 //! Validates:
 //! - Certain fields cannot be changed after creation
-//! - Prevents scaling to zero from a running state
+//! - Prevents scaling masters to below minimum
 
 use super::{ValidationContext, ValidationResult};
+use crate::controller::cluster_validation::MIN_MASTERS;
 
 /// Validate immutability constraints on UPDATE operations
 pub fn validate(ctx: &ValidationContext<'_>) -> ValidationResult {
@@ -17,16 +18,32 @@ pub fn validate(ctx: &ValidationContext<'_>) -> ValidationResult {
 
     let new = ctx.resource;
 
-    // Prevent scaling from non-zero to zero
-    if old.spec.replicas > 0 && new.spec.replicas == 0 {
+    // Prevent scaling masters below minimum
+    if old.spec.masters >= MIN_MASTERS && new.spec.masters < MIN_MASTERS {
         return ValidationResult::denied(
             "InvalidScaleDown",
-            "Cannot scale down from a running state to 0 replicas. Delete the resource instead.",
+            &format!(
+                "Cannot scale down masters below {} (cluster quorum requirement). Delete the resource instead.",
+                MIN_MASTERS
+            ),
         );
     }
 
-    // Example: Add more immutability checks here
-    // For instance, preventing changes to certain labels or annotations
+    // Prevent changing TLS issuer (would require certificate rotation)
+    if old.spec.tls.issuer_ref.name != new.spec.tls.issuer_ref.name {
+        return ValidationResult::denied(
+            "ImmutableField",
+            "tls.issuerRef.name cannot be changed after creation. Delete and recreate the cluster.",
+        );
+    }
+
+    // Prevent changing auth secret reference (would require credential rotation)
+    if old.spec.auth.secret_ref.name != new.spec.auth.secret_ref.name {
+        return ValidationResult::denied(
+            "ImmutableField",
+            "auth.secretRef.name cannot be changed after creation. Delete and recreate the cluster.",
+        );
+    }
 
     ValidationResult::allowed()
 }
@@ -35,11 +52,11 @@ pub fn validate(ctx: &ValidationContext<'_>) -> ValidationResult {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::crd::{ValkeyCluster, ValkeyClusterSpec};
+    use crate::crd::{ValkeyCluster, ValkeyClusterSpec, TlsSpec, AuthSpec, IssuerRef, SecretKeyRef};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::collections::BTreeMap;
 
-    fn create_resource(replicas: i32) -> ValkeyCluster {
+    fn create_resource(masters: i32) -> ValkeyCluster {
         ValkeyCluster {
             metadata: ObjectMeta {
                 name: Some("test".to_string()),
@@ -47,9 +64,23 @@ mod tests {
                 ..Default::default()
             },
             spec: ValkeyClusterSpec {
-                replicas,
-                message: "test".to_string(),
+                masters,
+                replicas_per_master: 1,
+                tls: TlsSpec {
+                    issuer_ref: IssuerRef {
+                        name: "test-issuer".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                auth: AuthSpec {
+                    secret_ref: SecretKeyRef {
+                        name: "test-secret".to_string(),
+                        ..Default::default()
+                    },
+                },
                 labels: BTreeMap::new(),
+                ..Default::default()
             },
             status: None,
         }
@@ -57,8 +88,8 @@ mod tests {
 
     #[test]
     fn test_valid_update() {
-        let old = create_resource(2);
-        let new = create_resource(3);
+        let old = create_resource(3);
+        let new = create_resource(6);
 
         let ctx = ValidationContext {
             resource: &new,
@@ -72,9 +103,9 @@ mod tests {
     }
 
     #[test]
-    fn test_scale_to_zero_denied() {
-        let old = create_resource(2);
-        let new = create_resource(0);
+    fn test_scale_below_minimum_denied() {
+        let old = create_resource(3);
+        let new = create_resource(2);
 
         let ctx = ValidationContext {
             resource: &new,
@@ -89,9 +120,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_allows_zero() {
+    fn test_create_allows_any() {
         // On CREATE, there's no old_resource
-        let new = create_resource(0);
+        let new = create_resource(3);
 
         let ctx = ValidationContext {
             resource: &new,
@@ -100,7 +131,6 @@ mod tests {
             namespace: Some("default"),
         };
 
-        // Immutability policy allows this (replicas policy will catch it)
         let result = validate(&ctx);
         assert!(result.allowed);
     }
