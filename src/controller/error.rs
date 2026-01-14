@@ -31,6 +31,14 @@ pub enum Error {
     /// Serialization error
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// Valkey client error
+    #[error("Valkey error: {0}")]
+    Valkey(String),
+
+    /// Timeout error
+    #[error("Timeout: {0}")]
+    Timeout(String),
 }
 
 impl Error {
@@ -50,6 +58,7 @@ impl Error {
                 ) || matches!(e, kube::Error::Service(_))
             }
             Error::Transient(_) => true,
+            Error::Valkey(_) | Error::Timeout(_) => true, // Valkey errors are typically transient
             Error::Validation(_) | Error::Permanent(_) | Error::MissingField(_) => false,
             Error::Serialization(_) => false,
         }
