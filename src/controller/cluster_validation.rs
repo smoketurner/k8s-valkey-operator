@@ -1,4 +1,4 @@
-//! Validation logic for MyResource spec changes.
+//! Validation logic for ValkeyCluster spec changes.
 //!
 //! This module provides validation for spec changes, including:
 //! - Replica count validation
@@ -6,7 +6,7 @@
 //! - Immutable field changes
 
 use crate::controller::error::{Error, Result};
-use crate::crd::MyResource;
+use crate::crd::ValkeyCluster;
 
 /// Minimum number of replicas
 pub const MIN_REPLICAS: i32 = 1;
@@ -15,14 +15,14 @@ pub const MIN_REPLICAS: i32 = 1;
 pub const MAX_REPLICAS: i32 = 10;
 
 /// Validate the resource spec
-pub fn validate_spec(resource: &MyResource) -> Result<()> {
+pub fn validate_spec(resource: &ValkeyCluster) -> Result<()> {
     validate_replicas(resource)?;
     validate_message(resource)?;
     Ok(())
 }
 
 /// Validate replica count
-fn validate_replicas(resource: &MyResource) -> Result<()> {
+fn validate_replicas(resource: &ValkeyCluster) -> Result<()> {
     let replicas = resource.spec.replicas;
 
     if replicas < MIN_REPLICAS {
@@ -43,7 +43,7 @@ fn validate_replicas(resource: &MyResource) -> Result<()> {
 }
 
 /// Validate message (basic check)
-fn validate_message(resource: &MyResource) -> Result<()> {
+fn validate_message(resource: &ValkeyCluster) -> Result<()> {
     // Message can be empty, but if provided, check reasonable length
     if resource.spec.message.len() > 1024 {
         return Err(Error::Validation(
@@ -94,7 +94,7 @@ impl SpecDiff {
 }
 
 /// Validate spec changes between old and new resource specs
-pub fn validate_spec_change(old: &MyResource, new: &MyResource) -> Result<SpecDiff> {
+pub fn validate_spec_change(old: &ValkeyCluster, new: &ValkeyCluster) -> Result<SpecDiff> {
     let old_spec = &old.spec;
     let new_spec = &new.spec;
 
@@ -120,7 +120,7 @@ pub fn validate_spec_change(old: &MyResource, new: &MyResource) -> Result<SpecDi
 }
 
 /// Validate scale down operation
-fn validate_scale_down(old: &MyResource, new: &MyResource) -> Result<()> {
+fn validate_scale_down(old: &ValkeyCluster, new: &ValkeyCluster) -> Result<()> {
     let new_replicas = new.spec.replicas;
 
     // Ensure we don't go below minimum
@@ -147,7 +147,7 @@ fn validate_scale_down(old: &MyResource, new: &MyResource) -> Result<()> {
 }
 
 /// Check if generation has changed (spec update)
-pub fn generation_changed(resource: &MyResource) -> bool {
+pub fn generation_changed(resource: &ValkeyCluster) -> bool {
     let generation = resource.metadata.generation;
     let observed = resource.status.as_ref().and_then(|s| s.observed_generation);
 
@@ -162,24 +162,24 @@ pub fn generation_changed(resource: &MyResource) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::crd::{MyResourceSpec, MyResourceStatus};
+    use crate::crd::{ValkeyClusterSpec, ValkeyClusterStatus};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::collections::BTreeMap;
 
-    fn create_test_resource(replicas: i32, message: &str) -> MyResource {
-        MyResource {
+    fn create_test_resource(replicas: i32, message: &str) -> ValkeyCluster {
+        ValkeyCluster {
             metadata: ObjectMeta {
                 name: Some("test".to_string()),
                 namespace: Some("default".to_string()),
                 generation: Some(1),
                 ..Default::default()
             },
-            spec: MyResourceSpec {
+            spec: ValkeyClusterSpec {
                 replicas,
                 message: message.to_string(),
                 labels: BTreeMap::new(),
             },
-            status: Some(MyResourceStatus::default()),
+            status: Some(ValkeyClusterStatus::default()),
         }
     }
 
@@ -259,7 +259,7 @@ mod tests {
     fn test_generation_changed() {
         let mut resource = create_test_resource(2, "test");
         resource.metadata.generation = Some(2);
-        resource.status = Some(MyResourceStatus {
+        resource.status = Some(ValkeyClusterStatus {
             observed_generation: Some(1),
             ..Default::default()
         });
@@ -271,7 +271,7 @@ mod tests {
     fn test_generation_unchanged() {
         let mut resource = create_test_resource(2, "test");
         resource.metadata.generation = Some(1);
-        resource.status = Some(MyResourceStatus {
+        resource.status = Some(ValkeyClusterStatus {
             observed_generation: Some(1),
             ..Default::default()
         });

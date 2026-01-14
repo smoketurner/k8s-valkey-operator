@@ -84,14 +84,14 @@ impl Metrics {
 
         let reconciliations_total = Family::<ReconcileLabels, Counter>::default();
         registry.register(
-            "myoperator_reconciliations",
+            "valkey_operator_reconciliations",
             "Total number of reconciliations",
             reconciliations_total.clone(),
         );
 
         let reconciliation_errors_total = Family::<ReconcileLabels, Counter>::default();
         registry.register(
-            "myoperator_reconciliation_errors",
+            "valkey_operator_reconciliation_errors",
             "Total number of reconciliation errors",
             reconciliation_errors_total.clone(),
         );
@@ -101,28 +101,28 @@ impl Metrics {
                 Histogram::new(exponential_buckets(0.001, 2.0, 15))
             });
         registry.register(
-            "myoperator_reconcile_duration_seconds",
+            "valkey_operator_reconcile_duration_seconds",
             "Duration of reconciliation in seconds",
             reconcile_duration_seconds.clone(),
         );
 
         let resources_total = Family::<PhaseLabels, Gauge>::default();
         registry.register(
-            "myoperator_resources_total",
-            "Total number of MyResource resources by phase",
+            "valkey_operator_resources_total",
+            "Total number of ValkeyCluster resources by phase",
             resources_total.clone(),
         );
 
         let resource_replicas_desired = Family::<ReconcileLabels, Gauge>::default();
         registry.register(
-            "myoperator_resource_replicas_desired",
+            "valkey_operator_resource_replicas_desired",
             "Desired number of replicas for each resource",
             resource_replicas_desired.clone(),
         );
 
         let resource_replicas_ready = Family::<ReconcileLabels, Gauge>::default();
         registry.register(
-            "myoperator_resource_replicas_ready",
+            "valkey_operator_resource_replicas_ready",
             "Number of ready replicas for each resource",
             resource_replicas_ready.clone(),
         );
@@ -297,9 +297,9 @@ mod tests {
         metrics.record_error("default", "test-resource");
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("myoperator_reconciliations"));
-        assert!(encoded.contains("myoperator_reconciliation_errors"));
-        assert!(encoded.contains("myoperator_reconcile_duration_seconds"));
+        assert!(encoded.contains("valkey_operator_reconciliations"));
+        assert!(encoded.contains("valkey_operator_reconciliation_errors"));
+        assert!(encoded.contains("valkey_operator_reconcile_duration_seconds"));
     }
 
     #[test]
@@ -312,7 +312,7 @@ mod tests {
         metrics.set_resources_by_phase("Creating", 2);
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("myoperator_resources_total"));
+        assert!(encoded.contains("valkey_operator_resources_total"));
     }
 
     #[test]
@@ -324,8 +324,8 @@ mod tests {
         metrics.set_resource_replicas("staging", "staging-app", 2, 1);
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("myoperator_resource_replicas_desired"));
-        assert!(encoded.contains("myoperator_resource_replicas_ready"));
+        assert!(encoded.contains("valkey_operator_resource_replicas_desired"));
+        assert!(encoded.contains("valkey_operator_resource_replicas_ready"));
     }
 
     #[tokio::test]

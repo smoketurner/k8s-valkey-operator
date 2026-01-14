@@ -1,4 +1,4 @@
-//! my-operator - A Kubernetes operator for managing MyResource custom resources.
+//! valkey-operator - A Kubernetes operator for managing Valkey Clusters.
 //!
 //! This is the main entry point that:
 //! - Initializes structured logging
@@ -16,12 +16,12 @@ use kube_leader_election::{LeaseLock, LeaseLockParams};
 use tokio::signal;
 use tracing::{error, info, warn};
 
-use my_operator::health::{HealthState, run_health_server};
-use my_operator::run_controller;
-use my_operator::{WEBHOOK_CERT_PATH, WEBHOOK_KEY_PATH, run_webhook_server};
+use valkey_operator::health::{HealthState, run_health_server};
+use valkey_operator::run_controller;
+use valkey_operator::{WEBHOOK_CERT_PATH, WEBHOOK_KEY_PATH, run_webhook_server};
 
 /// Lease configuration
-const LEASE_NAME: &str = "my-operator-leader";
+const LEASE_NAME: &str = "valkey-operator-leader";
 const LEASE_TTL_SECS: u64 = 15;
 const LEASE_RENEW_INTERVAL_SECS: u64 = 5;
 
@@ -34,14 +34,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("my_operator=info".parse()?)
+                .add_directive("valkey_operator=info".parse()?)
                 .add_directive("kube=info".parse()?)
                 .add_directive("kube_leader_election=info".parse()?),
         )
         .json()
         .init();
 
-    info!("Starting my-operator");
+    info!("Starting valkey-operator");
 
     // Create Kubernetes client
     let client = Client::try_default().await?;

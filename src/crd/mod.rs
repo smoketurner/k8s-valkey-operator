@@ -1,17 +1,17 @@
-//! Custom Resource Definitions (CRDs) for my-operator.
+//! Custom Resource Definitions (CRDs) for valkey-operator.
 //!
-//! This module defines the `MyResource` CRD using kube-rs derive macros.
+//! This module defines the `ValkeyCluster` CRD using kube-rs derive macros.
 
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// MyResource is a custom resource managed by this operator.
+/// ValkeyCluster is a custom resource managed by this operator.
 ///
 /// Example:
 /// ```yaml
-/// apiVersion: myoperator.example.com/v1alpha1
-/// kind: MyResource
+/// apiVersion: valkeyoperator.smoketurner.com/v1alpha1
+/// kind: ValkeyCluster
 /// metadata:
 ///   name: example
 /// spec:
@@ -20,12 +20,12 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(CustomResource, Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[kube(
-    group = "myoperator.example.com",
+    group = "valkeyoperator.smoketurner.com",
     version = "v1alpha1",
-    kind = "MyResource",
-    plural = "myresources",
-    shortname = "mr",
-    status = "MyResourceStatus",
+    kind = "ValkeyCluster",
+    plural = "valkeyclusters",
+    shortname = "vc",
+    status = "ValkeyClusterStatus",
     namespaced,
     // Print columns for kubectl get
     printcolumn = r#"{"name":"Phase", "type":"string", "jsonPath":".status.phase"}"#,
@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
     printcolumn = r#"{"name":"Age", "type":"date", "jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
-pub struct MyResourceSpec {
+pub struct ValkeyClusterSpec {
     /// Number of replicas for the managed deployment
     #[serde(default = "default_replicas")]
     pub replicas: i32,
@@ -52,10 +52,10 @@ fn default_replicas() -> i32 {
     1
 }
 
-/// Status of a MyResource
+/// Status of a ValkeyCluster
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct MyResourceStatus {
+pub struct ValkeyClusterStatus {
     /// Current phase of the resource
     #[serde(default)]
     pub phase: Phase,
@@ -73,7 +73,7 @@ pub struct MyResourceStatus {
     pub conditions: Vec<Condition>,
 }
 
-/// Phase represents the current lifecycle phase of a MyResource
+/// Phase represents the current lifecycle phase of a ValkeyCluster
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema)]
 pub enum Phase {
     /// Resource is being created

@@ -8,11 +8,11 @@ use std::sync::Arc;
 use kube::runtime::events::{Event, EventType, Recorder, Reporter};
 use kube::{Client, Resource};
 
-use crate::crd::MyResource;
+use crate::crd::ValkeyCluster;
 use crate::health::HealthState;
 
 /// Field manager name for the operator
-pub const FIELD_MANAGER: &str = "my-operator";
+pub const FIELD_MANAGER: &str = "valkey-operator";
 
 /// Shared context for the controller
 #[derive(Clone)]
@@ -46,7 +46,7 @@ impl Context {
     /// Publish a normal event for a resource
     pub async fn publish_normal_event(
         &self,
-        resource: &MyResource,
+        resource: &ValkeyCluster,
         reason: &str,
         action: &str,
         note: Option<String>,
@@ -73,7 +73,7 @@ impl Context {
     /// Publish a warning event for a resource
     pub async fn publish_warning_event(
         &self,
-        resource: &MyResource,
+        resource: &ValkeyCluster,
         reason: &str,
         action: &str,
         note: Option<String>,

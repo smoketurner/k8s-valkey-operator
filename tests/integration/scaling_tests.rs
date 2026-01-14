@@ -1,4 +1,4 @@
-//! Scaling tests for MyResource operations.
+//! Scaling tests for ValkeyCluster operations.
 //!
 //! These tests verify scaling behavior including:
 //! - Scale up operations
@@ -10,18 +10,18 @@ use std::time::Duration;
 use k8s_openapi::api::apps::v1::Deployment;
 use kube::api::{Api, Patch, PatchParams, PostParams};
 
-use my_operator::crd::{MyResource, Phase};
+use valkey_operator::crd::{ValkeyCluster, Phase};
 
 use crate::assertions::assert_deployment_replicas;
 use crate::init_test;
 use crate::namespace::TestNamespace;
 use crate::wait::{wait_for_condition, wait_for_operational, wait_for_phase};
 
-/// Helper to create a test MyResource.
-fn test_resource(name: &str, replicas: i32, message: &str) -> MyResource {
+/// Helper to create a test ValkeyCluster.
+fn test_resource(name: &str, replicas: i32, message: &str) -> ValkeyCluster {
     serde_json::from_value(serde_json::json!({
-        "apiVersion": "myoperator.example.com/v1alpha1",
-        "kind": "MyResource",
+        "apiVersion": "valkeyoperator.smoketurner.com/v1alpha1",
+        "kind": "ValkeyCluster",
         "metadata": {
             "name": name
         },
@@ -33,7 +33,7 @@ fn test_resource(name: &str, replicas: i32, message: &str) -> MyResource {
     .expect("Failed to create test resource")
 }
 
-/// Test scaling up a MyResource.
+/// Test scaling up a ValkeyCluster.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_scale_up() {
@@ -41,14 +41,14 @@ async fn test_scale_up() {
     let test_ns = TestNamespace::create(client.clone(), "scale-up").await;
     let ns_name = test_ns.name().to_string();
 
-    let api: Api<MyResource> = Api::namespaced(client.clone(), &ns_name);
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource with 1 replica
     let resource = test_resource("scale-up-test", 1, "scale up test");
     api.create(&PostParams::default(), &resource)
         .await
-        .expect("Failed to create MyResource");
+        .expect("Failed to create ValkeyCluster");
 
     // Wait for initial deployment
     wait_for_operational(&api, "scale-up-test", Duration::from_secs(120))
@@ -87,13 +87,13 @@ async fn test_scale_up() {
     // Verify deployment has 2 replicas
     assert_deployment_replicas(client.clone(), &ns_name, "scale-up-test", 2).await;
 
-    // Verify MyResource status
+    // Verify ValkeyCluster status
     let resource = api.get("scale-up-test").await.expect("Should get resource");
     let status = resource.status.expect("Should have status");
     assert_eq!(status.ready_replicas, 2, "Should have 2 ready replicas");
 }
 
-/// Test scaling down a MyResource.
+/// Test scaling down a ValkeyCluster.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_scale_down() {
@@ -101,13 +101,13 @@ async fn test_scale_down() {
     let test_ns = TestNamespace::create(client.clone(), "scale-down").await;
     let ns_name = test_ns.name().to_string();
 
-    let api: Api<MyResource> = Api::namespaced(client.clone(), &ns_name);
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource with 3 replicas
     let resource = test_resource("scale-down-test", 3, "scale down test");
     api.create(&PostParams::default(), &resource)
         .await
-        .expect("Failed to create MyResource");
+        .expect("Failed to create ValkeyCluster");
 
     // Wait for initial deployment
     wait_for_operational(&api, "scale-down-test", Duration::from_secs(180))
@@ -136,7 +136,7 @@ async fn test_scale_down() {
     // Verify deployment has 2 replicas
     assert_deployment_replicas(client.clone(), &ns_name, "scale-down-test", 2).await;
 
-    // Verify MyResource status
+    // Verify ValkeyCluster status
     let resource = api
         .get("scale-down-test")
         .await
@@ -145,7 +145,7 @@ async fn test_scale_down() {
     assert_eq!(status.ready_replicas, 2, "Should have 2 ready replicas");
 }
 
-/// Test that a MyResource enters Degraded state when replicas are unhealthy.
+/// Test that a ValkeyCluster enters Degraded state when replicas are unhealthy.
 ///
 /// Note: This test requires the ability to make pods unhealthy.
 /// In a real test environment, you might use a chaos engineering tool
@@ -157,14 +157,14 @@ async fn test_degraded_state() {
     let test_ns = TestNamespace::create(client.clone(), "degraded-state").await;
     let ns_name = test_ns.name().to_string();
 
-    let api: Api<MyResource> = Api::namespaced(client.clone(), &ns_name);
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource with 2 replicas
     let resource = test_resource("degraded-test", 2, "degraded test");
     api.create(&PostParams::default(), &resource)
         .await
-        .expect("Failed to create MyResource");
+        .expect("Failed to create ValkeyCluster");
 
     // Wait for resource to be operational
     wait_for_operational(&api, "degraded-test", Duration::from_secs(180))
@@ -240,13 +240,13 @@ async fn test_recovery_from_degraded() {
     let test_ns = TestNamespace::create(client.clone(), "recovery-test").await;
     let ns_name = test_ns.name().to_string();
 
-    let api: Api<MyResource> = Api::namespaced(client.clone(), &ns_name);
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
     let resource = test_resource("recovery-test", 2, "recovery test");
     api.create(&PostParams::default(), &resource)
         .await
-        .expect("Failed to create MyResource");
+        .expect("Failed to create ValkeyCluster");
 
     // Wait for resource to be operational
     wait_for_operational(&api, "recovery-test", Duration::from_secs(180))

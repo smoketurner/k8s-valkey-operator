@@ -9,7 +9,7 @@
 use k8s_openapi::api::core::v1::Namespace;
 use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::{Client, Resource};
-use my_operator::crd::MyResource;
+use valkey_operator::crd::ValkeyCluster;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -124,14 +124,14 @@ impl Drop for TestNamespace {
         tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async {
-                // First delete all MyResource resources to trigger operator cleanup
-                Self::delete_resources::<MyResource>(&client, &name).await;
+                // First delete all ValkeyCluster resources to trigger operator cleanup
+                Self::delete_resources::<ValkeyCluster>(&client, &name).await;
 
                 // Brief wait for operator to process deletions
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                 // Remove any remaining finalizers
-                Self::remove_resource_finalizers::<MyResource>(&client, &name).await;
+                Self::remove_resource_finalizers::<ValkeyCluster>(&client, &name).await;
 
                 let ns_api: Api<Namespace> = Api::all(client);
                 let dp = DeleteParams {

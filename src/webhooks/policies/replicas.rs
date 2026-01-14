@@ -7,7 +7,7 @@
 //! - Replica count does not exceed MAX_REPLICAS
 
 use super::{ValidationContext, ValidationResult};
-use crate::controller::validation::{MAX_REPLICAS, MIN_REPLICAS};
+use crate::controller::cluster_validation::{MAX_REPLICAS, MIN_REPLICAS};
 
 /// Validate replica count
 pub fn validate(ctx: &ValidationContext<'_>) -> ValidationResult {
@@ -40,18 +40,18 @@ pub fn validate(ctx: &ValidationContext<'_>) -> ValidationResult {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::crd::{MyResource, MyResourceSpec};
+    use crate::crd::{ValkeyCluster, ValkeyClusterSpec};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::collections::BTreeMap;
 
-    fn create_resource(replicas: i32) -> MyResource {
-        MyResource {
+    fn create_resource(replicas: i32) -> ValkeyCluster {
+        ValkeyCluster {
             metadata: ObjectMeta {
                 name: Some("test".to_string()),
                 namespace: Some("default".to_string()),
                 ..Default::default()
             },
-            spec: MyResourceSpec {
+            spec: ValkeyClusterSpec {
                 replicas,
                 message: "test".to_string(),
                 labels: BTreeMap::new(),

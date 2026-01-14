@@ -7,14 +7,14 @@
     clippy::string_slice
 )]
 
-//! Property-based tests for my-operator.
+//! Property-based tests for valkey-operator.
 //!
 //! Uses proptest to generate random inputs and verify invariants.
 
 use proptest::prelude::*;
 
-use my_operator::controller::state_machine::{ResourceEvent, ResourceStateMachine};
-use my_operator::crd::Phase;
+use valkey_operator::controller::cluster_state_machine::{ClusterEvent, ClusterStateMachine};
+use valkey_operator::crd::Phase;
 
 /// Strategy for generating valid replica counts.
 fn valid_replicas() -> impl Strategy<Value = i32> {
@@ -40,16 +40,16 @@ fn any_phase() -> impl Strategy<Value = Phase> {
 }
 
 /// Strategy for generating random events.
-fn any_event() -> impl Strategy<Value = ResourceEvent> {
+fn any_event() -> impl Strategy<Value = ClusterEvent> {
     prop_oneof![
-        Just(ResourceEvent::ResourcesApplied),
-        Just(ResourceEvent::AllReplicasReady),
-        Just(ResourceEvent::ReplicasDegraded),
-        Just(ResourceEvent::SpecChanged),
-        Just(ResourceEvent::ReconcileError),
-        Just(ResourceEvent::DeletionRequested),
-        Just(ResourceEvent::RecoveryInitiated),
-        Just(ResourceEvent::FullyRecovered),
+        Just(ClusterEvent::ResourcesApplied),
+        Just(ClusterEvent::AllReplicasReady),
+        Just(ClusterEvent::ReplicasDegraded),
+        Just(ClusterEvent::SpecChanged),
+        Just(ClusterEvent::ReconcileError),
+        Just(ClusterEvent::DeletionRequested),
+        Just(ClusterEvent::RecoveryInitiated),
+        Just(ClusterEvent::FullyRecovered),
     ]
 }
 
@@ -74,7 +74,7 @@ proptest! {
         phase in any_phase(),
         event in any_event()
     ) {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
         let result1 = sm.can_transition(&phase, &event);
         let result2 = sm.can_transition(&phase, &event);
         prop_assert_eq!(result1, result2);
@@ -84,7 +84,7 @@ proptest! {
     /// Once in Deleting, no events trigger a transition.
     #[test]
     fn test_deleting_is_terminal(event in any_event()) {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
         let can_transition = sm.can_transition(&Phase::Deleting, &event);
         prop_assert!(!can_transition, "Deleting should not transition on {:?}", event);
     }
@@ -92,8 +92,8 @@ proptest! {
     /// Property: All phases can transition to Deleting via DeletionRequested.
     #[test]
     fn test_all_can_delete(phase in any_phase()) {
-        let sm = ResourceStateMachine::new();
-        let can_delete = sm.can_transition(&phase, &ResourceEvent::DeletionRequested);
+        let sm = ClusterStateMachine::new();
+        let can_delete = sm.can_transition(&phase, &ClusterEvent::DeletionRequested);
         if phase == Phase::Deleting {
             // Deleting is terminal, no transitions out
             prop_assert!(!can_delete, "Deleting should not be able to transition");
@@ -107,11 +107,11 @@ proptest! {
 mod crd_property_tests {
     use super::*;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-    use my_operator::crd::{MyResource, MyResourceSpec};
+    use valkey_operator::crd::{ValkeyCluster, ValkeyClusterSpec};
 
-    /// Strategy for generating valid MyResourceSpec.
-    fn valid_spec() -> impl Strategy<Value = MyResourceSpec> {
-        (valid_replicas(), valid_message()).prop_map(|(replicas, message)| MyResourceSpec {
+    /// Strategy for generating valid ValkeyClusterSpec.
+    fn valid_spec() -> impl Strategy<Value = ValkeyClusterSpec> {
+        (valid_replicas(), valid_message()).prop_map(|(replicas, message)| ValkeyClusterSpec {
             replicas,
             message,
             labels: std::collections::BTreeMap::new(),
@@ -123,15 +123,15 @@ mod crd_property_tests {
         #[test]
         fn test_spec_roundtrip(spec in valid_spec()) {
             let json = serde_json::to_string(&spec).expect("Serialization should succeed");
-            let parsed: MyResourceSpec = serde_json::from_str(&json).expect("Deserialization should succeed");
+            let parsed: ValkeyClusterSpec = serde_json::from_str(&json).expect("Deserialization should succeed");
             prop_assert_eq!(spec.replicas, parsed.replicas);
             prop_assert_eq!(spec.message, parsed.message);
         }
 
-        /// Property: MyResource with valid spec is valid.
+        /// Property: ValkeyCluster with valid spec is valid.
         #[test]
         fn test_resource_with_valid_spec(spec in valid_spec()) {
-            let resource = MyResource {
+            let resource = ValkeyCluster {
                 metadata: ObjectMeta {
                     name: Some("test".to_string()),
                     namespace: Some("default".to_string()),
@@ -152,13 +152,13 @@ mod crd_property_tests {
 mod webhook_property_tests {
     use super::*;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-    use my_operator::crd::{MyResource, MyResourceSpec};
-    use my_operator::webhooks::{AdmissionRequest, AdmissionResponse, AdmissionReview};
+    use valkey_operator::crd::{ValkeyCluster, ValkeyClusterSpec};
+    use kube::core::admission::{AdmissionRequest, AdmissionResponse, AdmissionReview};
     use serde_json::{Value, json};
 
     /// Generate a valid UID string (UUID format)
     fn valid_uid() -> impl Strategy<Value = String> {
-        "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}".prop_map(|s| s)
+        "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}".prop_map(|s| s.to_string())
     }
 
     /// Generate an operation type
@@ -170,9 +170,9 @@ mod webhook_property_tests {
         ]
     }
 
-    /// Strategy for generating valid MyResourceSpec
-    fn valid_spec() -> impl Strategy<Value = MyResourceSpec> {
-        (valid_replicas(), valid_message()).prop_map(|(replicas, message)| MyResourceSpec {
+    /// Strategy for generating valid ValkeyClusterSpec
+    fn valid_spec() -> impl Strategy<Value = ValkeyClusterSpec> {
+        (valid_replicas(), valid_message()).prop_map(|(replicas, message)| ValkeyClusterSpec {
             replicas,
             message,
             labels: std::collections::BTreeMap::new(),
@@ -180,17 +180,17 @@ mod webhook_property_tests {
     }
 
     /// Create a minimal valid spec for simpler tests
-    fn minimal_spec() -> MyResourceSpec {
-        MyResourceSpec {
+    fn minimal_spec() -> ValkeyClusterSpec {
+        ValkeyClusterSpec {
             replicas: 1,
             message: "test".to_string(),
             labels: std::collections::BTreeMap::new(),
         }
     }
 
-    /// Create a MyResource from a spec
-    fn resource_from_spec(spec: MyResourceSpec) -> MyResource {
-        MyResource {
+    /// Create a ValkeyCluster from a spec
+    fn resource_from_spec(spec: ValkeyClusterSpec) -> ValkeyCluster {
+        ValkeyCluster {
             metadata: ObjectMeta {
                 name: Some("test-resource".to_string()),
                 namespace: Some("default".to_string()),
@@ -206,8 +206,8 @@ mod webhook_property_tests {
     fn build_admission_review(
         uid: &str,
         operation: &str,
-        resource: &MyResource,
-        old_resource: Option<&MyResource>,
+        resource: &ValkeyCluster,
+        old_resource: Option<&ValkeyCluster>,
     ) -> Value {
         let object = serde_json::to_value(resource).expect("serialize resource");
         let old_object =
@@ -216,24 +216,24 @@ mod webhook_property_tests {
         let mut request = json!({
             "uid": uid,
             "kind": {
-                "group": "myoperator.example.com",
+                "group": "valkeyoperator.smoketurner.com",
                 "version": "v1alpha1",
-                "kind": "MyResource"
+                "kind": "ValkeyCluster"
             },
             "resource": {
-                "group": "myoperator.example.com",
+                "group": "valkeyoperator.smoketurner.com",
                 "version": "v1alpha1",
-                "resource": "myresources"
+                "resource": "valkeyclusters"
             },
             "requestKind": {
-                "group": "myoperator.example.com",
+                "group": "valkeyoperator.smoketurner.com",
                 "version": "v1alpha1",
-                "kind": "MyResource"
+                "kind": "ValkeyCluster"
             },
             "requestResource": {
-                "group": "myoperator.example.com",
+                "group": "valkeyoperator.smoketurner.com",
                 "version": "v1alpha1",
-                "resource": "myresources"
+                "resource": "valkeyclusters"
             },
             "operation": operation,
             "namespace": resource.metadata.namespace,
@@ -260,7 +260,7 @@ mod webhook_property_tests {
         #![proptest_config(ProptestConfig::with_cases(50))]
 
         /// Property: AdmissionReview request deserializes correctly with camelCase fields
-        /// Uses kube-rs AdmissionReview<MyResource> type
+        /// Uses kube-rs AdmissionReview<ValkeyCluster> type
         #[test]
         fn prop_admission_review_deserializes(
             uid in valid_uid(),
@@ -271,11 +271,11 @@ mod webhook_property_tests {
             let review_json = build_admission_review(&uid, &op, &resource, None);
 
             // Should deserialize without error using kube-rs typed AdmissionReview
-            let review: Result<AdmissionReview<MyResource>, _> = serde_json::from_value(review_json);
+            let review: Result<AdmissionReview<ValkeyCluster>, _> = serde_json::from_value(review_json);
             prop_assert!(review.is_ok(), "AdmissionReview should deserialize: {:?}", review.err());
 
             // Extract the request using try_into
-            let request: Result<AdmissionRequest<MyResource>, _> = review.unwrap().try_into();
+            let request: Result<AdmissionRequest<ValkeyCluster>, _> = review.unwrap().try_into();
             prop_assert!(request.is_ok(), "Should extract request from review");
 
             let request = request.unwrap();
@@ -293,8 +293,8 @@ mod webhook_property_tests {
             let review_json = build_admission_review(&uid, "CREATE", &resource, None);
 
             // Deserialize to get a request
-            let review: AdmissionReview<MyResource> = serde_json::from_value(review_json).unwrap();
-            let request: AdmissionRequest<MyResource> = review.try_into().unwrap();
+            let review: AdmissionReview<ValkeyCluster> = serde_json::from_value(review_json).unwrap();
+            let request: AdmissionRequest<ValkeyCluster> = review.try_into().unwrap();
 
             // Create response using kube-rs API
             let response = if allowed {
@@ -330,8 +330,8 @@ mod webhook_property_tests {
             let resource = resource_from_spec(minimal_spec());
             let review_json = build_admission_review(&uid, "CREATE", &resource, None);
 
-            let review: AdmissionReview<MyResource> = serde_json::from_value(review_json).unwrap();
-            let request: AdmissionRequest<MyResource> = review.try_into().unwrap();
+            let review: AdmissionReview<ValkeyCluster> = serde_json::from_value(review_json).unwrap();
+            let request: AdmissionRequest<ValkeyCluster> = review.try_into().unwrap();
 
             let response = AdmissionResponse::from(&request).into_review();
             let json: Value = serde_json::to_value(&response).unwrap();
@@ -350,8 +350,8 @@ mod webhook_property_tests {
             let new_resource = resource_from_spec(new_spec);
             let review_json = build_admission_review(&uid, "UPDATE", &new_resource, Some(&old_resource));
 
-            let review: AdmissionReview<MyResource> = serde_json::from_value(review_json).unwrap();
-            let request: AdmissionRequest<MyResource> = review.try_into().unwrap();
+            let review: AdmissionReview<ValkeyCluster> = serde_json::from_value(review_json).unwrap();
+            let request: AdmissionRequest<ValkeyCluster> = review.try_into().unwrap();
 
             prop_assert!(request.old_object.is_some(), "UPDATE should have oldObject");
             prop_assert!(request.object.is_some(), "UPDATE should have object");
@@ -366,8 +366,8 @@ mod webhook_property_tests {
             let resource = resource_from_spec(minimal_spec());
             let review_json = build_admission_review(&uid, "CREATE", &resource, None);
 
-            let review: AdmissionReview<MyResource> = serde_json::from_value(review_json).unwrap();
-            let request: AdmissionRequest<MyResource> = review.try_into().unwrap();
+            let review: AdmissionReview<ValkeyCluster> = serde_json::from_value(review_json).unwrap();
+            let request: AdmissionRequest<ValkeyCluster> = review.try_into().unwrap();
 
             let response = AdmissionResponse::from(&request).deny(message.clone()).into_review();
             let json: Value = serde_json::to_value(&response).unwrap();
@@ -384,8 +384,8 @@ mod webhook_property_tests {
         let resource = resource_from_spec(minimal_spec());
         let review_json = build_admission_review("test-uid", "CREATE", &resource, None);
 
-        let review: AdmissionReview<MyResource> = serde_json::from_value(review_json).unwrap();
-        let request: AdmissionRequest<MyResource> = review.try_into().unwrap();
+        let review: AdmissionReview<ValkeyCluster> = serde_json::from_value(review_json).unwrap();
+        let request: AdmissionRequest<ValkeyCluster> = review.try_into().unwrap();
 
         let response = AdmissionResponse::from(&request)
             .deny("Test message")
@@ -433,15 +433,15 @@ mod webhook_property_tests {
         );
 
         // Deserialize using kube-rs typed AdmissionReview
-        let review: AdmissionReview<MyResource> =
+        let review: AdmissionReview<ValkeyCluster> =
             serde_json::from_value(review_json.clone()).expect("should deserialize");
 
         // Extract request
-        let request: AdmissionRequest<MyResource> = review.try_into().expect("should have request");
+        let request: AdmissionRequest<ValkeyCluster> = review.try_into().expect("should have request");
 
         assert_eq!(request.uid, "12345678-1234-1234-1234-123456789abc");
-        assert_eq!(request.kind.group, "myoperator.example.com");
+        assert_eq!(request.kind.group, "valkeyoperator.smoketurner.com");
         assert_eq!(request.kind.version, "v1alpha1");
-        assert_eq!(request.kind.kind, "MyResource");
+        assert_eq!(request.kind.kind, "ValkeyCluster");
     }
 }

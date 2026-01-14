@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **template repository** for building Kubernetes operators in Rust using kube-rs. It provides a working skeleton with best practices, patterns, and tooling ready for customization.
+This is a **Kubernetes operator for managing Valkey Clusters** built in Rust using kube-rs. It manages ValkeyCluster and ValkeyUpgrade custom resources.
 
 **For detailed pattern explanations, see `GUIDE.md`.**
 
@@ -15,16 +15,7 @@ This is a **template repository** for building Kubernetes operators in Rust usin
 | Rust | 1.92+ (Edition 2024) |
 | Kubernetes | 1.35+ |
 | kube-rs | 2.x |
-
-## Customization Guide
-
-To adapt this template for your operator:
-
-1. **Rename the project**: Update `Cargo.toml` package name from `my-operator`
-2. **Define your CRD**: Replace `MyResource` in `src/crd/mod.rs`
-3. **Update API group**: Change `myoperator.example.com` to your domain
-4. **Implement reconciliation**: Customize `src/controller/reconciler.rs`
-5. **Update manifests**: Rename resources in `config/` and `charts/`
+| Valkey | 9.x |
 
 ## Build & Test Commands
 
@@ -53,8 +44,8 @@ make uninstall          # Uninstall from cluster
 # Deployment
 make deploy             # Deploy operator to cluster
 make undeploy           # Undeploy operator
-make deploy-sample      # Deploy sample MyResource
-make delete-sample      # Delete sample MyResource
+make deploy-sample      # Deploy sample ValkeyCluster
+make delete-sample      # Delete sample ValkeyCluster
 
 # Cleanup
 make clean              # Clean build artifacts
@@ -69,7 +60,7 @@ make clean-all          # Uninstall and clean
 |------|---------|
 | `src/main.rs` | Entry point, leader election, startup |
 | `src/lib.rs` | Controller setup, stream configuration |
-| `src/crd/mod.rs` | Custom Resource Definition |
+| `src/crd/mod.rs` | Custom Resource Definition (ValkeyCluster) |
 | `src/controller/reconciler.rs` | Main reconciliation logic |
 | `src/controller/state_machine.rs` | Phase transitions |
 | `src/controller/error.rs` | Error types and classification |
@@ -81,16 +72,19 @@ make clean-all          # Uninstall and clean
 
 ### CRD Structure
 
-- **Spec**: `replicas`, `message`, `labels`
-- **Status**: `phase`, `conditions`, `observedGeneration`, `readyReplicas`
-- **API version**: `myoperator.example.com/v1alpha1`
+- **API group**: `valkeyoperator.smoketurner.com`
+- **API version**: `v1alpha1`
+- **Kinds**: `ValkeyCluster`, `ValkeyUpgrade`
+- **Short name**: `vc` (for ValkeyCluster)
 
 ### Generated Resources
 
-The operator creates these Kubernetes resources for each MyResource:
-- **Deployment**: Manages pods
-- **ConfigMap**: Configuration data
-- **Service**: Network access
+The operator creates these Kubernetes resources for each ValkeyCluster:
+- **StatefulSet**: Valkey pods with stable identity
+- **Headless Service**: Cluster discovery
+- **Client Service**: Client access endpoint
+- **PodDisruptionBudget**: Maintain quorum
+- **Certificate**: TLS certs via cert-manager
 
 ## Coding Standards
 

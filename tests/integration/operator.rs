@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use my_operator::controller::context::Context;
+use valkey_operator::controller::context::Context;
 
 /// A scoped operator instance for testing.
 ///
@@ -75,7 +75,7 @@ async fn run_controller(_ctx: Arc<Context>, _namespace: Option<String>) {
     // Example:
     // ```
     // use kube::runtime::Controller;
-    // use my_operator::crd::MyResource;
+    // use valkey_operator::crd::ValkeyCluster;
     //
     // let api: Api<MyResource> = match namespace {
     //     Some(ns) => Api::namespaced(ctx.client.clone(), &ns),

@@ -1,10 +1,10 @@
-//! Unit tests for my-operator.
+//! Unit tests for valkey-operator.
 //!
 //! These tests run without a Kubernetes cluster and test individual
 //! components in isolation.
 
 mod crd_tests {
-    use my_operator::crd::{Condition, Phase};
+    use valkey_operator::crd::{Condition, Phase};
 
     #[test]
     fn test_phase_display() {
@@ -54,90 +54,90 @@ mod crd_tests {
 }
 
 mod state_machine_tests {
-    use my_operator::controller::state_machine::{ResourceEvent, ResourceStateMachine};
-    use my_operator::crd::Phase;
+    use valkey_operator::controller::cluster_state_machine::{ClusterEvent, ClusterStateMachine};
+    use valkey_operator::crd::Phase;
 
     #[test]
     fn test_valid_events_from_pending() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
         // Pending can transition via ResourcesApplied -> Creating
-        assert!(sm.can_transition(&Phase::Pending, &ResourceEvent::ResourcesApplied));
+        assert!(sm.can_transition(&Phase::Pending, &ClusterEvent::ResourcesApplied));
         // Pending can transition via ReconcileError -> Failed
-        assert!(sm.can_transition(&Phase::Pending, &ResourceEvent::ReconcileError));
+        assert!(sm.can_transition(&Phase::Pending, &ClusterEvent::ReconcileError));
         // Pending can transition via DeletionRequested -> Deleting
-        assert!(sm.can_transition(&Phase::Pending, &ResourceEvent::DeletionRequested));
+        assert!(sm.can_transition(&Phase::Pending, &ClusterEvent::DeletionRequested));
         // Pending cannot directly go to Running via AllReplicasReady
-        assert!(!sm.can_transition(&Phase::Pending, &ResourceEvent::AllReplicasReady));
+        assert!(!sm.can_transition(&Phase::Pending, &ClusterEvent::AllReplicasReady));
     }
 
     #[test]
     fn test_valid_events_from_creating() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
         // Creating can transition via AllReplicasReady -> Running
-        assert!(sm.can_transition(&Phase::Creating, &ResourceEvent::AllReplicasReady));
+        assert!(sm.can_transition(&Phase::Creating, &ClusterEvent::AllReplicasReady));
         // Creating can transition via ReplicasDegraded -> Degraded
-        assert!(sm.can_transition(&Phase::Creating, &ResourceEvent::ReplicasDegraded));
+        assert!(sm.can_transition(&Phase::Creating, &ClusterEvent::ReplicasDegraded));
         // Creating can transition via ReconcileError -> Failed
-        assert!(sm.can_transition(&Phase::Creating, &ResourceEvent::ReconcileError));
+        assert!(sm.can_transition(&Phase::Creating, &ClusterEvent::ReconcileError));
         // Creating can transition via DeletionRequested -> Deleting
-        assert!(sm.can_transition(&Phase::Creating, &ResourceEvent::DeletionRequested));
+        assert!(sm.can_transition(&Phase::Creating, &ClusterEvent::DeletionRequested));
     }
 
     #[test]
     fn test_valid_events_from_running() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
         // Running can transition via SpecChanged -> Updating
-        assert!(sm.can_transition(&Phase::Running, &ResourceEvent::SpecChanged));
+        assert!(sm.can_transition(&Phase::Running, &ClusterEvent::SpecChanged));
         // Running can transition via ReplicasDegraded -> Degraded
-        assert!(sm.can_transition(&Phase::Running, &ResourceEvent::ReplicasDegraded));
+        assert!(sm.can_transition(&Phase::Running, &ClusterEvent::ReplicasDegraded));
         // Running can transition via DeletionRequested -> Deleting
-        assert!(sm.can_transition(&Phase::Running, &ResourceEvent::DeletionRequested));
+        assert!(sm.can_transition(&Phase::Running, &ClusterEvent::DeletionRequested));
         // Running can transition via ReconcileError -> Failed
-        assert!(sm.can_transition(&Phase::Running, &ResourceEvent::ReconcileError));
+        assert!(sm.can_transition(&Phase::Running, &ClusterEvent::ReconcileError));
     }
 
     #[test]
     fn test_valid_events_from_updating() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
         // Updating can transition via AllReplicasReady -> Running
-        assert!(sm.can_transition(&Phase::Updating, &ResourceEvent::AllReplicasReady));
+        assert!(sm.can_transition(&Phase::Updating, &ClusterEvent::AllReplicasReady));
         // Updating can transition via ReplicasDegraded -> Degraded
-        assert!(sm.can_transition(&Phase::Updating, &ResourceEvent::ReplicasDegraded));
+        assert!(sm.can_transition(&Phase::Updating, &ClusterEvent::ReplicasDegraded));
         // Updating can transition via ReconcileError -> Failed
-        assert!(sm.can_transition(&Phase::Updating, &ResourceEvent::ReconcileError));
+        assert!(sm.can_transition(&Phase::Updating, &ClusterEvent::ReconcileError));
         // Updating can transition via DeletionRequested -> Deleting
-        assert!(sm.can_transition(&Phase::Updating, &ResourceEvent::DeletionRequested));
+        assert!(sm.can_transition(&Phase::Updating, &ClusterEvent::DeletionRequested));
     }
 
     #[test]
     fn test_valid_events_from_degraded() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
         // Degraded can transition via FullyRecovered -> Running
-        assert!(sm.can_transition(&Phase::Degraded, &ResourceEvent::FullyRecovered));
+        assert!(sm.can_transition(&Phase::Degraded, &ClusterEvent::FullyRecovered));
         // Degraded can transition via AllReplicasReady -> Running
-        assert!(sm.can_transition(&Phase::Degraded, &ResourceEvent::AllReplicasReady));
+        assert!(sm.can_transition(&Phase::Degraded, &ClusterEvent::AllReplicasReady));
         // Degraded can transition via SpecChanged -> Updating
-        assert!(sm.can_transition(&Phase::Degraded, &ResourceEvent::SpecChanged));
+        assert!(sm.can_transition(&Phase::Degraded, &ClusterEvent::SpecChanged));
         // Degraded can transition via ReconcileError -> Failed
-        assert!(sm.can_transition(&Phase::Degraded, &ResourceEvent::ReconcileError));
+        assert!(sm.can_transition(&Phase::Degraded, &ClusterEvent::ReconcileError));
         // Degraded can transition via DeletionRequested -> Deleting
-        assert!(sm.can_transition(&Phase::Degraded, &ResourceEvent::DeletionRequested));
+        assert!(sm.can_transition(&Phase::Degraded, &ClusterEvent::DeletionRequested));
     }
 
     #[test]
     fn test_valid_events_from_failed() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
         // Failed can transition via RecoveryInitiated -> Pending
-        assert!(sm.can_transition(&Phase::Failed, &ResourceEvent::RecoveryInitiated));
+        assert!(sm.can_transition(&Phase::Failed, &ClusterEvent::RecoveryInitiated));
         // Failed can transition via DeletionRequested -> Deleting
-        assert!(sm.can_transition(&Phase::Failed, &ResourceEvent::DeletionRequested));
+        assert!(sm.can_transition(&Phase::Failed, &ClusterEvent::DeletionRequested));
         // Failed cannot go directly to Running
-        assert!(!sm.can_transition(&Phase::Failed, &ResourceEvent::AllReplicasReady));
+        assert!(!sm.can_transition(&Phase::Failed, &ClusterEvent::AllReplicasReady));
     }
 
     #[test]
     fn test_deleting_is_terminal() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
         // Deleting cannot transition to any other state
         let valid_events = sm.valid_events(&Phase::Deleting);
         assert!(
@@ -148,7 +148,7 @@ mod state_machine_tests {
 
     #[test]
     fn test_deletion_from_all_states() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
         let states = vec![
             Phase::Pending,
             Phase::Creating,
@@ -160,7 +160,7 @@ mod state_machine_tests {
 
         for state in states {
             assert!(
-                sm.can_transition(&state, &ResourceEvent::DeletionRequested),
+                sm.can_transition(&state, &ClusterEvent::DeletionRequested),
                 "Should be able to delete from {:?}",
                 state
             );
@@ -169,7 +169,7 @@ mod state_machine_tests {
 }
 
 mod error_tests {
-    use my_operator::controller::error::Error;
+    use valkey_operator::controller::error::Error;
 
     #[test]
     fn test_error_is_retryable() {
@@ -190,8 +190,8 @@ mod error_tests {
 }
 
 mod status_tests {
-    use my_operator::controller::status::{ConditionBuilder, is_condition_true};
-    use my_operator::crd::Condition;
+    use valkey_operator::controller::status::{ConditionBuilder, is_condition_true};
+    use valkey_operator::crd::Condition;
 
     #[test]
     fn test_condition_builder() {

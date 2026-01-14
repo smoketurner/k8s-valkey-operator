@@ -1,4 +1,4 @@
-# Rustfmt configuration for my-operator
+# Rustfmt configuration for valkey-operator
 # See: https://rust-lang.github.io/rustfmt/
 
 # Use the 2024 edition style

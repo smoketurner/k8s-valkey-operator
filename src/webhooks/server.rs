@@ -16,7 +16,7 @@ use kube::core::admission::{AdmissionRequest, AdmissionResponse, AdmissionReview
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use crate::crd::MyResource;
+use crate::crd::ValkeyCluster;
 use crate::webhooks::policies::{ValidationContext, validate_all};
 
 /// Default path to webhook TLS certificate
@@ -54,16 +54,16 @@ fn deny_with_reason<T: Resource<DynamicType = ()>>(
 /// Create the webhook router
 pub fn create_webhook_router(state: Arc<WebhookState>) -> Router {
     Router::new()
-        .route("/validate-myresource", post(validate_myresource))
+        .route("/validate-valkeycluster", post(validate_valkeycluster))
         .with_state(state)
 }
 
-/// Validate a MyResource admission webhook handler
-async fn validate_myresource(
+/// Validate a ValkeyCluster admission webhook handler
+async fn validate_valkeycluster(
     State(_state): State<Arc<WebhookState>>,
-    Json(review): Json<AdmissionReview<MyResource>>,
+    Json(review): Json<AdmissionReview<ValkeyCluster>>,
 ) -> impl IntoResponse {
-    let request: AdmissionRequest<MyResource> = match review.try_into() {
+    let request: AdmissionRequest<ValkeyCluster> = match review.try_into() {
         Ok(req) => req,
         Err(e) => {
             error!(error = %e, "Failed to extract admission request");
@@ -95,8 +95,8 @@ async fn validate_myresource(
         );
     }
 
-    // Get the new object (already typed as MyResource)
-    let resource: MyResource = match &request.object {
+    // Get the new object (already typed as ValkeyCluster)
+    let resource: ValkeyCluster = match &request.object {
         Some(obj) => obj.clone(),
         None => {
             error!(uid = %uid, "Missing object in request");
@@ -112,7 +112,7 @@ async fn validate_myresource(
     };
 
     // Get the old object for UPDATE operations (already typed)
-    let old_resource: Option<MyResource> = request.old_object.clone();
+    let old_resource: Option<ValkeyCluster> = request.old_object.clone();
 
     // Create validation context
     let ctx = ValidationContext {
@@ -168,7 +168,7 @@ impl std::error::Error for WebhookError {}
 
 /// Run the webhook server with TLS
 ///
-/// Binds to 0.0.0.0:9443 and serves the /validate-myresource endpoint.
+/// Binds to 0.0.0.0:9443 and serves the /validate-valkeycluster endpoint.
 /// TLS certificates are loaded from the paths specified.
 ///
 /// # Arguments
@@ -206,20 +206,20 @@ pub async fn run_webhook_server(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::crd::{MyResource, MyResourceSpec};
+    use crate::crd::{ValkeyCluster, ValkeyClusterSpec};
     use crate::webhooks::policies::ValidationContext;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::collections::BTreeMap;
 
-    fn create_resource(replicas: i32, message: &str) -> MyResource {
-        MyResource {
+    fn create_resource(replicas: i32, message: &str) -> ValkeyCluster {
+        ValkeyCluster {
             metadata: ObjectMeta {
                 name: Some("test".to_string()),
                 namespace: Some("default".to_string()),
                 uid: Some("test-uid".to_string()),
                 ..Default::default()
             },
-            spec: MyResourceSpec {
+            spec: ValkeyClusterSpec {
                 replicas,
                 message: message.to_string(),
                 labels: BTreeMap::new(),

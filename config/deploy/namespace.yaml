@@ -1,9 +1,9 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: my-operator-system
+  name: valkey-operator-system
   labels:
-    app.kubernetes.io/name: my-operator
+    app.kubernetes.io/name: valkey-operator
     app.kubernetes.io/component: operator
     # Pod Security Standards (PSS) - enforce restricted profile
     # See: https://kubernetes.io/docs/concepts/security/pod-security-standards/

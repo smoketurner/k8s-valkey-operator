@@ -7,20 +7,20 @@ use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::Client;
 use kube::api::Api;
 
-use my_operator::crd::{MyResource, Phase};
+use valkey_operator::crd::{ValkeyCluster, Phase};
 
-/// Assert that a MyResource exists and has the expected phase.
-pub async fn assert_myresource_phase(
+/// Assert that a ValkeyCluster exists and has the expected phase.
+pub async fn assert_valkeycluster_phase(
     client: Client,
     namespace: &str,
     name: &str,
     expected_phase: Phase,
 ) {
-    let api: Api<MyResource> = Api::namespaced(client, namespace);
+    let api: Api<ValkeyCluster> = Api::namespaced(client, namespace);
     let resource = api
         .get(name)
         .await
-        .unwrap_or_else(|e| panic!("Failed to get MyResource {}/{}: {}", namespace, name, e));
+        .unwrap_or_else(|e| panic!("Failed to get ValkeyCluster {}/{}: {}", namespace, name, e));
 
     let actual_phase = resource
         .status
@@ -30,14 +30,14 @@ pub async fn assert_myresource_phase(
 
     assert_eq!(
         actual_phase, expected_phase,
-        "MyResource {}/{} phase mismatch: expected {:?}, got {:?}",
+        "ValkeyCluster {}/{} phase mismatch: expected {:?}, got {:?}",
         namespace, name, expected_phase, actual_phase
     );
 }
 
-/// Assert that a MyResource is in the Ready phase.
-pub async fn assert_myresource_ready(client: Client, namespace: &str, name: &str) {
-    assert_myresource_phase(client, namespace, name, Phase::Running).await;
+/// Assert that a ValkeyCluster is in the Ready phase.
+pub async fn assert_valkeycluster_ready(client: Client, namespace: &str, name: &str) {
+    assert_valkeycluster_phase(client, namespace, name, Phase::Running).await;
 }
 
 /// Assert that a Deployment exists with expected replica count.

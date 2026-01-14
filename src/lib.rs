@@ -1,6 +1,7 @@
-//! my-operator library crate
+//! valkey-operator library crate
 //!
-//! This module exports the controller, CRD definitions, and resource generators.
+//! This module exports the controller, CRD definitions, and resource generators
+//! for managing Valkey Clusters on Kubernetes.
 
 pub mod controller;
 pub mod crd;
@@ -24,8 +25,8 @@ use kube::{Api, Client, Resource};
 use serde::de::DeserializeOwned;
 use tracing::{debug, error, info};
 
-use controller::{context::Context, reconciler::reconcile};
-use crd::MyResource;
+use controller::{context::Context, cluster_reconciler::reconcile};
+use crd::ValkeyCluster;
 
 /// Create namespaced or cluster-wide API based on scope
 pub fn scoped_api<T>(client: Client, namespace: Option<&str>) -> Api<T>
@@ -78,7 +79,7 @@ where
 
 /// Run the operator controller (cluster-wide).
 ///
-/// This is the main controller loop that watches MyResource resources
+/// This is the main controller loop that watches ValkeyCluster resources
 /// and reconciles them. It can be called from main.rs or spawned as a
 /// background task during integration tests.
 ///
@@ -100,7 +101,7 @@ pub async fn run_controller_scoped(
 ) {
     let scope_msg = namespace.unwrap_or("cluster-wide");
     info!(
-        "Starting controller for MyResource resources (scope: {})",
+        "Starting controller for ValkeyCluster resources (scope: {})",
         scope_msg
     );
 
@@ -112,7 +113,7 @@ pub async fn run_controller_scoped(
     let ctx = Arc::new(Context::new(client.clone(), health_state));
 
     // Set up APIs for the controller (namespaced or cluster-wide)
-    let myresources: Api<MyResource> = scoped_api(client.clone(), namespace);
+    let valkeyclusters: Api<ValkeyCluster> = scoped_api(client.clone(), namespace);
     let deployments: Api<Deployment> = scoped_api(client.clone(), namespace);
     let services: Api<Service> = scoped_api(client.clone(), namespace);
     let configmaps: Api<ConfigMap> = scoped_api(client.clone(), namespace);
@@ -121,7 +122,7 @@ pub async fn run_controller_scoped(
     let watcher_config = default_watcher_config();
 
     // Create filtered stream with standard optimizations (reflector, backoff, generation predicate)
-    let (reader, resource_stream) = create_filtered_stream(myresources, watcher_config.clone());
+    let (reader, resource_stream) = create_filtered_stream(valkeyclusters, watcher_config.clone());
 
     // Create and run the controller using for_stream with the pre-filtered stream
     // Memory optimization: Use metadata_watcher for owned resources where we only need to know
@@ -132,7 +133,7 @@ pub async fn run_controller_scoped(
         .owns(deployments, watcher_config.clone())
         .owns_stream(metadata_watcher(services, watcher_config.clone()).touched_objects())
         .owns_stream(metadata_watcher(configmaps, watcher_config).touched_objects())
-        .run(reconcile, controller::reconciler::error_policy, ctx)
+        .run(reconcile, controller::cluster_reconciler::error_policy, ctx)
         .for_each(|result| async move {
             match result {
                 Ok((obj, _action)) => {

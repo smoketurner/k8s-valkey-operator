@@ -1,0 +1,32 @@
+Valkey Operator has been installed.
+
+=============================================================================
+Getting Started
+=============================================================================
+
+1. Verify the operator is running:
+
+   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "valkey-operator.name" . }}
+
+2. Create a ValkeyCluster:
+
+   cat <<EOF | kubectl apply -f -
+   apiVersion: valkeyoperator.smoketurner.com/v1alpha1
+   kind: ValkeyCluster
+   metadata:
+     name: example
+   spec:
+     replicas: 3
+     message: "Hello from ValkeyCluster!"
+   EOF
+
+3. Check the resource status:
+
+   kubectl get valkeyclusters
+   kubectl describe valkeycluster example
+
+4. Wait for the resource to be ready:
+
+   kubectl wait --for=condition=Ready valkeycluster/example --timeout=300s
+
+For more information, visit: https://github.com/smoketurner/k8s-valkey-operator

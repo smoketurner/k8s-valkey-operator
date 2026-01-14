@@ -1,15 +1,15 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: my-operator
-  namespace: my-operator-system
+  name: valkey-operator
+  namespace: valkey-operator-system
   labels:
-    app.kubernetes.io/name: my-operator
+    app.kubernetes.io/name: valkey-operator
     app.kubernetes.io/component: controller
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: my-operator
+      app.kubernetes.io/name: valkey-operator
   policyTypes:
     - Ingress
     - Egress

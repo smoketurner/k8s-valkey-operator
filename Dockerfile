@@ -27,9 +27,9 @@ FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
 # Copy the statically-linked binary
-COPY --from=builder /app/target/release/my-operator /my-operator
+COPY --from=builder /app/target/release/valkey-operator /valkey-operator
 
 # Run as non-root (numeric UID since scratch has no /etc/passwd)
 USER 1000:1000
 
-ENTRYPOINT ["/my-operator"]
+ENTRYPOINT ["/valkey-operator"]

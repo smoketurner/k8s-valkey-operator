@@ -1,14 +1,14 @@
 {{/*
 Expand the name of the chart.
 */}}
-{{- define "my-operator.name" -}}
+{{- define "valkey-operator.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Create a default fully qualified app name.
 */}}
-{{- define "my-operator.fullname" -}}
+{{- define "valkey-operator.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -24,16 +24,16 @@ Create a default fully qualified app name.
 {{/*
 Create chart name and version as used by the chart label.
 */}}
-{{- define "my-operator.chart" -}}
+{{- define "valkey-operator.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Common labels
 */}}
-{{- define "my-operator.labels" -}}
-helm.sh/chart: {{ include "my-operator.chart" . }}
-{{ include "my-operator.selectorLabels" . }}
+{{- define "valkey-operator.labels" -}}
+helm.sh/chart: {{ include "valkey-operator.chart" . }}
+{{ include "valkey-operator.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
@@ -43,17 +43,17 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/*
 Selector labels
 */}}
-{{- define "my-operator.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "my-operator.name" . }}
+{{- define "valkey-operator.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "valkey-operator.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
 Create the name of the service account to use
 */}}
-{{- define "my-operator.serviceAccountName" -}}
+{{- define "valkey-operator.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create }}
-{{- default (include "my-operator.fullname" .) .Values.serviceAccount.name }}
+{{- default (include "valkey-operator.fullname" .) .Values.serviceAccount.name }}
 {{- else }}
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
@@ -62,7 +62,7 @@ Create the name of the service account to use
 {{/*
 Operator image
 */}}
-{{- define "my-operator.image" -}}
+{{- define "valkey-operator.image" -}}
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
 {{- printf "%s:%s" .Values.image.repository $tag }}
 {{- end }}

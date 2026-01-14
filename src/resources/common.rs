@@ -11,19 +11,19 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
 use std::collections::BTreeMap;
 
-use crate::crd::MyResource;
+use crate::crd::ValkeyCluster;
 
 /// Standard labels applied to all managed resources
-pub fn standard_labels(resource: &MyResource) -> BTreeMap<String, String> {
+pub fn standard_labels(resource: &ValkeyCluster) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     labels.insert("app.kubernetes.io/name".to_string(), resource.name_any());
     labels.insert(
         "app.kubernetes.io/managed-by".to_string(),
-        "my-operator".to_string(),
+        "valkey-operator".to_string(),
     );
     labels.insert(
         "app.kubernetes.io/component".to_string(),
-        "myresource".to_string(),
+        "valkeycluster".to_string(),
     );
 
     // Merge user-defined labels
@@ -34,11 +34,11 @@ pub fn standard_labels(resource: &MyResource) -> BTreeMap<String, String> {
     labels
 }
 
-/// Create owner reference for a MyResource
-pub fn owner_reference(resource: &MyResource) -> OwnerReference {
+/// Create owner reference for a ValkeyCluster
+pub fn owner_reference(resource: &ValkeyCluster) -> OwnerReference {
     OwnerReference {
-        api_version: "myoperator.example.com/v1alpha1".to_string(),
-        kind: "MyResource".to_string(),
+        api_version: "valkeyoperator.smoketurner.com/v1alpha1".to_string(),
+        kind: "ValkeyCluster".to_string(),
         name: resource.name_any(),
         uid: resource.uid().unwrap_or_default(),
         controller: Some(true),
@@ -46,8 +46,8 @@ pub fn owner_reference(resource: &MyResource) -> OwnerReference {
     }
 }
 
-/// Generate a ConfigMap for a MyResource
-pub fn generate_configmap(resource: &MyResource) -> ConfigMap {
+/// Generate a ConfigMap for a ValkeyCluster
+pub fn generate_configmap(resource: &ValkeyCluster) -> ConfigMap {
     let name = resource.name_any();
     let labels = standard_labels(resource);
 
@@ -69,8 +69,8 @@ pub fn generate_configmap(resource: &MyResource) -> ConfigMap {
     }
 }
 
-/// Generate a Deployment for a MyResource
-pub fn generate_deployment(resource: &MyResource) -> Deployment {
+/// Generate a Deployment for a ValkeyCluster
+pub fn generate_deployment(resource: &ValkeyCluster) -> Deployment {
     let name = resource.name_any();
     let labels = standard_labels(resource);
     let replicas = resource.spec.replicas;
@@ -175,8 +175,8 @@ pub fn generate_deployment(resource: &MyResource) -> Deployment {
     }
 }
 
-/// Generate a Service for a MyResource
-pub fn generate_service(resource: &MyResource) -> Service {
+/// Generate a Service for a ValkeyCluster
+pub fn generate_service(resource: &ValkeyCluster) -> Service {
     let name = resource.name_any();
     let labels = standard_labels(resource);
 

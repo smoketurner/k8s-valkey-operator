@@ -1,4 +1,4 @@
-//! Validation policies for MyResource admission webhooks.
+//! Validation policies for ValkeyCluster admission webhooks.
 //!
 //! Policies are organized into tiers:
 //! - Tier 1 (Critical): Always enforced (replica validation)
@@ -7,7 +7,7 @@
 pub mod immutability;
 pub mod replicas;
 
-use crate::crd::MyResource;
+use crate::crd::ValkeyCluster;
 
 /// Result of a validation check
 #[derive(Debug)]
@@ -43,9 +43,9 @@ impl ValidationResult {
 /// Context for validation
 pub struct ValidationContext<'a> {
     /// The resource being validated
-    pub resource: &'a MyResource,
+    pub resource: &'a ValkeyCluster,
     /// The old resource (for UPDATE operations)
-    pub old_resource: Option<&'a MyResource>,
+    pub old_resource: Option<&'a ValkeyCluster>,
     /// Whether this is a dry-run request
     pub dry_run: bool,
     /// The namespace of the resource

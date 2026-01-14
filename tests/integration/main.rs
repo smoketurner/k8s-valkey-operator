@@ -9,7 +9,7 @@
     unused_variables
 )]
 
-//! Integration test harness for my-operator.
+//! Integration test harness for valkey-operator.
 //!
 //! These tests require a running Kubernetes cluster (e.g., kind, minikube).
 //! Tests are marked with #[ignore] and must be run explicitly:
@@ -19,7 +19,7 @@
 //! cargo test --test integration -- --ignored
 //!
 //! # Run specific test
-//! cargo test --test integration test_myresource_lifecycle -- --ignored
+//! cargo test --test integration test_valkeycluster_lifecycle -- --ignored
 //! ```
 //!
 //! The CRD must be installed before running tests: `make install-crd`
@@ -65,7 +65,7 @@ async fn test_cluster_connectivity() {
     );
 }
 
-/// Test that the MyResource CRD is installed.
+/// Test that the ValkeyCluster CRD is installed.
 #[tokio::test]
 #[ignore = "requires Kubernetes cluster"]
 async fn test_crd_installed() {
@@ -76,32 +76,32 @@ async fn test_crd_installed() {
 
     let crds: Api<CustomResourceDefinition> = Api::all(client);
     let crd = crds
-        .get("myresources.myoperator.example.com")
+        .get("valkeyclusters.valkeyoperator.smoketurner.com")
         .await
         .expect("CRD should be installed. Run `make install-crd` first.");
 
     assert_eq!(
-        crd.spec.group, "myoperator.example.com",
+        crd.spec.group, "valkeyoperator.smoketurner.com",
         "CRD group should match"
     );
 }
 
-/// Test creating and deleting a MyResource in an isolated namespace.
+/// Test creating and deleting a ValkeyCluster in an isolated namespace.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster"]
-async fn test_myresource_lifecycle() {
+async fn test_valkeycluster_lifecycle() {
     use kube::api::{Api, PostParams};
-    use my_operator::crd::MyResource;
+    use valkey_operator::crd::ValkeyCluster;
 
     let (_cluster, client) = init_test().await;
     let test_ns = namespace::TestNamespace::create(client.clone(), "lifecycle-test").await;
 
-    let api: Api<MyResource> = Api::namespaced(client.clone(), test_ns.name());
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), test_ns.name());
 
-    // Create a MyResource
+    // Create a ValkeyCluster
     let resource = serde_json::from_value(serde_json::json!({
-        "apiVersion": "myoperator.example.com/v1alpha1",
-        "kind": "MyResource",
+        "apiVersion": "valkeyoperator.smoketurner.com/v1alpha1",
+        "kind": "ValkeyCluster",
         "metadata": {
             "name": "test-resource"
         },
@@ -110,12 +110,12 @@ async fn test_myresource_lifecycle() {
             "message": "Hello from integration test"
         }
     }))
-    .expect("Failed to parse MyResource");
+    .expect("Failed to parse ValkeyCluster");
 
     let created = api
         .create(&PostParams::default(), &resource)
         .await
-        .expect("Failed to create MyResource");
+        .expect("Failed to create ValkeyCluster");
 
     assert_eq!(created.metadata.name, Some("test-resource".to_string()));
     assert_eq!(created.spec.replicas, 1);

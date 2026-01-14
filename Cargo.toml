@@ -1,9 +1,9 @@
 [package]
-name = "my-operator"
+name = "valkey-operator"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
-description = "A Kubernetes operator for managing MyResource custom resources"
+description = "A Kubernetes operator for managing Valkey Clusters"
 license = "MIT"
 
 [dependencies]
@@ -39,6 +39,13 @@ rustls-pemfile = { version = "=2.2.0", default-features = false, features = ["st
 
 # TLS crypto backend for rustls
 rustls = { version = "=0.23.36", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+
+# Valkey client
+# fred is an async Redis/Valkey client. Features:
+# - i-cluster: CLUSTER command interface (CLUSTER MEET, CLUSTER ADDSLOTS, etc.)
+# - enable-rustls: TLS support via rustls
+# - replicas: Interface for routing commands to replica nodes
+fred = { version = "=10.1.0", default-features = false, features = ["i-cluster", "enable-rustls", "replicas"] }
 
 # Utilities
 jiff = { version = "=0.2.16", default-features = false, features = ["std"] }

@@ -178,16 +178,16 @@ jobs:
 
       - name: Update Chart.yaml version
         run: |
-          sed -i "s/^version:.*/version: ${{ steps.version.outputs.version }}/" charts/my-operator/Chart.yaml
-          sed -i "s/^appVersion:.*/appVersion: \"${{ steps.version.outputs.version }}\"/" charts/my-operator/Chart.yaml
+          sed -i "s/^version:.*/version: ${{ steps.version.outputs.version }}/" charts/valkey-operator/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${{ steps.version.outputs.version }}\"/" charts/valkey-operator/Chart.yaml
 
       - name: Update image repository in values.yaml
         run: |
-          sed -i "s|repository:.*|repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}|" charts/my-operator/values.yaml
+          sed -i "s|repository:.*|repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}|" charts/valkey-operator/values.yaml
 
       - name: Package Helm chart
         run: |
-          helm package charts/my-operator --destination .helm-packages
+          helm package charts/valkey-operator --destination .helm-packages
 
       - name: Generate Helm chart attestation
         uses: actions/attest-build-provenance@00014ed6ed5efc5b1ab7f7f34a39eb55d41aa4f8 # v3.1.0
@@ -228,18 +228,18 @@ jobs:
             ### Using Helm (OCI)
 
             ```bash
-            helm install my-operator oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/my-operator \
+            helm install valkey-operator oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/valkey-operator \
               --version ${{ github.event.inputs.tag || github.ref_name }} \
-              --namespace my-operator-system \
+              --namespace valkey-operator-system \
               --create-namespace
             ```
 
             ### Using Helm (from release assets)
 
             ```bash
-            helm install my-operator \
-              https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag || github.ref_name }}/my-operator-*.tgz \
-              --namespace my-operator-system \
+            helm install valkey-operator \
+              https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag || github.ref_name }}/valkey-operator-*.tgz \
+              --namespace valkey-operator-system \
               --create-namespace
             ```
 

@@ -1,8 +1,8 @@
-# Default values for my-operator.
+# Default values for valkey-operator.
 
 # Operator image configuration
 image:
-  repository: my-operator
+  repository: valkey-operator
   tag: ""  # Defaults to appVersion
   pullPolicy: IfNotPresent
 
@@ -46,7 +46,7 @@ rbac:
   # Create RBAC resources
   create: true
 
-# Install the MyResource CRD
+# Install the ValkeyCluster CRD
 crd:
   install: true
   # Keep CRD on chart uninstall (recommended to prevent data loss)

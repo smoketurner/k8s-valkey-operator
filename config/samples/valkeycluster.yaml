@@ -1,0 +1,9 @@
+apiVersion: valkeyoperator.smoketurner.com/v1alpha1
+kind: ValkeyCluster
+metadata:
+  name: example
+  namespace: default
+spec:
+  # Example configuration
+  replicas: 3
+  message: "Hello from ValkeyCluster!"

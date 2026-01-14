@@ -1,7 +1,7 @@
-//! Reconciliation loop for MyResource.
+//! Reconciliation loop for ValkeyCluster.
 //!
 //! This module contains the main reconcile function that handles the lifecycle
-//! of MyResource custom resources.
+//! of ValkeyCluster custom resources.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,29 +14,29 @@ use kube::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    controller::{context::Context, error::Error, state_machine::ResourceStateMachine},
-    crd::{Condition, MyResource, MyResourceStatus, Phase},
+    controller::{context::Context, error::Error, cluster_state_machine::ClusterStateMachine},
+    crd::{Condition, ValkeyCluster, ValkeyClusterStatus, Phase},
     resources,
 };
 
 /// Field manager name for server-side apply
-pub const FIELD_MANAGER: &str = "my-operator";
+pub const FIELD_MANAGER: &str = "valkey-operator";
 
 /// Finalizer name for graceful deletion
-pub const FINALIZER: &str = "myoperator.example.com/finalizer";
+pub const FINALIZER: &str = "valkeyoperator.smoketurner.com/finalizer";
 
-/// Reconcile a MyResource
+/// Reconcile a ValkeyCluster
 ///
 /// This is the main reconciliation function called by the controller.
 /// It handles the full lifecycle: creation, updates, and deletion.
-pub async fn reconcile(obj: Arc<MyResource>, ctx: Arc<Context>) -> Result<Action, Error> {
+pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Action, Error> {
     let start_time = Instant::now();
     let name = obj.name_any();
     let namespace = obj.namespace().unwrap_or_else(|| "default".to_string());
 
-    debug!(name = %name, namespace = %namespace, "Reconciling MyResource");
+    debug!(name = %name, namespace = %namespace, "Reconciling ValkeyCluster");
 
-    let api: Api<MyResource> = Api::namespaced(ctx.client.clone(), &namespace);
+    let api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), &namespace);
 
     // Handle deletion
     if obj.metadata.deletion_timestamp.is_some() {
@@ -72,7 +72,7 @@ pub async fn reconcile(obj: Arc<MyResource>, ctx: Arc<Context>) -> Result<Action
     }
 
     // Initialize state machine for transition validation
-    let state_machine = ResourceStateMachine::new();
+    let state_machine = ClusterStateMachine::new();
 
     // Determine next phase based on current state
     let next_phase = match current_phase {
@@ -247,7 +247,7 @@ pub async fn reconcile(obj: Arc<MyResource>, ctx: Arc<Context>) -> Result<Action
 }
 
 /// Error policy for the controller
-pub fn error_policy(obj: Arc<MyResource>, error: &Error, ctx: Arc<Context>) -> Action {
+pub fn error_policy(obj: Arc<ValkeyCluster>, error: &Error, ctx: Arc<Context>) -> Action {
     let name = obj.name_any();
     let namespace = obj.namespace().unwrap_or_else(|| "default".to_string());
 
@@ -271,7 +271,7 @@ pub fn error_policy(obj: Arc<MyResource>, error: &Error, ctx: Arc<Context>) -> A
 }
 
 /// Validate the resource spec
-fn validate_spec(obj: &MyResource) -> Result<(), Error> {
+fn validate_spec(obj: &ValkeyCluster) -> Result<(), Error> {
     if obj.spec.replicas < 1 {
         return Err(Error::Validation("replicas must be at least 1".to_string()));
     }
@@ -281,9 +281,9 @@ fn validate_spec(obj: &MyResource) -> Result<(), Error> {
     Ok(())
 }
 
-/// Handle deletion of a MyResource
+/// Handle deletion of a ValkeyCluster
 async fn handle_deletion(
-    obj: &MyResource,
+    obj: &ValkeyCluster,
     ctx: &Context,
     namespace: &str,
 ) -> Result<Action, Error> {
@@ -294,14 +294,14 @@ async fn handle_deletion(
     // but we can do explicit cleanup here if needed)
 
     // Remove finalizer
-    let api: Api<MyResource> = Api::namespaced(ctx.client.clone(), namespace);
+    let api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), namespace);
     remove_finalizer(&api, &name).await?;
 
     Ok(Action::await_change())
 }
 
 /// Add finalizer to resource
-async fn add_finalizer(api: &Api<MyResource>, name: &str) -> Result<(), Error> {
+async fn add_finalizer(api: &Api<ValkeyCluster>, name: &str) -> Result<(), Error> {
     let patch = serde_json::json!({
         "metadata": {
             "finalizers": [FINALIZER]
@@ -317,7 +317,7 @@ async fn add_finalizer(api: &Api<MyResource>, name: &str) -> Result<(), Error> {
 }
 
 /// Remove finalizer from resource
-async fn remove_finalizer(api: &Api<MyResource>, name: &str) -> Result<(), Error> {
+async fn remove_finalizer(api: &Api<ValkeyCluster>, name: &str) -> Result<(), Error> {
     let patch = serde_json::json!({
         "metadata": {
             "finalizers": null
@@ -334,7 +334,7 @@ async fn remove_finalizer(api: &Api<MyResource>, name: &str) -> Result<(), Error
 
 /// Create owned resources (Deployment, ConfigMap, Service)
 async fn create_owned_resources(
-    obj: &MyResource,
+    obj: &ValkeyCluster,
     ctx: &Context,
     namespace: &str,
 ) -> Result<(), Error> {
@@ -382,7 +382,7 @@ async fn create_owned_resources(
 
 /// Check number of ready replicas
 async fn check_ready_replicas(
-    obj: &MyResource,
+    obj: &ValkeyCluster,
     ctx: &Context,
     namespace: &str,
 ) -> Result<i32, Error> {
@@ -404,9 +404,9 @@ async fn check_ready_replicas(
     }
 }
 
-/// Update the status of a MyResource
+/// Update the status of a ValkeyCluster
 async fn update_status(
-    api: &Api<MyResource>,
+    api: &Api<ValkeyCluster>,
     name: &str,
     phase: Phase,
     ready_replicas: i32,
@@ -437,7 +437,7 @@ async fn update_status(
         )]
     };
 
-    let status = MyResourceStatus {
+    let status = ValkeyClusterStatus {
         phase,
         ready_replicas,
         observed_generation: generation,

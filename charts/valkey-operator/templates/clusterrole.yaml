@@ -2,15 +2,15 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "my-operator.fullname" . }}
+  name: {{ include "valkey-operator.fullname" . }}
   labels:
-    {{- include "my-operator.labels" . | nindent 4 }}
+    {{- include "valkey-operator.labels" . | nindent 4 }}
 rules:
-  # MyResource CRD resources
+  # ValkeyCluster CRD resources
   - apiGroups:
-      - myoperator.example.com
+      - valkeyoperator.smoketurner.com
     resources:
-      - myresources
+      - valkeyclusters
     verbs:
       - get
       - list
@@ -20,17 +20,17 @@ rules:
       - patch
       - delete
   - apiGroups:
-      - myoperator.example.com
+      - valkeyoperator.smoketurner.com
     resources:
-      - myresources/status
+      - valkeyclusters/status
     verbs:
       - get
       - update
       - patch
   - apiGroups:
-      - myoperator.example.com
+      - valkeyoperator.smoketurner.com
     resources:
-      - myresources/finalizers
+      - valkeyclusters/finalizers
     verbs:
       - update
 

@@ -11,7 +11,7 @@ use std::fmt::Debug;
 use std::time::Duration;
 use tokio::time::timeout;
 
-use my_operator::crd::{MyResource, Phase};
+use valkey_operator::crd::{ValkeyCluster, Phase};
 
 /// Error type for wait operations.
 #[derive(Debug, thiserror::Error)]
@@ -174,11 +174,11 @@ where
 }
 
 // ============================================================
-// MyResource-specific wait helpers
+// ValkeyCluster-specific wait helpers
 // ============================================================
 
-/// Check if a MyResource is in a specific phase.
-pub fn is_phase(resource: &MyResource, phase: Phase) -> bool {
+/// Check if a ValkeyCluster is in a specific phase.
+pub fn is_phase(resource: &ValkeyCluster, phase: Phase) -> bool {
     resource
         .status
         .as_ref()
@@ -186,8 +186,8 @@ pub fn is_phase(resource: &MyResource, phase: Phase) -> bool {
         .unwrap_or(false)
 }
 
-/// Check if a MyResource has the expected ready replicas.
-pub fn has_ready_replicas(resource: &MyResource, count: i32) -> bool {
+/// Check if a ValkeyCluster has the expected ready replicas.
+pub fn has_ready_replicas(resource: &ValkeyCluster, count: i32) -> bool {
     resource
         .status
         .as_ref()
@@ -195,8 +195,8 @@ pub fn has_ready_replicas(resource: &MyResource, count: i32) -> bool {
         .unwrap_or(false)
 }
 
-/// Check if a MyResource is operational (Running phase with all replicas ready).
-pub fn is_operational(resource: &MyResource) -> bool {
+/// Check if a ValkeyCluster is operational (Running phase with all replicas ready).
+pub fn is_operational(resource: &ValkeyCluster) -> bool {
     resource
         .status
         .as_ref()
@@ -204,38 +204,38 @@ pub fn is_operational(resource: &MyResource) -> bool {
         .unwrap_or(false)
 }
 
-/// Check if a MyResource's generation has been observed.
-pub fn generation_observed(resource: &MyResource) -> bool {
+/// Check if a ValkeyCluster's generation has been observed.
+pub fn generation_observed(resource: &ValkeyCluster) -> bool {
     match (resource.metadata.generation, &resource.status) {
         (Some(current_gen), Some(status)) => status.observed_generation == Some(current_gen),
         _ => false,
     }
 }
 
-/// Wait for a MyResource to reach a specific phase.
+/// Wait for a ValkeyCluster to reach a specific phase.
 pub async fn wait_for_phase(
-    api: &Api<MyResource>,
+    api: &Api<ValkeyCluster>,
     name: &str,
     phase: Phase,
     timeout_duration: Duration,
-) -> Result<MyResource, WaitError> {
+) -> Result<ValkeyCluster, WaitError> {
     wait_for_condition(api, name, |r| is_phase(r, phase), timeout_duration).await
 }
 
-/// Wait for a MyResource to be operational (Running with all replicas ready).
+/// Wait for a ValkeyCluster to be operational (Running with all replicas ready).
 pub async fn wait_for_operational(
-    api: &Api<MyResource>,
+    api: &Api<ValkeyCluster>,
     name: &str,
     timeout_duration: Duration,
-) -> Result<MyResource, WaitError> {
+) -> Result<ValkeyCluster, WaitError> {
     wait_for_condition(api, name, is_operational, timeout_duration).await
 }
 
-/// Wait for a MyResource to have its generation observed.
+/// Wait for a ValkeyCluster to have its generation observed.
 pub async fn wait_for_generation_observed(
-    api: &Api<MyResource>,
+    api: &Api<ValkeyCluster>,
     name: &str,
     timeout_duration: Duration,
-) -> Result<MyResource, WaitError> {
+) -> Result<ValkeyCluster, WaitError> {
     wait_for_condition(api, name, generation_observed, timeout_duration).await
 }

@@ -1,8 +1,8 @@
-# Makefile for my-operator Kubernetes Operator
+# Makefile for valkey-operator Kubernetes Operator
 
 # Image configuration
-IMG ?= my-operator:latest
-NAMESPACE ?= my-operator-system
+IMG ?= valkey-operator:latest
+NAMESPACE ?= valkey-operator-system
 
 # Tool binaries
 KUBECTL ?= kubectl
@@ -80,11 +80,11 @@ undeploy: ## Undeploy the operator from the cluster
 
 ##@ Samples
 
-deploy-sample: ## Deploy a sample MyResource
-	$(KUBECTL) apply -f config/samples/my-resource.yaml
+deploy-sample: ## Deploy a sample ValkeyCluster
+	$(KUBECTL) apply -f config/samples/valkeycluster.yaml
 
-delete-sample: ## Delete the sample MyResource
-	$(KUBECTL) delete -f config/samples/my-resource.yaml --ignore-not-found
+delete-sample: ## Delete the sample ValkeyCluster
+	$(KUBECTL) delete -f config/samples/valkeycluster.yaml --ignore-not-found
 
 ##@ Cleanup
 

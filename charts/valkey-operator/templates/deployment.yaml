@@ -1,10 +1,10 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "my-operator.fullname" . }}
+  name: {{ include "valkey-operator.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "my-operator.labels" . | nindent 4 }}
+    {{- include "valkey-operator.labels" . | nindent 4 }}
     app.kubernetes.io/component: controller
 spec:
   replicas: {{ .Values.replicaCount }}
@@ -12,7 +12,7 @@ spec:
   minReadySeconds: 5
   selector:
     matchLabels:
-      {{- include "my-operator.selectorLabels" . | nindent 6 }}
+      {{- include "valkey-operator.selectorLabels" . | nindent 6 }}
   strategy:
     type: Recreate
   template:
@@ -22,7 +22,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       labels:
-        {{- include "my-operator.selectorLabels" . | nindent 8 }}
+        {{- include "valkey-operator.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: controller
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
@@ -32,7 +32,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "my-operator.serviceAccountName" . }}
+      serviceAccountName: {{ include "valkey-operator.serviceAccountName" . }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -42,7 +42,7 @@ spec:
       {{- end }}
       containers:
         - name: operator
-          image: {{ include "my-operator.image" . }}
+          image: {{ include "valkey-operator.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             - name: RUST_LOG

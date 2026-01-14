@@ -1,4 +1,4 @@
-//! Formal finite state machine for MyResource lifecycle management.
+//! Formal finite state machine for ValkeyCluster lifecycle management.
 //!
 //! This module implements a proper FSM pattern with explicit state transitions,
 //! guards, and actions. It ensures that only valid state transitions occur and
@@ -10,7 +10,7 @@ use crate::crd::Phase;
 
 /// Events that trigger state transitions in the resource lifecycle
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ResourceEvent {
+pub enum ClusterEvent {
     /// Kubernetes resources have been applied to the cluster
     ResourcesApplied,
     /// All desired replicas are ready
@@ -29,17 +29,17 @@ pub enum ResourceEvent {
     FullyRecovered,
 }
 
-impl fmt::Display for ResourceEvent {
+impl fmt::Display for ClusterEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ResourceEvent::ResourcesApplied => write!(f, "ResourcesApplied"),
-            ResourceEvent::AllReplicasReady => write!(f, "AllReplicasReady"),
-            ResourceEvent::ReplicasDegraded => write!(f, "ReplicasDegraded"),
-            ResourceEvent::SpecChanged => write!(f, "SpecChanged"),
-            ResourceEvent::ReconcileError => write!(f, "ReconcileError"),
-            ResourceEvent::DeletionRequested => write!(f, "DeletionRequested"),
-            ResourceEvent::RecoveryInitiated => write!(f, "RecoveryInitiated"),
-            ResourceEvent::FullyRecovered => write!(f, "FullyRecovered"),
+            ClusterEvent::ResourcesApplied => write!(f, "ResourcesApplied"),
+            ClusterEvent::AllReplicasReady => write!(f, "AllReplicasReady"),
+            ClusterEvent::ReplicasDegraded => write!(f, "ReplicasDegraded"),
+            ClusterEvent::SpecChanged => write!(f, "SpecChanged"),
+            ClusterEvent::ReconcileError => write!(f, "ReconcileError"),
+            ClusterEvent::DeletionRequested => write!(f, "DeletionRequested"),
+            ClusterEvent::RecoveryInitiated => write!(f, "RecoveryInitiated"),
+            ClusterEvent::FullyRecovered => write!(f, "FullyRecovered"),
         }
     }
 }
@@ -107,14 +107,14 @@ pub struct Transition {
     /// Target state
     pub to: Phase,
     /// Event that triggers this transition
-    pub event: ResourceEvent,
+    pub event: ClusterEvent,
     /// Human-readable description of this transition
     pub description: &'static str,
 }
 
 impl Transition {
     /// Create a new transition
-    const fn new(from: Phase, to: Phase, event: ResourceEvent, description: &'static str) -> Self {
+    const fn new(from: Phase, to: Phase, event: ClusterEvent, description: &'static str) -> Self {
         Self {
             from,
             to,
@@ -131,35 +131,35 @@ pub enum TransitionResult {
     Success {
         from: Phase,
         to: Phase,
-        event: ResourceEvent,
+        event: ClusterEvent,
         description: &'static str,
     },
     /// Transition was not valid for current state
     InvalidTransition {
         current: Phase,
-        event: ResourceEvent,
+        event: ClusterEvent,
     },
     /// Guard condition prevented the transition
     GuardFailed {
         from: Phase,
         to: Phase,
-        event: ResourceEvent,
+        event: ClusterEvent,
         reason: String,
     },
 }
 
-/// Formal state machine for MyResource lifecycle
-pub struct ResourceStateMachine {
+/// Formal state machine for ValkeyCluster lifecycle
+pub struct ClusterStateMachine {
     transitions: Vec<Transition>,
 }
 
-impl Default for ResourceStateMachine {
+impl Default for ClusterStateMachine {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ResourceStateMachine {
+impl ClusterStateMachine {
     /// Create a new state machine with the defined transition table
     pub fn new() -> Self {
         Self {
@@ -168,138 +168,138 @@ impl ResourceStateMachine {
                 Transition::new(
                     Phase::Pending,
                     Phase::Creating,
-                    ResourceEvent::ResourcesApplied,
+                    ClusterEvent::ResourcesApplied,
                     "Starting resource creation",
                 ),
                 Transition::new(
                     Phase::Pending,
                     Phase::Failed,
-                    ResourceEvent::ReconcileError,
+                    ClusterEvent::ReconcileError,
                     "Validation failed during pending",
                 ),
                 Transition::new(
                     Phase::Pending,
                     Phase::Deleting,
-                    ResourceEvent::DeletionRequested,
+                    ClusterEvent::DeletionRequested,
                     "Resource deletion requested before creation",
                 ),
                 // === Creating state transitions ===
                 Transition::new(
                     Phase::Creating,
                     Phase::Running,
-                    ResourceEvent::AllReplicasReady,
+                    ClusterEvent::AllReplicasReady,
                     "All replicas are ready, resource is now running",
                 ),
                 Transition::new(
                     Phase::Creating,
                     Phase::Degraded,
-                    ResourceEvent::ReplicasDegraded,
+                    ClusterEvent::ReplicasDegraded,
                     "Some replicas ready but resource is degraded",
                 ),
                 Transition::new(
                     Phase::Creating,
                     Phase::Failed,
-                    ResourceEvent::ReconcileError,
+                    ClusterEvent::ReconcileError,
                     "Error during resource creation",
                 ),
                 Transition::new(
                     Phase::Creating,
                     Phase::Deleting,
-                    ResourceEvent::DeletionRequested,
+                    ClusterEvent::DeletionRequested,
                     "Resource deletion requested during creation",
                 ),
                 // === Running state transitions ===
                 Transition::new(
                     Phase::Running,
                     Phase::Updating,
-                    ResourceEvent::SpecChanged,
+                    ClusterEvent::SpecChanged,
                     "Resource spec changed, starting update",
                 ),
                 Transition::new(
                     Phase::Running,
                     Phase::Degraded,
-                    ResourceEvent::ReplicasDegraded,
+                    ClusterEvent::ReplicasDegraded,
                     "Resource health degraded",
                 ),
                 Transition::new(
                     Phase::Running,
                     Phase::Failed,
-                    ResourceEvent::ReconcileError,
+                    ClusterEvent::ReconcileError,
                     "Error while running",
                 ),
                 Transition::new(
                     Phase::Running,
                     Phase::Deleting,
-                    ResourceEvent::DeletionRequested,
+                    ClusterEvent::DeletionRequested,
                     "Resource deletion requested",
                 ),
                 // === Updating state transitions ===
                 Transition::new(
                     Phase::Updating,
                     Phase::Running,
-                    ResourceEvent::AllReplicasReady,
+                    ClusterEvent::AllReplicasReady,
                     "Update completed, resource is running",
                 ),
                 Transition::new(
                     Phase::Updating,
                     Phase::Degraded,
-                    ResourceEvent::ReplicasDegraded,
+                    ClusterEvent::ReplicasDegraded,
                     "Update in progress but resource degraded",
                 ),
                 Transition::new(
                     Phase::Updating,
                     Phase::Failed,
-                    ResourceEvent::ReconcileError,
+                    ClusterEvent::ReconcileError,
                     "Error during update",
                 ),
                 Transition::new(
                     Phase::Updating,
                     Phase::Deleting,
-                    ResourceEvent::DeletionRequested,
+                    ClusterEvent::DeletionRequested,
                     "Resource deletion requested during update",
                 ),
                 // === Degraded state transitions ===
                 Transition::new(
                     Phase::Degraded,
                     Phase::Running,
-                    ResourceEvent::FullyRecovered,
+                    ClusterEvent::FullyRecovered,
                     "Resource fully recovered from degraded state",
                 ),
                 Transition::new(
                     Phase::Degraded,
                     Phase::Running,
-                    ResourceEvent::AllReplicasReady,
+                    ClusterEvent::AllReplicasReady,
                     "All replicas recovered",
                 ),
                 Transition::new(
                     Phase::Degraded,
                     Phase::Updating,
-                    ResourceEvent::SpecChanged,
+                    ClusterEvent::SpecChanged,
                     "Spec changed while degraded",
                 ),
                 Transition::new(
                     Phase::Degraded,
                     Phase::Failed,
-                    ResourceEvent::ReconcileError,
+                    ClusterEvent::ReconcileError,
                     "Degraded resource encountered error",
                 ),
                 Transition::new(
                     Phase::Degraded,
                     Phase::Deleting,
-                    ResourceEvent::DeletionRequested,
+                    ClusterEvent::DeletionRequested,
                     "Resource deletion requested while degraded",
                 ),
                 // === Failed state transitions ===
                 Transition::new(
                     Phase::Failed,
                     Phase::Pending,
-                    ResourceEvent::RecoveryInitiated,
+                    ClusterEvent::RecoveryInitiated,
                     "Recovery initiated from failed state",
                 ),
                 Transition::new(
                     Phase::Failed,
                     Phase::Deleting,
-                    ResourceEvent::DeletionRequested,
+                    ClusterEvent::DeletionRequested,
                     "Resource deletion requested while failed",
                 ),
                 // === Deleting state transitions (terminal) ===
@@ -312,7 +312,7 @@ impl ResourceStateMachine {
     pub fn transition(
         &self,
         current: &Phase,
-        event: ResourceEvent,
+        event: ClusterEvent,
         ctx: &TransitionContext,
     ) -> TransitionResult {
         // Find a matching transition
@@ -348,14 +348,14 @@ impl ResourceStateMachine {
     }
 
     /// Check if a transition is valid (ignoring guards)
-    pub fn can_transition(&self, from: &Phase, event: &ResourceEvent) -> bool {
+    pub fn can_transition(&self, from: &Phase, event: &ClusterEvent) -> bool {
         self.transitions
             .iter()
             .any(|t| t.from == *from && t.event == *event)
     }
 
     /// Get all valid events for a given state
-    pub fn valid_events(&self, state: &Phase) -> Vec<&ResourceEvent> {
+    pub fn valid_events(&self, state: &Phase) -> Vec<&ClusterEvent> {
         self.transitions
             .iter()
             .filter(|t| t.from == *state)
@@ -367,7 +367,7 @@ impl ResourceStateMachine {
     fn check_guard(&self, transition: &Transition, ctx: &TransitionContext) -> Option<String> {
         match (&transition.from, &transition.to, &transition.event) {
             // Guard: AllReplicasReady requires all replicas to be ready
-            (_, Phase::Running, ResourceEvent::AllReplicasReady) => {
+            (_, Phase::Running, ClusterEvent::AllReplicasReady) => {
                 if !ctx.all_replicas_ready() {
                     Some(format!(
                         "Not all replicas ready: {}/{}",
@@ -378,7 +378,7 @@ impl ResourceStateMachine {
                 }
             }
             // Guard: ReplicasDegraded requires partial readiness
-            (_, Phase::Degraded, ResourceEvent::ReplicasDegraded) => {
+            (_, Phase::Degraded, ClusterEvent::ReplicasDegraded) => {
                 if !ctx.is_degraded() {
                     Some(format!(
                         "Resource is not degraded: {}/{} replicas ready",
@@ -389,7 +389,7 @@ impl ResourceStateMachine {
                 }
             }
             // Guard: FullyRecovered requires all replicas ready
-            (Phase::Degraded, Phase::Running, ResourceEvent::FullyRecovered) => {
+            (Phase::Degraded, Phase::Running, ClusterEvent::FullyRecovered) => {
                 if !ctx.all_replicas_ready() {
                     Some(format!(
                         "Cannot mark as recovered, not all replicas ready: {}/{}",
@@ -410,38 +410,38 @@ pub fn determine_event(
     current_phase: &Phase,
     ctx: &TransitionContext,
     has_deletion_timestamp: bool,
-) -> ResourceEvent {
+) -> ClusterEvent {
     // Deletion always takes priority
     if has_deletion_timestamp {
-        return ResourceEvent::DeletionRequested;
+        return ClusterEvent::DeletionRequested;
     }
 
     // Check for spec change
     if ctx.spec_changed && matches!(current_phase, Phase::Running | Phase::Degraded) {
-        return ResourceEvent::SpecChanged;
+        return ClusterEvent::SpecChanged;
     }
 
     // Determine event based on replica status
     if ctx.all_replicas_ready() {
         match current_phase {
-            Phase::Failed => ResourceEvent::RecoveryInitiated,
-            Phase::Degraded => ResourceEvent::FullyRecovered,
-            _ => ResourceEvent::AllReplicasReady,
+            Phase::Failed => ClusterEvent::RecoveryInitiated,
+            Phase::Degraded => ClusterEvent::FullyRecovered,
+            _ => ClusterEvent::AllReplicasReady,
         }
     } else if ctx.is_degraded() {
-        ResourceEvent::ReplicasDegraded
+        ClusterEvent::ReplicasDegraded
     } else if *current_phase == Phase::Pending {
-        ResourceEvent::ResourcesApplied
+        ClusterEvent::ResourcesApplied
     } else if ctx.no_replicas_ready() && matches!(current_phase, Phase::Creating | Phase::Updating)
     {
         // During initial bootstrap or updates, having 0 ready replicas
         // is a normal transitional state, not an error. Return ResourcesApplied
         // which has no valid transition from these states (InvalidTransition),
         // keeping us in the current state while waiting for pods to become ready.
-        ResourceEvent::ResourcesApplied
+        ClusterEvent::ResourcesApplied
     } else {
         // Default: error occurred
-        ResourceEvent::ReconcileError
+        ClusterEvent::ReconcileError
     }
 }
 
@@ -457,10 +457,10 @@ mod tests {
 
     #[test]
     fn test_pending_to_creating() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
         let ctx = TransitionContext::new(0, 3);
 
-        let result = sm.transition(&Phase::Pending, ResourceEvent::ResourcesApplied, &ctx);
+        let result = sm.transition(&Phase::Pending, ClusterEvent::ResourcesApplied, &ctx);
 
         match result {
             TransitionResult::Success { from, to, .. } => {
@@ -473,47 +473,47 @@ mod tests {
 
     #[test]
     fn test_creating_to_running_guard() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
 
         // Should fail with 0/3 replicas ready
         let ctx = TransitionContext::new(0, 3);
-        let result = sm.transition(&Phase::Creating, ResourceEvent::AllReplicasReady, &ctx);
+        let result = sm.transition(&Phase::Creating, ClusterEvent::AllReplicasReady, &ctx);
         assert!(matches!(result, TransitionResult::GuardFailed { .. }));
 
         // Should succeed with 3/3 replicas ready
         let ctx = TransitionContext::new(3, 3);
-        let result = sm.transition(&Phase::Creating, ResourceEvent::AllReplicasReady, &ctx);
+        let result = sm.transition(&Phase::Creating, ClusterEvent::AllReplicasReady, &ctx);
         assert!(matches!(result, TransitionResult::Success { .. }));
     }
 
     #[test]
     fn test_running_to_degraded_guard() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
 
         // Should succeed with 2/3 replicas (degraded)
         let ctx = TransitionContext::new(2, 3);
-        let result = sm.transition(&Phase::Running, ResourceEvent::ReplicasDegraded, &ctx);
+        let result = sm.transition(&Phase::Running, ClusterEvent::ReplicasDegraded, &ctx);
         assert!(matches!(result, TransitionResult::Success { .. }));
 
         // Should fail with 3/3 replicas (not degraded)
         let ctx = TransitionContext::new(3, 3);
-        let result = sm.transition(&Phase::Running, ResourceEvent::ReplicasDegraded, &ctx);
+        let result = sm.transition(&Phase::Running, ClusterEvent::ReplicasDegraded, &ctx);
         assert!(matches!(result, TransitionResult::GuardFailed { .. }));
     }
 
     #[test]
     fn test_invalid_transition() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
         let ctx = TransitionContext::new(3, 3);
 
         // Running -> Creating is not a valid transition
-        let result = sm.transition(&Phase::Running, ResourceEvent::ResourcesApplied, &ctx);
+        let result = sm.transition(&Phase::Running, ClusterEvent::ResourcesApplied, &ctx);
         assert!(matches!(result, TransitionResult::InvalidTransition { .. }));
     }
 
     #[test]
     fn test_deleting_is_terminal() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
 
         // No valid events should transition out of Deleting
         let valid_events = sm.valid_events(&Phase::Deleting);
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn test_deletion_from_any_state() {
-        let sm = ResourceStateMachine::new();
+        let sm = ClusterStateMachine::new();
 
         let states = vec![
             Phase::Pending,
@@ -535,7 +535,7 @@ mod tests {
 
         for state in states {
             assert!(
-                sm.can_transition(&state, &ResourceEvent::DeletionRequested),
+                sm.can_transition(&state, &ClusterEvent::DeletionRequested),
                 "Should be able to transition from {:?} to Deleting",
                 state
             );
@@ -546,27 +546,27 @@ mod tests {
     fn test_determine_event_deletion_priority() {
         let ctx = TransitionContext::new(3, 3);
         let event = determine_event(&Phase::Running, &ctx, true);
-        assert_eq!(event, ResourceEvent::DeletionRequested);
+        assert_eq!(event, ClusterEvent::DeletionRequested);
     }
 
     #[test]
     fn test_determine_event_spec_changed() {
         let ctx = TransitionContext::new(3, 3).with_spec_changed(true);
         let event = determine_event(&Phase::Running, &ctx, false);
-        assert_eq!(event, ResourceEvent::SpecChanged);
+        assert_eq!(event, ClusterEvent::SpecChanged);
     }
 
     #[test]
     fn test_determine_event_all_replicas_ready() {
         let ctx = TransitionContext::new(3, 3);
         let event = determine_event(&Phase::Creating, &ctx, false);
-        assert_eq!(event, ResourceEvent::AllReplicasReady);
+        assert_eq!(event, ClusterEvent::AllReplicasReady);
     }
 
     #[test]
     fn test_determine_event_degraded() {
         let ctx = TransitionContext::new(2, 3);
         let event = determine_event(&Phase::Running, &ctx, false);
-        assert_eq!(event, ResourceEvent::ReplicasDegraded);
+        assert_eq!(event, ClusterEvent::ReplicasDegraded);
     }
 }

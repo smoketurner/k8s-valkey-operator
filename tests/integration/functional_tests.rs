@@ -1,4 +1,4 @@
-//! Functional tests for MyResource lifecycle operations.
+//! Functional tests for ValkeyCluster lifecycle operations.
 //!
 //! These tests verify the core functionality of the operator including:
 //! - Resource creation and owned resource generation
@@ -11,21 +11,21 @@ use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::api::{Api, Patch, PatchParams, PostParams};
 
-use my_operator::crd::{MyResource, Phase};
+use valkey_operator::crd::{ValkeyCluster, Phase};
 
 use crate::assertions::{
     assert_configmap_has_key, assert_deployment_replicas, assert_has_owner_reference,
-    assert_myresource_phase, assert_service_exists,
+    assert_valkeycluster_phase, assert_service_exists,
 };
 use crate::namespace::TestNamespace;
 use crate::wait::{wait_for_condition, wait_for_operational, wait_for_phase};
 use crate::{init_test, wait};
 
-/// Helper to create a test MyResource.
-fn test_resource(name: &str, replicas: i32, message: &str) -> MyResource {
+/// Helper to create a test ValkeyCluster.
+fn test_resource(name: &str, replicas: i32, message: &str) -> ValkeyCluster {
     serde_json::from_value(serde_json::json!({
-        "apiVersion": "myoperator.example.com/v1alpha1",
-        "kind": "MyResource",
+        "apiVersion": "valkeyoperator.smoketurner.com/v1alpha1",
+        "kind": "ValkeyCluster",
         "metadata": {
             "name": name
         },
@@ -37,7 +37,7 @@ fn test_resource(name: &str, replicas: i32, message: &str) -> MyResource {
     .expect("Failed to create test resource")
 }
 
-/// Test that creating a MyResource creates the expected Deployment.
+/// Test that creating a ValkeyCluster creates the expected Deployment.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_creates_deployment() {
@@ -45,14 +45,14 @@ async fn test_creates_deployment() {
     let test_ns = TestNamespace::create(client.clone(), "creates-deployment").await;
     let ns_name = test_ns.name().to_string();
 
-    let api: Api<MyResource> = Api::namespaced(client.clone(), &ns_name);
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
     let resource = test_resource("test-deploy", 1, "test message");
     api.create(&PostParams::default(), &resource)
         .await
-        .expect("Failed to create MyResource");
+        .expect("Failed to create ValkeyCluster");
 
     // Wait for resource to start creating
     wait_for_phase(
@@ -74,10 +74,10 @@ async fn test_creates_deployment() {
 
     // Verify owner reference
     let deployment = deploy_api.get("test-deploy").await.unwrap();
-    assert_has_owner_reference(&deployment, "test-deploy", "MyResource");
+    assert_has_owner_reference(&deployment, "test-deploy", "ValkeyCluster");
 }
 
-/// Test that creating a MyResource creates the expected ConfigMap.
+/// Test that creating a ValkeyCluster creates the expected ConfigMap.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_creates_configmap() {
@@ -85,14 +85,14 @@ async fn test_creates_configmap() {
     let test_ns = TestNamespace::create(client.clone(), "creates-configmap").await;
     let ns_name = test_ns.name().to_string();
 
-    let api: Api<MyResource> = Api::namespaced(client.clone(), &ns_name);
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
     let resource = test_resource("test-cm", 1, "hello world");
     api.create(&PostParams::default(), &resource)
         .await
-        .expect("Failed to create MyResource");
+        .expect("Failed to create ValkeyCluster");
 
     // Wait for configmap to exist
     wait::wait_for_resource(&cm_api, "test-cm", Duration::from_secs(30))
@@ -104,10 +104,10 @@ async fn test_creates_configmap() {
 
     // Verify owner reference
     let configmap = cm_api.get("test-cm").await.unwrap();
-    assert_has_owner_reference(&configmap, "test-cm", "MyResource");
+    assert_has_owner_reference(&configmap, "test-cm", "ValkeyCluster");
 }
 
-/// Test that creating a MyResource creates the expected Service.
+/// Test that creating a ValkeyCluster creates the expected Service.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_creates_service() {
@@ -115,14 +115,14 @@ async fn test_creates_service() {
     let test_ns = TestNamespace::create(client.clone(), "creates-service").await;
     let ns_name = test_ns.name().to_string();
 
-    let api: Api<MyResource> = Api::namespaced(client.clone(), &ns_name);
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let svc_api: Api<Service> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
     let resource = test_resource("test-svc", 1, "service test");
     api.create(&PostParams::default(), &resource)
         .await
-        .expect("Failed to create MyResource");
+        .expect("Failed to create ValkeyCluster");
 
     // Wait for service to exist
     wait::wait_for_resource(&svc_api, "test-svc", Duration::from_secs(30))
@@ -134,10 +134,10 @@ async fn test_creates_service() {
 
     // Verify owner reference
     let service = svc_api.get("test-svc").await.unwrap();
-    assert_has_owner_reference(&service, "test-svc", "MyResource");
+    assert_has_owner_reference(&service, "test-svc", "ValkeyCluster");
 }
 
-/// Test that a MyResource reaches Running phase when pods are ready.
+/// Test that a ValkeyCluster reaches Running phase when pods are ready.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_resource_becomes_running() {
@@ -145,13 +145,13 @@ async fn test_resource_becomes_running() {
     let test_ns = TestNamespace::create(client.clone(), "becomes-running").await;
     let ns_name = test_ns.name().to_string();
 
-    let api: Api<MyResource> = Api::namespaced(client.clone(), &ns_name);
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
     let resource = test_resource("test-running", 1, "running test");
     api.create(&PostParams::default(), &resource)
         .await
-        .expect("Failed to create MyResource");
+        .expect("Failed to create ValkeyCluster");
 
     // Wait for resource to become operational (Running with replicas ready)
     wait_for_operational(&api, "test-running", Duration::from_secs(120))
@@ -159,10 +159,10 @@ async fn test_resource_becomes_running() {
         .expect("Resource should become operational");
 
     // Verify final state
-    assert_myresource_phase(client.clone(), &ns_name, "test-running", Phase::Running).await;
+    assert_valkeycluster_phase(client.clone(), &ns_name, "test-running", Phase::Running).await;
 }
 
-/// Test that updating a MyResource spec triggers reconciliation.
+/// Test that updating a ValkeyCluster spec triggers reconciliation.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_spec_update() {
@@ -170,14 +170,14 @@ async fn test_spec_update() {
     let test_ns = TestNamespace::create(client.clone(), "spec-update").await;
     let ns_name = test_ns.name().to_string();
 
-    let api: Api<MyResource> = Api::namespaced(client.clone(), &ns_name);
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
     let resource = test_resource("test-update", 1, "original message");
     api.create(&PostParams::default(), &resource)
         .await
-        .expect("Failed to create MyResource");
+        .expect("Failed to create ValkeyCluster");
 
     // Wait for initial reconciliation
     wait_for_operational(&api, "test-update", Duration::from_secs(120))
@@ -196,7 +196,7 @@ async fn test_spec_update() {
         &Patch::Merge(&patch),
     )
     .await
-    .expect("Failed to patch MyResource");
+    .expect("Failed to patch ValkeyCluster");
 
     // Wait for the update to be processed
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -218,7 +218,7 @@ async fn test_spec_update() {
     );
 }
 
-/// Test that deleting a MyResource triggers cleanup.
+/// Test that deleting a ValkeyCluster triggers cleanup.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_resource_deletion() {
@@ -226,14 +226,14 @@ async fn test_resource_deletion() {
     let test_ns = TestNamespace::create(client.clone(), "deletion-test").await;
     let ns_name = test_ns.name().to_string();
 
-    let api: Api<MyResource> = Api::namespaced(client.clone(), &ns_name);
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
     let resource = test_resource("test-delete", 1, "deletion test");
     api.create(&PostParams::default(), &resource)
         .await
-        .expect("Failed to create MyResource");
+        .expect("Failed to create ValkeyCluster");
 
     // Wait for resource to be ready
     wait_for_operational(&api, "test-delete", Duration::from_secs(120))
@@ -243,12 +243,12 @@ async fn test_resource_deletion() {
     // Delete the resource
     api.delete("test-delete", &Default::default())
         .await
-        .expect("Failed to delete MyResource");
+        .expect("Failed to delete ValkeyCluster");
 
     // Wait for deletion to complete
     wait::wait_for_deletion(&api, "test-delete", Duration::from_secs(60))
         .await
-        .expect("MyResource should be deleted");
+        .expect("ValkeyCluster should be deleted");
 
     // Verify owned resources are also deleted (via owner references)
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -256,7 +256,7 @@ async fn test_resource_deletion() {
     let deployment_exists = deploy_api.get("test-delete").await.is_ok();
     assert!(
         !deployment_exists,
-        "Deployment should be garbage collected after MyResource deletion"
+        "Deployment should be garbage collected after ValkeyCluster deletion"
     );
 }
 
@@ -268,7 +268,7 @@ async fn test_validation_rejects_invalid_replicas() {
     let test_ns = TestNamespace::create(client.clone(), "validation-test").await;
     let ns_name = test_ns.name().to_string();
 
-    let api: Api<MyResource> = Api::namespaced(client.clone(), &ns_name);
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Try to create resource with invalid replicas (0)
     let invalid_resource = test_resource("invalid-replicas", 0, "should fail");

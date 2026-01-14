@@ -1,4 +1,4 @@
-# Clippy configuration for my-operator
+# Clippy configuration for valkey-operator
 # See: https://doc.rust-lang.org/clippy/configuration.html
 
 # Allow breaking the exported API (we're pre-1.0)

@@ -1,21 +1,21 @@
-//! Test fixtures and builder patterns for MyResource.
+//! Test fixtures and builder patterns for ValkeyCluster.
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use my_operator::crd::{MyResource, MyResourceSpec};
+use valkey_operator::crd::{ValkeyCluster, ValkeyClusterSpec};
 use std::collections::BTreeMap;
 
-/// Builder for creating MyResource test fixtures.
+/// Builder for creating ValkeyCluster test fixtures.
 ///
 /// # Example
 /// ```
-/// let resource = MyResourceBuilder::new("test-resource")
+/// let resource = ValkeyClusterBuilder::new("test-resource")
 ///     .namespace("test-ns")
 ///     .replicas(3)
 ///     .message("Hello, World!")
 ///     .build();
 /// ```
 #[derive(Clone, Debug)]
-pub struct MyResourceBuilder {
+pub struct ValkeyClusterBuilder {
     name: String,
     namespace: Option<String>,
     replicas: i32,
@@ -26,14 +26,14 @@ pub struct MyResourceBuilder {
     uid: Option<String>,
 }
 
-impl MyResourceBuilder {
+impl ValkeyClusterBuilder {
     /// Create a new builder with the given resource name.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             namespace: None,
             replicas: 1,
-            message: "Hello from MyResource".to_string(),
+            message: "Hello from ValkeyCluster".to_string(),
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             generation: None,
@@ -89,9 +89,9 @@ impl MyResourceBuilder {
         self
     }
 
-    /// Build the MyResource.
-    pub fn build(self) -> MyResource {
-        MyResource {
+    /// Build the ValkeyCluster.
+    pub fn build(self) -> ValkeyCluster {
+        ValkeyCluster {
             metadata: ObjectMeta {
                 name: Some(self.name),
                 namespace: self.namespace,
@@ -109,7 +109,7 @@ impl MyResourceBuilder {
                 uid: self.uid,
                 ..Default::default()
             },
-            spec: MyResourceSpec {
+            spec: ValkeyClusterSpec {
                 replicas: self.replicas,
                 message: self.message,
                 labels: BTreeMap::new(),
@@ -119,20 +119,20 @@ impl MyResourceBuilder {
     }
 }
 
-impl Default for MyResourceBuilder {
+impl Default for ValkeyClusterBuilder {
     fn default() -> Self {
         Self::new("test-resource")
     }
 }
 
-/// Create a minimal MyResource for testing.
-pub fn minimal_resource(name: &str) -> MyResource {
-    MyResourceBuilder::new(name).build()
+/// Create a minimal ValkeyCluster for testing.
+pub fn minimal_resource(name: &str) -> ValkeyCluster {
+    ValkeyClusterBuilder::new(name).build()
 }
 
-/// Create a MyResource with common test defaults.
-pub fn test_resource(name: &str, namespace: &str) -> MyResource {
-    MyResourceBuilder::new(name)
+/// Create a ValkeyCluster with common test defaults.
+pub fn test_resource(name: &str, namespace: &str) -> ValkeyCluster {
+    ValkeyClusterBuilder::new(name)
         .namespace(namespace)
         .replicas(1)
         .generation(1)
@@ -146,14 +146,14 @@ mod tests {
 
     #[test]
     fn test_builder_defaults() {
-        let resource = MyResourceBuilder::new("test").build();
+        let resource = ValkeyClusterBuilder::new("test").build();
         assert_eq!(resource.metadata.name, Some("test".to_string()));
         assert_eq!(resource.spec.replicas, 1);
     }
 
     #[test]
     fn test_builder_with_options() {
-        let resource = MyResourceBuilder::new("test")
+        let resource = ValkeyClusterBuilder::new("test")
             .namespace("my-ns")
             .replicas(3)
             .message("Custom message")
