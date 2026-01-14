@@ -1,0 +1,77 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:kube.rs)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:kubernetes.io)",
+      "Bash(cargo check:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo run:*)",
+      "Bash(make:*)",
+      "Bash(kubectl get:*)",
+      "Bash(kubectl describe:*)",
+      "Bash(kubectl logs:*)",
+      "Bash(kubectl apply:*)",
+      "Bash(kubectl delete:*)",
+      "Bash(kubectl wait:*)",
+      "Bash(kubectl auth:*)",
+      "Bash(kubectl config:*)",
+      "Bash(kubectl cluster-info:*)",
+      "Bash(kubectl exec:*)",
+      "Bash(kubectl port-forward:*)",
+      "Bash(docker build:*)",
+      "Bash(docker images:*)",
+      "Bash(docker tag:*)",
+      "Bash(docker push:*)",
+      "Bash(docker info:*)",
+      "Bash(git log:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(tree:*)",
+      "Bash(wc:*)",
+      "mcp__kubernetes__kubectl_context",
+      "mcp__kubernetes__kubectl_get",
+      "mcp__kubernetes__list_api_resources",
+      "mcp__kubernetes__kubectl_apply",
+      "mcp__kubernetes__kubectl_describe",
+      "mcp__kubernetes__kubectl_generic",
+      "mcp__kubernetes__kubectl_delete",
+      "mcp__kubernetes__kubectl_wait",
+      "mcp__kubernetes__kubectl_auth",
+      "mcp__kubernetes__kubectl_config",
+      "mcp__kubernetes__kubectl_cluster-info",
+      "mcp__kubernetes__kubectl_exec",
+      "mcp__kubernetes__kubectl_port-forward",
+      "mcp__kubernetes__kubectl_top"
+    ],
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Bash(docker run:*)"
+    ]
+  },
+  "env": {
+    "DISABLE_AUTOUPDATER": "1",
+    "RUST_BACKTRACE": "1"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [[ \"$CLAUDE_TOOL_INPUT_FILE_PATH\" == *.rs ]]; then cargo check --quiet 2>&1 || true; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

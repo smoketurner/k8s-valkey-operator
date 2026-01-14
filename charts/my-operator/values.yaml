@@ -1,0 +1,138 @@
+# Default values for my-operator.
+
+# Operator image configuration
+image:
+  repository: my-operator
+  tag: ""  # Defaults to appVersion
+  pullPolicy: IfNotPresent
+
+# Image pull secrets for private registries
+imagePullSecrets: []
+# - name: regcred
+
+# Override the name of the chart
+nameOverride: ""
+fullnameOverride: ""
+
+# Number of operator replicas (only 1 is active due to leader election)
+replicaCount: 1
+
+# Operator configuration
+operator:
+  # Log level (trace, debug, info, warn, error)
+  logLevel: info
+
+  # Leader election settings
+  leaderElection:
+    enabled: true
+    leaseDuration: 15
+    renewDeadline: 10
+    retryPeriod: 2
+
+  # Health server port
+  healthPort: 8080
+
+# Service account configuration
+serviceAccount:
+  # Create service account
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account (generated if not set)
+  name: ""
+
+# RBAC configuration
+rbac:
+  # Create RBAC resources
+  create: true
+
+# Install the MyResource CRD
+crd:
+  install: true
+  # Keep CRD on chart uninstall (recommended to prevent data loss)
+  keep: true
+
+# Resource limits and requests
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Node selector for operator pod
+nodeSelector: {}
+
+# Tolerations for operator pod
+tolerations: []
+
+# Affinity rules for operator pod
+affinity: {}
+
+# Pod annotations
+podAnnotations: {}
+
+# Pod labels
+podLabels: {}
+
+# Pod security context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+# Container security context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Liveness probe configuration
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: health
+  initialDelaySeconds: 15
+  periodSeconds: 20
+
+# Readiness probe configuration
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: health
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+# Prometheus ServiceMonitor (requires prometheus-operator)
+serviceMonitor:
+  enabled: false
+  # Additional labels for the ServiceMonitor
+  labels: {}
+  # Scrape interval
+  interval: 30s
+  # Scrape timeout
+  scrapeTimeout: 10s
+  # Metric relabeling configs
+  metricRelabelings: []
+  # Relabeling configs
+  relabelings: []
+
+# Pod priority class name
+priorityClassName: ""
+
+# Termination grace period
+terminationGracePeriodSeconds: 10
+
+# Extra environment variables
+extraEnv: []
+# - name: MY_VAR
+#   value: "my-value"
+
+# Extra volume mounts
+extraVolumeMounts: []
+
+# Extra volumes
+extraVolumes: []

@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-operator
+  namespace: my-operator-system
+  labels:
+    app.kubernetes.io/name: my-operator
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  # Progress deadline for deployment rollouts (5 minutes)
+  progressDeadlineSeconds: 300
+  # Minimum time a pod must be ready before considered available
+  minReadySeconds: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: my-operator
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: my-operator
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: my-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: operator
+          image: my-operator:latest
+          imagePullPolicy: Always
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+            - name: webhook
+              containerPort: 8443
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            # Webhook TLS certificates (mounted from cert-manager secret)
+            - name: webhook-certs
+              mountPath: /etc/webhook/certs
+              readOnly: true
+      volumes:
+        # Webhook TLS certificates from cert-manager
+        - name: webhook-certs
+          secret:
+            secretName: my-operator-webhook-tls
+            optional: true # Allow deployment to start without webhook
+      terminationGracePeriodSeconds: 10

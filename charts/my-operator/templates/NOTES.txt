@@ -1,0 +1,32 @@
+My Operator has been installed.
+
+=============================================================================
+Getting Started
+=============================================================================
+
+1. Verify the operator is running:
+
+   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "my-operator.name" . }}
+
+2. Create a MyResource:
+
+   cat <<EOF | kubectl apply -f -
+   apiVersion: myoperator.example.com/v1alpha1
+   kind: MyResource
+   metadata:
+     name: example
+   spec:
+     replicas: 3
+     message: "Hello from MyResource!"
+   EOF
+
+3. Check the resource status:
+
+   kubectl get myresources
+   kubectl describe myresource example
+
+4. Wait for the resource to be ready:
+
+   kubectl wait --for=condition=Ready myresource/example --timeout=300s
+
+For more information, visit: https://github.com/your-org/my-operator

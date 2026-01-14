@@ -1,0 +1,18 @@
+apiVersion: v2
+name: my-operator
+description: A Kubernetes operator for managing MyResource custom resources
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.35.0-0"
+keywords:
+  - kubernetes
+  - operator
+  - custom-resource
+maintainers:
+  - name: My Operator Team
+    email: maintainers@example.com
+annotations:
+  artifacthub.io/license: MIT
+  artifacthub.io/operator: "true"
+  artifacthub.io/operatorCapabilities: Full Lifecycle

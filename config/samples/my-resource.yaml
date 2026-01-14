@@ -1,0 +1,9 @@
+apiVersion: myoperator.example.com/v1alpha1
+kind: MyResource
+metadata:
+  name: example
+  namespace: default
+spec:
+  # Example configuration
+  replicas: 3
+  message: "Hello from MyResource!"
