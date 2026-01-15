@@ -15,6 +15,7 @@
 pub mod certificate;
 pub mod common;
 pub mod pdb;
+pub mod port_forward;
 pub mod services;
 pub mod statefulset;
 

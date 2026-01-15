@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Example:
 /// ```yaml
-/// apiVersion: valkeyoperator.smoketurner.com/v1alpha1
+/// apiVersion: valkey-operator.smoketurner.com/v1alpha1
 /// kind: ValkeyCluster
 /// metadata:
 ///   name: my-cluster
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[kube(
-    group = "valkeyoperator.smoketurner.com",
+    group = "valkey-operator.smoketurner.com",
     version = "v1alpha1",
     kind = "ValkeyCluster",
     plural = "valkeyclusters",

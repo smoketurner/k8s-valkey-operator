@@ -113,8 +113,7 @@ fn generate_pod_template(
             affinity: Some(generate_affinity(resource)),
             containers: vec![generate_valkey_container(resource)],
             volumes: Some(generate_volumes(resource)),
-            // Service account for the pod
-            service_account_name: Some(name),
+            // Use the default service account - Valkey pods don't need K8s API access
             ..Default::default()
         }),
     }
@@ -373,13 +372,15 @@ fn generate_container_security_context() -> SecurityContext {
 ///
 /// Uses simple PING during startup to allow time for AOF loading.
 /// Higher failure threshold to accommodate large datasets.
+/// Uses VALKEYCLI_AUTH environment variable for secure password handling.
+/// Uses --tls --insecure for localhost connections (skips cert validation).
 fn generate_startup_probe() -> Probe {
     Probe {
         exec: Some(ExecAction {
             command: Some(vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "valkey-cli --tls --cert /etc/valkey/certs/tls.crt --key /etc/valkey/certs/tls.key --cacert /etc/valkey/certs/ca.crt -a $VALKEY_PASSWORD ping".to_string(),
+                "VALKEYCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure ping".to_string(),
             ]),
         }),
         // 60 failures * 5 seconds = 5 minutes for AOF loading
@@ -393,13 +394,15 @@ fn generate_startup_probe() -> Probe {
 /// Generate liveness probe.
 ///
 /// Uses simple PING to verify the process is responsive.
+/// Uses VALKEYCLI_AUTH environment variable for secure password handling.
+/// Uses --tls --insecure for localhost connections (skips cert validation).
 fn generate_liveness_probe() -> Probe {
     Probe {
         exec: Some(ExecAction {
             command: Some(vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "valkey-cli --tls --cert /etc/valkey/certs/tls.crt --key /etc/valkey/certs/tls.key --cacert /etc/valkey/certs/ca.crt -a $VALKEY_PASSWORD ping".to_string(),
+                "VALKEYCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure ping".to_string(),
             ]),
         }),
         initial_delay_seconds: Some(10),
@@ -415,13 +418,15 @@ fn generate_liveness_probe() -> Probe {
 /// Checks that the cluster state is OK, meaning:
 /// - Node is part of the cluster
 /// - Cluster is consistent and operational
+/// Uses VALKEYCLI_AUTH environment variable for secure password handling.
+/// Uses --tls --insecure for localhost connections (skips cert validation).
 fn generate_readiness_probe() -> Probe {
     Probe {
         exec: Some(ExecAction {
             command: Some(vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "valkey-cli --tls --cert /etc/valkey/certs/tls.crt --key /etc/valkey/certs/tls.key --cacert /etc/valkey/certs/ca.crt -a $VALKEY_PASSWORD cluster info | grep cluster_state:ok".to_string(),
+                "VALKEYCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure cluster info | grep cluster_state:ok".to_string(),
             ]),
         }),
         initial_delay_seconds: Some(5),
@@ -436,6 +441,8 @@ fn generate_readiness_probe() -> Probe {
 /// Generate lifecycle hooks.
 ///
 /// preStop hook performs BGSAVE before termination to minimize data loss.
+/// Uses VALKEYCLI_AUTH environment variable for secure password handling.
+/// Uses --tls --insecure for localhost connections (skips cert validation).
 fn generate_lifecycle() -> Lifecycle {
     Lifecycle {
         pre_stop: Some(LifecycleHandler {
@@ -443,7 +450,7 @@ fn generate_lifecycle() -> Lifecycle {
                 command: Some(vec![
                     "sh".to_string(),
                     "-c".to_string(),
-                    "valkey-cli --tls --cert /etc/valkey/certs/tls.crt --key /etc/valkey/certs/tls.key --cacert /etc/valkey/certs/ca.crt -a $VALKEY_PASSWORD bgsave && sleep 5".to_string(),
+                    "VALKEYCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure bgsave && sleep 5".to_string(),
                 ]),
             }),
             ..Default::default()

@@ -15,7 +15,7 @@ use kube::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    client::{ScalingContext, ScalingOps},
+    client::{ScalingContext, ScalingOps, TlsCertData},
     controller::{
         context::Context,
         error::Error,
@@ -30,7 +30,7 @@ use crate::{
 pub const FIELD_MANAGER: &str = "valkey-operator";
 
 /// Finalizer name for graceful deletion
-pub const FINALIZER: &str = "valkeyoperator.smoketurner.com/finalizer";
+pub const FINALIZER: &str = "valkey-operator.smoketurner.com/finalizer";
 
 /// Reconcile a ValkeyCluster
 ///
@@ -110,23 +110,30 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             // Create owned resources
             create_owned_resources(&obj, &ctx, &namespace).await?;
 
-            // Check if resources are ready
-            let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
+            // Check if pods are running (not Ready - readiness requires cluster to be OK)
+            // We need running pods to start cluster initialization
+            let running_pods = check_running_pods(&obj, &ctx, &namespace).await?;
             let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
-            if ready_replicas >= desired_replicas {
+            if running_pods >= desired_replicas {
                 ctx.publish_normal_event(
                     &obj,
-                    "PodsReady",
+                    "PodsRunning",
                     "Reconciling",
                     Some(format!(
-                        "All pods ready ({}/{}), initializing cluster",
-                        ready_replicas, desired_replicas
+                        "All pods running ({}/{}), initializing cluster",
+                        running_pods, desired_replicas
                     )),
                 )
                 .await;
                 // Transition to Initializing for CLUSTER MEET operations
                 ClusterPhase::Initializing
             } else {
+                debug!(
+                    name = %name,
+                    running = running_pods,
+                    desired = desired_replicas,
+                    "Waiting for pods to be running"
+                );
                 ClusterPhase::Creating
             }
         }
@@ -168,51 +175,111 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             // Apply updates
             create_owned_resources(&obj, &ctx, &namespace).await?;
 
-            let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
+            // Check running pods - new pods might need to be added to cluster
+            let running_pods = check_running_pods(&obj, &ctx, &namespace).await?;
             let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
 
-            if ready_replicas >= desired_replicas {
-                // Check if this update involves scaling (masters count change)
-                let current_masters = get_current_master_count(&obj, &ctx, &namespace).await?;
-                let target_masters = obj.spec.masters;
+            // Check if all desired pods are running
+            if running_pods < desired_replicas {
+                debug!(
+                    name = %name,
+                    running = running_pods,
+                    desired = desired_replicas,
+                    "Waiting for pods to be running"
+                );
+                ClusterPhase::Updating
+            } else {
+                // All pods are running, check if new nodes need to be added to cluster
+                let nodes_in_cluster = get_nodes_in_cluster_count(&obj, &ctx, &namespace).await?;
 
-                if current_masters != target_masters && current_masters > 0 {
-                    // Scaling operation needed - transition to Resharding
-                    let direction = if target_masters > current_masters {
-                        "up"
-                    } else {
-                        "down"
-                    };
+                if nodes_in_cluster < desired_replicas {
+                    // New pods need to be added to cluster via CLUSTER MEET + REPLICATE
                     info!(
                         name = %name,
-                        current_masters = current_masters,
-                        target_masters = target_masters,
-                        direction = direction,
-                        "Scaling detected, transitioning to Resharding"
+                        nodes_in_cluster = nodes_in_cluster,
+                        desired = desired_replicas,
+                        "New pods detected, adding to cluster"
                     );
-                    ctx.publish_normal_event(
-                        &obj,
-                        "ScalingDetected",
-                        "Updating",
-                        Some(format!(
-                            "Scaling {} from {} to {} masters",
-                            direction, current_masters, target_masters
-                        )),
-                    )
-                    .await;
-                    ClusterPhase::Resharding
+
+                    match add_new_replicas_to_cluster(&obj, &ctx, &namespace).await {
+                        Ok(added) => {
+                            info!(name = %name, added = added, "Added new replicas to cluster");
+                            ctx.publish_normal_event(
+                                &obj,
+                                "ReplicasAdded",
+                                "Updating",
+                                Some(format!("Added {} new replicas to cluster", added)),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            warn!(name = %name, error = %e, "Failed to add replicas, will retry");
+                            ctx.publish_warning_event(
+                                &obj,
+                                "ReplicaAddFailed",
+                                "Updating",
+                                Some(format!("Failed to add replicas: {}", e)),
+                            )
+                            .await;
+                        }
+                    }
+                    // Stay in Updating to verify all replicas are ready
+                    ClusterPhase::Updating
                 } else {
-                    ctx.publish_normal_event(
-                        &obj,
-                        "Updated",
-                        "Updating",
-                        Some("Resource update completed successfully".to_string()),
-                    )
-                    .await;
-                    ClusterPhase::Running
+                    // All pods are in cluster, check ready status
+                    let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
+
+                    if ready_replicas >= desired_replicas {
+                        // Check if this update involves scaling (masters count change)
+                        let current_masters = get_current_master_count(&obj, &ctx, &namespace).await?;
+                        let target_masters = obj.spec.masters;
+
+                        if current_masters != target_masters && current_masters > 0 {
+                            // Scaling operation needed - transition to Resharding
+                            let direction = if target_masters > current_masters {
+                                "up"
+                            } else {
+                                "down"
+                            };
+                            info!(
+                                name = %name,
+                                current_masters = current_masters,
+                                target_masters = target_masters,
+                                direction = direction,
+                                "Scaling detected, transitioning to Resharding"
+                            );
+                            ctx.publish_normal_event(
+                                &obj,
+                                "ScalingDetected",
+                                "Updating",
+                                Some(format!(
+                                    "Scaling {} from {} to {} masters",
+                                    direction, current_masters, target_masters
+                                )),
+                            )
+                            .await;
+                            ClusterPhase::Resharding
+                        } else {
+                            ctx.publish_normal_event(
+                                &obj,
+                                "Updated",
+                                "Updating",
+                                Some("Resource update completed successfully".to_string()),
+                            )
+                            .await;
+                            ClusterPhase::Running
+                        }
+                    } else {
+                        // Wait for pods to become ready
+                        debug!(
+                            name = %name,
+                            ready = ready_replicas,
+                            desired = desired_replicas,
+                            "Waiting for pods to become ready"
+                        );
+                        ClusterPhase::Updating
+                    }
                 }
-            } else {
-                ClusterPhase::Updating
             }
         }
         ClusterPhase::Degraded => {
@@ -249,11 +316,18 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             // Ensure resources are still in sync
             create_owned_resources(&obj, &ctx, &namespace).await?;
 
-            let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
+            // Check running pods (not Ready - readiness requires cluster to be OK)
+            let running_pods = check_running_pods(&obj, &ctx, &namespace).await?;
             let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
 
-            if ready_replicas < desired_replicas {
-                // Pods not ready, wait
+            if running_pods < desired_replicas {
+                // Pods not running yet, wait
+                debug!(
+                    name = %name,
+                    running = running_pods,
+                    desired = desired_replicas,
+                    "Waiting for pods to be running before CLUSTER MEET"
+                );
                 ClusterPhase::Initializing
             } else {
                 // Execute CLUSTER MEET to connect all nodes
@@ -536,7 +610,7 @@ async fn remove_finalizer(api: &Api<ValkeyCluster>, name: &str) -> Result<(), Er
     });
     api.patch(
         name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
+        &PatchParams::apply(FIELD_MANAGER),
         &Patch::Merge(&patch),
     )
     .await?;
@@ -646,6 +720,38 @@ async fn check_ready_replicas(
     }
 }
 
+/// Check number of running pods (containers started, but not necessarily Ready).
+/// Used during cluster initialization when readiness probe requires cluster to be OK.
+async fn check_running_pods(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<i32, Error> {
+    use k8s_openapi::api::core::v1::Pod;
+
+    let name = obj.name_any();
+    let pod_api: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
+
+    let label_selector = format!("app.kubernetes.io/name={}", name);
+    let pods = pod_api
+        .list(&kube::api::ListParams::default().labels(&label_selector))
+        .await?;
+
+    let running_count = pods
+        .items
+        .iter()
+        .filter(|pod| {
+            pod.status
+                .as_ref()
+                .and_then(|s| s.phase.as_ref())
+                .map(|phase| phase == "Running")
+                .unwrap_or(false)
+        })
+        .count();
+
+    Ok(running_count as i32)
+}
+
 /// Retrieve password from the auth secret
 async fn get_auth_password(
     ctx: &Context,
@@ -680,6 +786,53 @@ async fn get_auth_password(
     }
 }
 
+/// Retrieve TLS certificates from the TLS secret created by cert-manager.
+///
+/// The secret contains:
+/// - `ca.crt`: CA certificate for verification
+/// - `tls.crt`: Server/client certificate
+/// - `tls.key`: Server/client private key
+async fn get_tls_certs(
+    ctx: &Context,
+    namespace: &str,
+    cluster_name: &str,
+) -> Result<Option<TlsCertData>, Error> {
+    let secret_name = format!("{}-tls", cluster_name);
+    let secret_api: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+
+    match secret_api.get(&secret_name).await {
+        Ok(secret) => {
+            if let Some(data) = secret.data {
+                // Get CA certificate - required for verification
+                let ca_cert = match data.get("ca.crt") {
+                    Some(bytes) => bytes.0.clone(),
+                    None => {
+                        warn!(secret = %secret_name, "ca.crt not found in TLS secret");
+                        return Ok(None);
+                    }
+                };
+
+                // Client cert and key are optional (used for mTLS if provided)
+                let client_cert = data.get("tls.crt").map(|b| b.0.clone());
+                let client_key = data.get("tls.key").map(|b| b.0.clone());
+
+                return Ok(Some(TlsCertData {
+                    ca_cert_pem: ca_cert,
+                    client_cert_pem: client_cert,
+                    client_key_pem: client_key,
+                }));
+            }
+            warn!(secret = %secret_name, "TLS secret has no data");
+            Ok(None)
+        }
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            warn!(secret = %secret_name, "TLS secret not found");
+            Ok(None)
+        }
+        Err(e) => Err(Error::Kube(e)),
+    }
+}
+
 /// Execute cluster initialization (CLUSTER MEET)
 async fn execute_cluster_init(
     obj: &ValkeyCluster,
@@ -695,11 +848,18 @@ async fn execute_cluster_init(
     )
     .await?;
 
-    // TLS is always enabled in our design
-    let use_tls = true;
+    // Get TLS certificates from secret
+    let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
+
+    // Create connection strategy based on environment
+    let strategy = cluster_init::create_connection_strategy(
+        ctx.client.clone(),
+        namespace,
+        &obj.name_any(),
+    );
 
     // Execute cluster meet
-    cluster_init::execute_cluster_meet(obj, password.as_deref(), use_tls)
+    cluster_init::execute_cluster_meet(&ctx.client, obj, password.as_deref(), tls_certs.as_ref(), &strategy)
         .await
         .map_err(|e| Error::Valkey(e.to_string()))?;
 
@@ -721,17 +881,24 @@ async fn execute_slot_assignment(
     )
     .await?;
 
-    // TLS is always enabled in our design
-    let use_tls = true;
+    // Get TLS certificates from secret
+    let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
+
+    // Create connection strategy based on environment
+    let strategy = cluster_init::create_connection_strategy(
+        ctx.client.clone(),
+        namespace,
+        &obj.name_any(),
+    );
 
     // Assign slots to masters
-    cluster_init::assign_slots_to_masters(obj, password.as_deref(), use_tls)
+    cluster_init::assign_slots_to_masters(obj, password.as_deref(), tls_certs.as_ref(), &strategy)
         .await
         .map_err(|e| Error::Valkey(e.to_string()))?;
 
     // Set up replicas
     if obj.spec.replicas_per_master > 0 {
-        cluster_init::setup_replicas(obj, password.as_deref(), use_tls)
+        cluster_init::setup_replicas(obj, password.as_deref(), tls_certs.as_ref(), &strategy)
             .await
             .map_err(|e| Error::Valkey(e.to_string()))?;
     }
@@ -784,11 +951,32 @@ async fn check_cluster_health(
         });
     }
 
-    // Connect to first master to query cluster state
-    let (host, port) = &pod_addresses[0];
-    let use_tls = true;
+    // Get TLS certificates from secret
+    let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
 
-    let client = match ValkeyClient::connect_single(host, *port, password.as_deref(), use_tls).await
+    // Create connection strategy for port forwarding
+    let strategy = cluster_init::create_connection_strategy(
+        ctx.client.clone(),
+        namespace,
+        &obj.name_any(),
+    );
+
+    // Get connection address for first master via port forwarding
+    let (connect_host, connect_port) = match strategy.get_connection(0).await {
+        Ok(addr) => addr,
+        Err(e) => {
+            debug!(error = %e, "Failed to create port forward for health check");
+            return Ok(ClusterHealthStatus {
+                is_healthy: false,
+                healthy_masters: 0,
+                healthy_replicas: 0,
+                slots_assigned: 0,
+                topology: None,
+            });
+        }
+    };
+
+    let client = match ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref()).await
     {
         Ok(c) => c,
         Err(e) => {
@@ -1000,11 +1188,26 @@ async fn get_current_master_count(
         return Ok(0);
     }
 
-    // Connect to first master to query cluster state
-    let (host, port) = &pod_addresses[0];
-    let use_tls = true;
+    // Get TLS certificates from secret
+    let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
 
-    let client = match ValkeyClient::connect_single(host, *port, password.as_deref(), use_tls).await
+    // Create connection strategy for port forwarding
+    let strategy = cluster_init::create_connection_strategy(
+        ctx.client.clone(),
+        namespace,
+        &obj.name_any(),
+    );
+
+    // Get connection address for first master via port forwarding
+    let (connect_host, connect_port) = match strategy.get_connection(0).await {
+        Ok(addr) => addr,
+        Err(e) => {
+            debug!(error = %e, "Failed to create port forward for master count");
+            return Ok(0);
+        }
+    };
+
+    let client = match ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref()).await
     {
         Ok(c) => c,
         Err(e) => {
@@ -1053,11 +1256,21 @@ async fn execute_scaling_operation(
         return Err(Error::Valkey("No pod addresses available".to_string()));
     }
 
-    // Connect to first master
-    let (host, port) = &pod_addresses[0];
-    let use_tls = true;
+    // Get TLS certificates from secret
+    let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
 
-    let client = ValkeyClient::connect_single(host, *port, password.as_deref(), use_tls)
+    // Create connection strategy for port forwarding
+    let strategy = cluster_init::create_connection_strategy(
+        ctx.client.clone(),
+        namespace,
+        &obj.name_any(),
+    );
+
+    // Get connection address for first master via port forwarding
+    let (connect_host, connect_port) = strategy.get_connection(0).await
+        .map_err(|e| Error::Valkey(format!("Failed to create port forward for scaling: {}", e)))?;
+
+    let client = ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref())
         .await
         .map_err(|e| Error::Valkey(format!("Failed to connect for scaling: {}", e)))?;
 
@@ -1076,7 +1289,7 @@ async fn execute_scaling_operation(
         target_masters,
         namespace: namespace.to_string(),
         headless_service: common::headless_service_name(obj),
-        port: *port,
+        port: 6379,
     };
 
     // Execute the appropriate scaling operation
@@ -1103,4 +1316,264 @@ async fn execute_scaling_operation(
     let _ = client.close().await;
 
     result.map_err(|e| Error::Valkey(format!("Scaling operation failed: {}", e)))
+}
+
+/// Get the total number of nodes in the Valkey cluster.
+async fn get_nodes_in_cluster_count(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<i32, Error> {
+    use crate::client::cluster_ops::ClusterOps;
+    use crate::client::valkey_client::ValkeyClient;
+
+    // Get password from secret
+    let password = get_auth_password(
+        ctx,
+        namespace,
+        &obj.spec.auth.secret_ref.name,
+        &obj.spec.auth.secret_ref.key,
+    )
+    .await?;
+
+    // Get TLS certificates from secret
+    let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
+
+    // Create connection strategy for port forwarding
+    let strategy = cluster_init::create_connection_strategy(
+        ctx.client.clone(),
+        namespace,
+        &obj.name_any(),
+    );
+
+    // Get connection address for first master via port forwarding
+    let (connect_host, connect_port) = match strategy.get_connection(0).await {
+        Ok(addr) => addr,
+        Err(e) => {
+            debug!(error = %e, "Failed to create port forward for node count");
+            return Ok(0);
+        }
+    };
+
+    let client = match ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref()).await {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(error = %e, "Failed to connect to cluster for node count");
+            return Ok(0);
+        }
+    };
+
+    let cluster_nodes = match client.cluster_nodes().await {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            let _ = client.close().await;
+            debug!(error = %e, "Failed to get cluster nodes");
+            return Ok(0);
+        }
+    };
+
+    let _ = client.close().await;
+    Ok(cluster_nodes.nodes.len() as i32)
+}
+
+/// Add new replica pods to an existing cluster.
+/// Returns the number of replicas added.
+async fn add_new_replicas_to_cluster(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<i32, Error> {
+    use crate::client::cluster_ops::ClusterOps;
+    use crate::client::valkey_client::ValkeyClient;
+
+    let name = obj.name_any();
+    let masters = obj.spec.masters;
+    let replicas_per_master = obj.spec.replicas_per_master;
+
+    // Get password from secret
+    let password = get_auth_password(
+        ctx,
+        namespace,
+        &obj.spec.auth.secret_ref.name,
+        &obj.spec.auth.secret_ref.key,
+    )
+    .await?;
+
+    // Get TLS certificates from secret
+    let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
+
+    // Create connection strategy for port forwarding
+    let strategy = cluster_init::create_connection_strategy(
+        ctx.client.clone(),
+        namespace,
+        &name,
+    );
+
+    // First, get the current cluster state
+    let (connect_host, connect_port) = strategy.get_connection(0).await
+        .map_err(|e| Error::Valkey(format!("Failed to create port forward: {}", e)))?;
+
+    let client = ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref())
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
+
+    let cluster_nodes = client
+        .cluster_nodes()
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to get cluster nodes: {}", e)))?;
+
+    let current_node_count = cluster_nodes.nodes.len() as i32;
+    let desired_total = total_pods(masters, replicas_per_master);
+    let _ = client.close().await;
+
+    // If we already have all nodes, nothing to do
+    if current_node_count >= desired_total {
+        return Ok(0);
+    }
+
+    // Get pod IPs for new nodes
+    let pod_ips = cluster_init::get_pod_ips(&ctx.client, namespace, &name, desired_total)
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to get pod IPs: {}", e)))?;
+
+    // Filter to only pods not yet in cluster
+    let existing_ips: std::collections::HashSet<_> = cluster_nodes.nodes.iter()
+        .map(|n| n.address.split(':').next().unwrap_or(""))
+        .collect();
+
+    let new_pods: Vec<_> = pod_ips.iter()
+        .filter(|(_, ip, _)| !existing_ips.contains(ip.as_str()))
+        .collect();
+
+    if new_pods.is_empty() {
+        return Ok(0);
+    }
+
+    info!(
+        name = %name,
+        new_count = new_pods.len(),
+        "Adding new nodes to cluster via CLUSTER MEET"
+    );
+
+    // Connect to first master and run CLUSTER MEET for each new node
+    let (connect_host, connect_port) = strategy.get_connection(0).await
+        .map_err(|e| Error::Valkey(format!("Failed to create port forward: {}", e)))?;
+
+    let client = ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref())
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
+
+    // Execute CLUSTER MEET for each new pod
+    for (pod_name, ip, port) in &new_pods {
+        info!(pod = %pod_name, ip = %ip, "Executing CLUSTER MEET");
+        client
+            .cluster_meet(ip, *port)
+            .await
+            .map_err(|e| Error::Valkey(format!("CLUSTER MEET failed for {}: {}", pod_name, e)))?;
+    }
+
+    let _ = client.close().await;
+
+    // Wait a moment for gossip to propagate
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Now configure new nodes as replicas of their corresponding masters
+    // Replica pods are numbered after masters: if masters=3, then:
+    //   - pod-0, pod-1, pod-2 are masters
+    //   - pod-3 is replica of pod-0, pod-4 is replica of pod-1, pod-5 is replica of pod-2
+    //   - pod-6 is replica of pod-0, pod-7 is replica of pod-1, pod-8 is replica of pod-2, etc.
+
+    // Get updated cluster nodes to get node IDs
+    let (connect_host, connect_port) = strategy.get_connection(0).await
+        .map_err(|e| Error::Valkey(format!("Failed to create port forward: {}", e)))?;
+
+    let client = ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref())
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
+
+    let cluster_nodes = client
+        .cluster_nodes()
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to get cluster nodes: {}", e)))?;
+
+    let _ = client.close().await;
+
+    // Build a mapping of IP to node ID
+    let ip_to_node_id: std::collections::HashMap<String, String> = cluster_nodes.nodes.iter()
+        .map(|n| (n.ip.clone(), n.node_id.clone()))
+        .collect();
+
+    // Get master node IDs (from pod-0 to pod-(masters-1))
+    let master_ips: Vec<String> = pod_ips.iter()
+        .take(masters as usize)
+        .map(|(_, ip, _)| ip.clone())
+        .collect();
+
+    let master_node_ids: Vec<String> = master_ips.iter()
+        .filter_map(|ip| ip_to_node_id.get(ip).cloned())
+        .collect();
+
+    // For each new replica, configure it
+    let mut added = 0;
+    for (pod_name, ip, _) in &new_pods {
+        // Extract pod ordinal from name (e.g., "test-cluster-3" -> 3)
+        let ordinal = pod_name
+            .rsplit('-')
+            .next()
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+
+        // Skip if this is a master pod
+        if ordinal < masters {
+            continue;
+        }
+
+        // Determine which master this replica belongs to
+        let master_index = ((ordinal - masters) % masters) as usize;
+        if master_index >= master_node_ids.len() {
+            warn!(pod = %pod_name, "Cannot find master for replica");
+            continue;
+        }
+
+        let master_node_id = &master_node_ids[master_index];
+
+        // Get the node ID for this replica
+        let replica_node_id = match ip_to_node_id.get(ip.as_str()) {
+            Some(id) => id,
+            None => {
+                warn!(pod = %pod_name, ip = %ip, "Cannot find node ID for replica");
+                continue;
+            }
+        };
+
+        info!(
+            pod = %pod_name,
+            replica_node = %replica_node_id,
+            master_node = %master_node_id,
+            master_index = master_index,
+            "Configuring replica"
+        );
+
+        // Connect to the replica and configure it
+        let (connect_host, connect_port) = strategy.get_connection(ordinal).await
+            .map_err(|e| Error::Valkey(format!("Failed to create port forward for replica: {}", e)))?;
+
+        let replica_client = ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref())
+            .await
+            .map_err(|e| Error::Valkey(format!("Failed to connect to replica: {}", e)))?;
+
+        match replica_client.cluster_replicate(master_node_id).await {
+            Ok(()) => {
+                info!(pod = %pod_name, "Successfully configured as replica");
+                added += 1;
+            }
+            Err(e) => {
+                warn!(pod = %pod_name, error = %e, "Failed to configure replica");
+            }
+        }
+
+        let _ = replica_client.close().await;
+    }
+
+    Ok(added)
 }

@@ -27,7 +27,7 @@ use super::valkey_cluster::Condition;
 /// 3. Move to next shard
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[kube(
-    group = "valkeyoperator.smoketurner.com",
+    group = "valkey-operator.smoketurner.com",
     version = "v1alpha1",
     kind = "ValkeyUpgrade",
     plural = "valkeyupgrades",

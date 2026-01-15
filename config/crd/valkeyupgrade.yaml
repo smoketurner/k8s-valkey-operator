@@ -1,0 +1,151 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: valkeyupgrades.valkey-operator.smoketurner.com
+spec:
+  group: valkey-operator.smoketurner.com
+  names:
+    kind: ValkeyUpgrade
+    listKind: ValkeyUpgradeList
+    plural: valkeyupgrades
+    singular: valkeyupgrade
+    shortNames:
+      - vug
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Cluster
+          type: string
+          jsonPath: .spec.clusterRef.name
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Progress
+          type: string
+          jsonPath: .status.progress
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - clusterRef
+                - targetVersion
+              properties:
+                clusterRef:
+                  type: object
+                  required:
+                    - name
+                  properties:
+                    name:
+                      type: string
+                      description: Name of the ValkeyCluster to upgrade
+                    namespace:
+                      type: string
+                      description: Namespace of the ValkeyCluster (defaults to same namespace)
+                targetVersion:
+                  type: string
+                  description: Target Valkey version (e.g., "9.0.1")
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    - Pending
+                    - PreChecks
+                    - InProgress
+                    - Completed
+                    - Failed
+                    - RollingBack
+                    - RolledBack
+                progress:
+                  type: string
+                  description: Human-readable progress (e.g., "2/6 shards upgraded")
+                currentVersion:
+                  type: string
+                targetVersion:
+                  type: string
+                startedAt:
+                  type: string
+                  format: date-time
+                completedAt:
+                  type: string
+                  format: date-time
+                totalShards:
+                  type: integer
+                upgradedShards:
+                  type: integer
+                failedShards:
+                  type: integer
+                currentShard:
+                  type: integer
+                  default: -1
+                errorMessage:
+                  type: string
+                observedGeneration:
+                  type: integer
+                  format: int64
+                shardStatuses:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      shardIndex:
+                        type: integer
+                      masterNodeId:
+                        type: string
+                      masterPod:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - Pending
+                          - UpgradingReplicas
+                          - WaitingForSync
+                          - FailingOver
+                          - UpgradingOldMaster
+                          - Completed
+                          - Failed
+                          - Skipped
+                      promotedReplica:
+                        type: string
+                      error:
+                        type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - reason
+                      - message
+                      - lastTransitionTime
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      observedGeneration:
+                        type: integer
+                        format: int64

@@ -8,7 +8,7 @@ metadata:
 rules:
   # ValkeyCluster CRD resources
   - apiGroups:
-      - valkeyoperator.smoketurner.com
+      - valkey-operator.smoketurner.com
     resources:
       - valkeyclusters
     verbs:
@@ -20,7 +20,7 @@ rules:
       - patch
       - delete
   - apiGroups:
-      - valkeyoperator.smoketurner.com
+      - valkey-operator.smoketurner.com
     resources:
       - valkeyclusters/status
     verbs:
@@ -28,7 +28,7 @@ rules:
       - update
       - patch
   - apiGroups:
-      - valkeyoperator.smoketurner.com
+      - valkey-operator.smoketurner.com
     resources:
       - valkeyclusters/finalizers
     verbs:

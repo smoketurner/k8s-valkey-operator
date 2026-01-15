@@ -4,15 +4,24 @@
 //! - CLUSTER MEET operations to connect all nodes
 //! - Slot assignment via CLUSTER ADDSLOTS
 //! - Replica setup via CLUSTER REPLICATE
+//!
+//! When the operator runs locally (outside the cluster), port forwarding
+//! is used to connect to Valkey pods since K8s DNS is not available.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
-use kube::ResourceExt;
+use k8s_openapi::api::core::v1::Pod;
+use kube::api::ListParams;
+use kube::{Api, Client, ResourceExt};
+use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
 
 use crate::client::cluster_ops::calculate_slot_distribution;
-use crate::client::valkey_client::{ValkeyClient, ValkeyError};
+use crate::client::valkey_client::{TlsCertData, ValkeyClient, ValkeyError};
 use crate::crd::ValkeyCluster;
+use crate::resources::port_forward::{PortForward, PortForwardError, PortForwardTarget};
 
 /// Build the DNS name for a pod in the StatefulSet.
 ///
@@ -72,41 +81,200 @@ pub fn replica_pod_dns_names_for_master(
         .collect()
 }
 
+/// Get pod name (StatefulSet pod name, not DNS)
+pub fn pod_name(cluster_name: &str, ordinal: i32) -> String {
+    format!("{}-{}", cluster_name, ordinal)
+}
+
+/// Get all pod names for a cluster
+pub fn all_pod_names(cluster: &ValkeyCluster) -> Vec<String> {
+    let name = cluster.name_any();
+    let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
+
+    (0..total_pods)
+        .map(|i| pod_name(&name, i))
+        .collect()
+}
+
+/// Get pod IP addresses from the Kubernetes API.
+///
+/// CLUSTER MEET requires IP addresses, not DNS names.
+/// Returns a vector of (pod_name, ip_address, port) tuples.
+pub async fn get_pod_ips(
+    client: &Client,
+    namespace: &str,
+    cluster_name: &str,
+    total_pods: i32,
+) -> Result<Vec<(String, String, u16)>, ValkeyError> {
+    let pod_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let label_selector = format!("app.kubernetes.io/instance={}", cluster_name);
+
+    let pods = pod_api
+        .list(&ListParams::default().labels(&label_selector))
+        .await
+        .map_err(|e| ValkeyError::Connection(format!("Failed to list pods: {}", e)))?;
+
+    let mut pod_ips: Vec<(String, String, u16)> = Vec::new();
+
+    for ordinal in 0..total_pods {
+        let pod_name = format!("{}-{}", cluster_name, ordinal);
+
+        let pod = pods
+            .items
+            .iter()
+            .find(|p| p.metadata.name.as_deref() == Some(&pod_name))
+            .ok_or_else(|| {
+                ValkeyError::ClusterNotReady(format!("Pod {} not found", pod_name))
+            })?;
+
+        let ip = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.pod_ip.as_ref())
+            .ok_or_else(|| {
+                ValkeyError::ClusterNotReady(format!("Pod {} has no IP", pod_name))
+            })?;
+
+        pod_ips.push((pod_name, ip.clone(), 6379));
+    }
+
+    Ok(pod_ips)
+}
+
+/// Connection strategy for connecting to Valkey pods
+///
+/// We always use port forwarding as it works both in-cluster and locally.
+/// The overhead is minimal for an operator making occasional admin connections.
+#[derive(Clone)]
+pub struct ConnectionStrategy {
+    port_forwards: Arc<Mutex<ClusterPortForwards>>,
+}
+
+impl ConnectionStrategy {
+    /// Create a new connection strategy with port forwarding
+    pub fn new(client: Client, namespace: &str, cluster_name: &str) -> Self {
+        let forwards = ClusterPortForwards::new(client, namespace, cluster_name);
+        Self {
+            port_forwards: Arc::new(Mutex::new(forwards)),
+        }
+    }
+
+    /// Get a connection address for a pod by ordinal
+    pub async fn get_connection(&self, ordinal: i32) -> Result<(String, u16), ValkeyError> {
+        let mut pf = self.port_forwards.lock().await;
+        pf.ensure_forward(ordinal)
+            .await
+            .map_err(|e| ValkeyError::Connection(format!("Port forward error: {}", e)))
+    }
+}
+
+/// Manages port forwards for all pods in a cluster
+pub struct ClusterPortForwards {
+    client: Client,
+    namespace: String,
+    cluster_name: String,
+    /// Map from pod ordinal to port forward
+    forwards: HashMap<i32, PortForward>,
+}
+
+impl ClusterPortForwards {
+    /// Create a new port forward manager
+    pub fn new(client: Client, namespace: &str, cluster_name: &str) -> Self {
+        Self {
+            client,
+            namespace: namespace.to_string(),
+            cluster_name: cluster_name.to_string(),
+            forwards: HashMap::new(),
+        }
+    }
+
+    /// Ensure a port forward exists for the given pod ordinal
+    pub async fn ensure_forward(&mut self, ordinal: i32) -> Result<(String, u16), PortForwardError> {
+        if let Some(pf) = self.forwards.get(&ordinal) {
+            return Ok(("127.0.0.1".to_string(), pf.local_port()));
+        }
+
+        let pod_name = pod_name(&self.cluster_name, ordinal);
+
+        info!(pod = %pod_name, ordinal = ordinal, "Creating port forward for pod");
+
+        let pf = PortForward::start(
+            self.client.clone(),
+            &self.namespace,
+            PortForwardTarget::pod(&pod_name, 6379),
+            None,
+        )
+        .await?;
+
+        let local_port = pf.local_port();
+        self.forwards.insert(ordinal, pf);
+
+        Ok(("127.0.0.1".to_string(), local_port))
+    }
+
+    /// Get the connection address for a pod ordinal
+    pub fn get_address(&self, ordinal: i32) -> Option<(String, u16)> {
+        self.forwards.get(&ordinal).map(|pf| ("127.0.0.1".to_string(), pf.local_port()))
+    }
+
+    /// Create port forwards for all pods in the cluster
+    pub async fn ensure_all_forwards(&mut self, total_pods: i32) -> Result<(), PortForwardError> {
+        for i in 0..total_pods {
+            self.ensure_forward(i).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Execute CLUSTER MEET from the first node to all other nodes.
 ///
 /// This connects all nodes in the cluster so they can communicate via gossip.
-#[instrument(skip(cluster, password))]
+///
+/// Uses pod IP addresses for CLUSTER MEET since Valkey requires IP addresses
+/// (DNS names are not accepted by the CLUSTER MEET command).
+#[instrument(skip(k8s_client, cluster, password, tls_certs, strategy))]
 pub async fn execute_cluster_meet(
+    k8s_client: &Client,
     cluster: &ValkeyCluster,
     password: Option<&str>,
-    use_tls: bool,
+    tls_certs: Option<&TlsCertData>,
+    strategy: &ConnectionStrategy,
 ) -> Result<(), ValkeyError> {
-    let all_pods = all_pod_dns_names(cluster);
+    let namespace = cluster.namespace().unwrap_or_else(|| "default".to_string());
+    let cluster_name = cluster.name_any();
+    let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
 
-    if all_pods.is_empty() {
+    // Get pod IP addresses from Kubernetes API
+    // CLUSTER MEET requires IP addresses, not DNS names
+    let pod_ips = get_pod_ips(k8s_client, &namespace, &cluster_name, total_pods).await?;
+
+    if pod_ips.is_empty() {
         return Err(ValkeyError::InvalidConfig("No pods in cluster".to_string()));
     }
 
-    let (first_host, first_port) = &all_pods[0];
+    // Get connection address for first node via port forwarding
+    let (connect_host, connect_port) = strategy.get_connection(0).await?;
+
     info!(
-        host = %first_host,
-        port = %first_port,
-        total_nodes = all_pods.len(),
+        host = %connect_host,
+        port = %connect_port,
+        total_nodes = pod_ips.len(),
         "Connecting to first node to execute CLUSTER MEET"
     );
 
-    // Connect to the first node
-    let client = ValkeyClient::connect_single(first_host, *first_port, password, use_tls).await?;
+    // Connect to the first node via port forward
+    // TLS is still used - the port forward is just a transport layer tunnel
+    let client = ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
 
-    // Execute CLUSTER MEET for all other nodes
-    for (host, port) in all_pods.iter().skip(1) {
-        debug!(host = %host, port = %port, "Executing CLUSTER MEET");
-        match client.cluster_meet(host, *port).await {
+    // Execute CLUSTER MEET for all other nodes using their IP addresses
+    for (_pod_name, ip, port) in pod_ips.iter().skip(1) {
+        debug!(ip = %ip, port = %port, "Executing CLUSTER MEET");
+        match client.cluster_meet(ip, *port).await {
             Ok(()) => {
-                debug!(host = %host, port = %port, "CLUSTER MEET successful");
+                debug!(ip = %ip, port = %port, "CLUSTER MEET successful");
             }
             Err(e) => {
-                warn!(host = %host, port = %port, error = %e, "CLUSTER MEET failed");
+                warn!(ip = %ip, port = %port, error = %e, "CLUSTER MEET failed");
                 return Err(e);
             }
         }
@@ -123,11 +291,12 @@ pub async fn execute_cluster_meet(
 /// Assign hash slots evenly across master nodes.
 ///
 /// Connects to each master and assigns its portion of the 16384 hash slots.
-#[instrument(skip(cluster, password))]
+#[instrument(skip(cluster, password, tls_certs, strategy))]
 pub async fn assign_slots_to_masters(
     cluster: &ValkeyCluster,
     password: Option<&str>,
-    use_tls: bool,
+    tls_certs: Option<&TlsCertData>,
+    strategy: &ConnectionStrategy,
 ) -> Result<(), ValkeyError> {
     let masters = cluster.spec.masters;
     let slot_ranges = calculate_slot_distribution(masters);
@@ -147,20 +316,24 @@ pub async fn assign_slots_to_masters(
         masters
     );
 
-    for (i, ((host, port), (start_slot, end_slot))) in
+    for (i, ((_dns_host, _dns_port), (start_slot, end_slot))) in
         master_pods.iter().zip(slot_ranges.iter()).enumerate()
     {
+        // Get connection address via port forwarding
+        let (connect_host, connect_port) = strategy.get_connection(i as i32).await?;
+
         debug!(
             master_index = i,
-            host = %host,
-            port = %port,
+            host = %connect_host,
+            port = %connect_port,
             start_slot = start_slot,
             end_slot = end_slot,
             "Connecting to master to assign slots"
         );
 
-        // Connect to this specific master
-        let client = ValkeyClient::connect_single(host, *port, password, use_tls).await?;
+        // Connect to this specific master via port forward
+        // TLS is still used - the port forward is just a transport layer tunnel
+        let client = ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
 
         // Build slot range and assign
         let slots: Vec<u16> = (*start_slot as u16..=*end_slot as u16).collect();
@@ -187,11 +360,12 @@ pub async fn assign_slots_to_masters(
 /// Set up replica nodes to replicate their assigned masters.
 ///
 /// For each master, connects to its replicas and executes CLUSTER REPLICATE.
-#[instrument(skip(cluster, password))]
+#[instrument(skip(cluster, password, tls_certs, strategy))]
 pub async fn setup_replicas(
     cluster: &ValkeyCluster,
     password: Option<&str>,
-    use_tls: bool,
+    tls_certs: Option<&TlsCertData>,
+    strategy: &ConnectionStrategy,
 ) -> Result<(), ValkeyError> {
     if cluster.spec.replicas_per_master == 0 {
         info!("No replicas configured, skipping replica setup");
@@ -217,9 +391,12 @@ pub async fn setup_replicas(
         ));
     }
 
+    // Get connection address for first master via port forwarding
+    let (connect_host, connect_port) = strategy.get_connection(0).await?;
+
     // Connect to first master to get cluster topology
-    let (first_host, first_port) = &master_pods[0];
-    let client = ValkeyClient::connect_single(first_host, *first_port, password, use_tls).await?;
+    // TLS is still used - the port forward is just a transport layer tunnel
+    let client = ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
 
     // Get cluster nodes to find master node IDs
     let nodes_raw = client.cluster_nodes_raw().await?;
@@ -240,18 +417,25 @@ pub async fn setup_replicas(
     for (master_index, master_node_id) in master_node_ids.iter().enumerate() {
         let replica_pods = replica_pod_dns_names_for_master(cluster, master_index as i32);
 
-        for (replica_index, (replica_host, replica_port)) in replica_pods.iter().enumerate() {
+        for (replica_index, (_replica_dns_host, _replica_dns_port)) in replica_pods.iter().enumerate() {
+            // Calculate the ordinal for this replica pod
+            let replica_ordinal = masters + (master_index as i32 * replicas_per_master) + replica_index as i32;
+
+            // Get connection address for this replica via port forwarding
+            let (connect_host, connect_port) = strategy.get_connection(replica_ordinal).await?;
+
             debug!(
                 master_index = master_index,
                 master_node_id = %master_node_id,
                 replica_index = replica_index,
-                replica_host = %replica_host,
+                replica_host = %connect_host,
                 "Setting up replica"
             );
 
-            // Connect to the replica
+            // Connect to the replica via port forward
+            // TLS is still used - the port forward is just a transport layer tunnel
             let replica_client =
-                ValkeyClient::connect_single(replica_host, *replica_port, password, use_tls)
+                ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs)
                     .await?;
 
             // Execute CLUSTER REPLICATE to make this node replicate the master
@@ -351,25 +535,27 @@ fn extract_ordinal_from_address(address: &str) -> Option<i32> {
 /// 1. CLUSTER MEET all nodes
 /// 2. Assign slots to masters
 /// 3. Set up replicas
-#[instrument(skip(cluster, password))]
+#[instrument(skip(k8s_client, cluster, password, tls_certs, strategy))]
 pub async fn initialize_cluster(
+    k8s_client: &Client,
     cluster: &ValkeyCluster,
     password: Option<&str>,
-    use_tls: bool,
+    tls_certs: Option<&TlsCertData>,
+    strategy: &ConnectionStrategy,
 ) -> Result<(), ValkeyError> {
     let name = cluster.name_any();
     info!(cluster = %name, "Starting cluster initialization");
 
     // Step 1: Connect all nodes via CLUSTER MEET
     info!(cluster = %name, "Step 1: Executing CLUSTER MEET");
-    execute_cluster_meet(cluster, password, use_tls).await?;
+    execute_cluster_meet(k8s_client, cluster, password, tls_certs, strategy).await?;
 
     // Give nodes time to exchange topology information
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Step 2: Assign slots to masters
     info!(cluster = %name, "Step 2: Assigning slots to masters");
-    assign_slots_to_masters(cluster, password, use_tls).await?;
+    assign_slots_to_masters(cluster, password, tls_certs, strategy).await?;
 
     // Give cluster time to propagate slot assignments
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -377,11 +563,23 @@ pub async fn initialize_cluster(
     // Step 3: Set up replicas
     if cluster.spec.replicas_per_master > 0 {
         info!(cluster = %name, "Step 3: Setting up replicas");
-        setup_replicas(cluster, password, use_tls).await?;
+        setup_replicas(cluster, password, tls_certs, strategy).await?;
     }
 
     info!(cluster = %name, "Cluster initialization complete");
     Ok(())
+}
+
+/// Create a connection strategy for connecting to Valkey pods.
+///
+/// Always uses port forwarding as it works both in-cluster and locally.
+pub fn create_connection_strategy(
+    client: Client,
+    namespace: &str,
+    cluster_name: &str,
+) -> ConnectionStrategy {
+    info!(namespace = %namespace, cluster = %cluster_name, "Creating connection strategy with port forwarding");
+    ConnectionStrategy::new(client, namespace, cluster_name)
 }
 
 #[cfg(test)]

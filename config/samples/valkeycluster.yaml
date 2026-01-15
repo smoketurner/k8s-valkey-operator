@@ -1,9 +1,41 @@
-apiVersion: valkeyoperator.smoketurner.com/v1alpha1
+---
+# Password secret for Valkey authentication
+apiVersion: v1
+kind: Secret
+metadata:
+  name: valkey-auth
+  namespace: default
+type: Opaque
+stringData:
+  password: "valkey-test-password"
+---
+# Minimal ValkeyCluster with 3 masters and 1 replica each (6 pods total)
+apiVersion: valkey-operator.smoketurner.com/v1alpha1
 kind: ValkeyCluster
 metadata:
-  name: example
+  name: my-cluster
   namespace: default
 spec:
-  # Example configuration
-  replicas: 3
-  message: "Hello from ValkeyCluster!"
+  masters: 3
+  replicasPerMaster: 1
+  tls:
+    issuerRef:
+      name: selfsigned-issuer
+      kind: ClusterIssuer
+  auth:
+    secretRef:
+      name: valkey-auth
+      key: password
+  persistence:
+    enabled: true
+    size: 1Gi
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "256Mi"
+  # Disable spread for single-node cluster testing
+  scheduling:
+    spreadMasters: false

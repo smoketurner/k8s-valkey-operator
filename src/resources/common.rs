@@ -64,7 +64,7 @@ pub fn standard_annotations(resource: &ValkeyCluster) -> BTreeMap<String, String
 /// when the ValkeyCluster is deleted.
 pub fn owner_reference(resource: &ValkeyCluster) -> OwnerReference {
     OwnerReference {
-        api_version: "valkeyoperator.smoketurner.com/v1alpha1".to_string(),
+        api_version: "valkey-operator.smoketurner.com/v1alpha1".to_string(),
         kind: "ValkeyCluster".to_string(),
         name: resource.name_any(),
         uid: resource.uid().unwrap_or_default(),
@@ -146,7 +146,7 @@ mod tests {
 
         assert_eq!(owner_ref.name, "my-cluster");
         assert_eq!(owner_ref.kind, "ValkeyCluster");
-        assert_eq!(owner_ref.api_version, "valkeyoperator.smoketurner.com/v1alpha1");
+        assert_eq!(owner_ref.api_version, "valkey-operator.smoketurner.com/v1alpha1");
         assert_eq!(owner_ref.controller, Some(true));
     }
 

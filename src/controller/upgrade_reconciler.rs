@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     client::cluster_ops::ClusterOps,
-    client::valkey_client::ValkeyClient,
+    client::valkey_client::{TlsCertData, ValkeyClient},
     controller::{
         cluster_init::{master_pod_dns_names, replica_pod_dns_names_for_master},
         cluster_reconciler::FIELD_MANAGER,
@@ -32,7 +32,7 @@ use crate::{
 };
 
 /// Finalizer name for upgrade resources
-pub const UPGRADE_FINALIZER: &str = "valkeyoperator.smoketurner.com/upgrade-finalizer";
+pub const UPGRADE_FINALIZER: &str = "valkey-operator.smoketurner.com/upgrade-finalizer";
 
 /// Reconcile a ValkeyUpgrade
 ///
@@ -194,6 +194,9 @@ async fn handle_prechecks_phase(
     )
     .await?;
 
+    // Get TLS certificates from secret
+    let tls_certs = get_tls_certs(ctx, namespace, &cluster.name_any()).await?;
+
     // Connect to cluster and check health
     let master_pods = master_pod_dns_names(cluster);
     if master_pods.is_empty() {
@@ -201,7 +204,7 @@ async fn handle_prechecks_phase(
     }
 
     let (host, port) = &master_pods[0];
-    let client = ValkeyClient::connect_single(host, *port, password.as_deref(), true)
+    let client = ValkeyClient::connect_single(host, *port, password.as_deref(), tls_certs.as_ref())
         .await
         .map_err(|e| Error::Valkey(e.to_string()))?;
 
@@ -511,9 +514,12 @@ async fn wait_for_replication_sync(
     )
     .await?;
 
+    // Get TLS certificates from secret
+    let tls_certs = get_tls_certs(ctx, namespace, &cluster.name_any()).await?;
+
     // Connect to the first replica and check replication status
     let (replica_host, replica_port) = &replica_pods[0];
-    let client = match ValkeyClient::connect_single(replica_host, *replica_port, password.as_deref(), true).await {
+    let client = match ValkeyClient::connect_single(replica_host, *replica_port, password.as_deref(), tls_certs.as_ref()).await {
         Ok(c) => c,
         Err(e) => {
             debug!(error = %e, "Failed to connect to replica for sync check");
@@ -569,6 +575,9 @@ async fn execute_failover(
     )
     .await?;
 
+    // Get TLS certificates from secret
+    let tls_certs = get_tls_certs(ctx, namespace, &cluster.name_any()).await?;
+
     // Connect to the first replica (best replica selection would be an enhancement)
     let (replica_host, replica_port) = &replica_pods[0];
     let replica_pod_name = replica_host.split('.').next().unwrap_or(replica_host);
@@ -580,7 +589,7 @@ async fn execute_failover(
         "Executing CLUSTER FAILOVER"
     );
 
-    let client = ValkeyClient::connect_single(replica_host, *replica_port, password.as_deref(), true)
+    let client = ValkeyClient::connect_single(replica_host, *replica_port, password.as_deref(), tls_certs.as_ref())
         .await
         .map_err(|e| Error::Valkey(e.to_string()))?;
 
@@ -815,6 +824,9 @@ async fn initialize_shard_statuses(
     )
     .await?;
 
+    // Get TLS certificates from secret
+    let tls_certs = get_tls_certs(ctx, namespace, &cluster.name_any()).await?;
+
     let master_pods = master_pod_dns_names(cluster);
     if master_pods.is_empty() {
         return Err(Error::Validation("No master pods found".to_string()));
@@ -822,7 +834,7 @@ async fn initialize_shard_statuses(
 
     // Connect to cluster to get topology
     let (host, port) = &master_pods[0];
-    let client = ValkeyClient::connect_single(host, *port, password.as_deref(), true)
+    let client = ValkeyClient::connect_single(host, *port, password.as_deref(), tls_certs.as_ref())
         .await
         .map_err(|e| Error::Valkey(e.to_string()))?;
 
@@ -872,6 +884,48 @@ async fn get_auth_password(
     }
 }
 
+/// Retrieve TLS certificates from the TLS secret created by cert-manager.
+async fn get_tls_certs(
+    ctx: &Context,
+    namespace: &str,
+    cluster_name: &str,
+) -> Result<Option<TlsCertData>, Error> {
+    let secret_name = format!("{}-tls", cluster_name);
+    let secret_api: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+
+    match secret_api.get(&secret_name).await {
+        Ok(secret) => {
+            if let Some(data) = secret.data {
+                // Get CA certificate - required for verification
+                let ca_cert = match data.get("ca.crt") {
+                    Some(bytes) => bytes.0.clone(),
+                    None => {
+                        warn!(secret = %secret_name, "ca.crt not found in TLS secret");
+                        return Ok(None);
+                    }
+                };
+
+                // Client cert and key are optional (used for mTLS if provided)
+                let client_cert = data.get("tls.crt").map(|b| b.0.clone());
+                let client_key = data.get("tls.key").map(|b| b.0.clone());
+
+                return Ok(Some(TlsCertData {
+                    ca_cert_pem: ca_cert,
+                    client_cert_pem: client_cert,
+                    client_key_pem: client_key,
+                }));
+            }
+            warn!(secret = %secret_name, "TLS secret has no data");
+            Ok(None)
+        }
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            warn!(secret = %secret_name, "TLS secret not found");
+            Ok(None)
+        }
+        Err(e) => Err(Error::Kube(e)),
+    }
+}
+
 /// Handle deletion of a ValkeyUpgrade
 async fn handle_deletion(
     obj: &ValkeyUpgrade,
@@ -912,7 +966,7 @@ async fn remove_finalizer(api: &Api<ValkeyUpgrade>, name: &str) -> Result<(), Er
     });
     api.patch(
         name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
+        &PatchParams::apply(FIELD_MANAGER),
         &Patch::Merge(&patch),
     )
     .await?;

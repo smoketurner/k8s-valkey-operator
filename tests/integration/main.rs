@@ -76,12 +76,12 @@ async fn test_crd_installed() {
 
     let crds: Api<CustomResourceDefinition> = Api::all(client);
     let crd = crds
-        .get("valkeyclusters.valkeyoperator.smoketurner.com")
+        .get("valkeyclusters.valkey-operator.smoketurner.com")
         .await
         .expect("CRD should be installed. Run `make install-crd` first.");
 
     assert_eq!(
-        crd.spec.group, "valkeyoperator.smoketurner.com",
+        crd.spec.group, "valkey-operator.smoketurner.com",
         "CRD group should match"
     );
 }
@@ -100,7 +100,7 @@ async fn test_valkeycluster_lifecycle() {
 
     // Create a ValkeyCluster with the new spec structure
     let resource = serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkeyoperator.smoketurner.com/v1alpha1",
+        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
         "kind": "ValkeyCluster",
         "metadata": {
             "name": "test-resource"

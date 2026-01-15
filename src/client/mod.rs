@@ -33,4 +33,4 @@ pub use scaling::{ScalingContext, ScalingOps, ScalingResult};
 pub use types::{
     ClusterInfo, ClusterNode, ClusterState, NodeFlags, NodeRole, ParsedClusterNodes, SlotRange,
 };
-pub use valkey_client::{ValkeyClient, ValkeyClientConfig};
+pub use valkey_client::{TlsCertData, ValkeyClient, ValkeyClientConfig};

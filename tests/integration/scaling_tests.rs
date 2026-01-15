@@ -20,7 +20,7 @@ use crate::wait::{wait_for_condition, wait_for_operational, wait_for_phase};
 /// Helper to create a test ValkeyCluster.
 fn test_resource(name: &str, masters: i32, replicas_per_master: i32) -> ValkeyCluster {
     serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkeyoperator.smoketurner.com/v1alpha1",
+        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
         "kind": "ValkeyCluster",
         "metadata": {
             "name": name

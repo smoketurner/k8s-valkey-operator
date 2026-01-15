@@ -5,7 +5,7 @@ metadata:
 rules:
   # ValkeyCluster CRD resources
   - apiGroups:
-      - valkeyoperator.smoketurner.com
+      - valkey-operator.smoketurner.com
     resources:
       - valkeyclusters
     verbs:
@@ -17,7 +17,7 @@ rules:
       - patch
       - delete
   - apiGroups:
-      - valkeyoperator.smoketurner.com
+      - valkey-operator.smoketurner.com
     resources:
       - valkeyclusters/status
     verbs:
@@ -25,9 +25,37 @@ rules:
       - update
       - patch
   - apiGroups:
-      - valkeyoperator.smoketurner.com
+      - valkey-operator.smoketurner.com
     resources:
       - valkeyclusters/finalizers
+    verbs:
+      - update
+
+  # ValkeyUpgrade CRD resources
+  - apiGroups:
+      - valkey-operator.smoketurner.com
+    resources:
+      - valkeyupgrades
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - valkey-operator.smoketurner.com
+    resources:
+      - valkeyupgrades/status
+    verbs:
+      - get
+      - update
+      - patch
+  - apiGroups:
+      - valkey-operator.smoketurner.com
+    resources:
+      - valkeyupgrades/finalizers
     verbs:
       - update
 
@@ -40,11 +68,11 @@ rules:
       - get
       - list
       - watch
+      - delete
   - apiGroups:
       - ""
     resources:
       - services
-      - configmaps
       - secrets
     verbs:
       - get
@@ -53,6 +81,16 @@ rules:
       - create
       - update
       - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - list
+      - watch
+      - create
       - delete
   - apiGroups:
       - ""
@@ -66,8 +104,35 @@ rules:
   - apiGroups:
       - apps
     resources:
-      - deployments
       - statefulsets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+
+  # Policy resources (PodDisruptionBudget)
+  - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+
+  # cert-manager resources
+  - apiGroups:
+      - cert-manager.io
+    resources:
+      - certificates
     verbs:
       - get
       - list

@@ -72,7 +72,7 @@ make clean-all          # Uninstall and clean
 
 ### CRD Structure
 
-- **API group**: `valkeyoperator.smoketurner.com`
+- **API group**: `valkey-operator.smoketurner.com`
 - **API version**: `v1alpha1`
 - **Kinds**: `ValkeyCluster`, `ValkeyUpgrade`
 - **Short name**: `vc` (for ValkeyCluster)

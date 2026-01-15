@@ -24,7 +24,7 @@ use crate::{init_test, wait};
 /// Helper to create a test ValkeyCluster with the new spec structure.
 fn test_resource(name: &str, masters: i32, replicas_per_master: i32) -> ValkeyCluster {
     serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkeyoperator.smoketurner.com/v1alpha1",
+        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
         "kind": "ValkeyCluster",
         "metadata": {
             "name": name
