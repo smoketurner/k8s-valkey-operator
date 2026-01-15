@@ -8,7 +8,7 @@ use std::sync::Arc;
 use kube::runtime::events::{Event, EventType, Recorder, Reporter};
 use kube::{Client, Resource};
 
-use crate::crd::ValkeyCluster;
+use crate::crd::{ValkeyCluster, ValkeyUpgrade};
 use crate::health::HealthState;
 
 /// Field manager name for the operator
@@ -43,7 +43,7 @@ impl Context {
         Recorder::new(self.client.clone(), self.reporter.clone())
     }
 
-    /// Publish a normal event for a resource
+    /// Publish a normal event for a ValkeyCluster resource
     pub async fn publish_normal_event(
         &self,
         resource: &ValkeyCluster,
@@ -70,7 +70,7 @@ impl Context {
         }
     }
 
-    /// Publish a warning event for a resource
+    /// Publish a warning event for a ValkeyCluster resource
     pub async fn publish_warning_event(
         &self,
         resource: &ValkeyCluster,
@@ -94,6 +94,33 @@ impl Context {
             .await
         {
             tracing::warn!(reason = %reason, error = %e, "Failed to publish warning event");
+        }
+    }
+
+    /// Publish a normal event for a ValkeyUpgrade resource
+    pub async fn publish_upgrade_event(
+        &self,
+        resource: &ValkeyUpgrade,
+        reason: &str,
+        action: &str,
+        note: Option<String>,
+    ) {
+        let recorder = self.recorder();
+        let object_ref = resource.object_ref(&());
+        if let Err(e) = recorder
+            .publish(
+                &Event {
+                    type_: EventType::Normal,
+                    reason: reason.into(),
+                    note,
+                    action: action.into(),
+                    secondary: None,
+                },
+                &object_ref,
+            )
+            .await
+        {
+            tracing::warn!(reason = %reason, error = %e, "Failed to publish upgrade event");
         }
     }
 }

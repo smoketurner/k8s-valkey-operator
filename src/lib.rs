@@ -26,8 +26,12 @@ use kube::{Api, Client, Resource};
 use serde::de::DeserializeOwned;
 use tracing::{debug, error, info};
 
-use controller::{context::Context, cluster_reconciler::reconcile};
-use crd::ValkeyCluster;
+use controller::{
+    context::Context,
+    cluster_reconciler::reconcile as reconcile_cluster,
+    upgrade_reconciler::reconcile as reconcile_upgrade,
+};
+use crd::{ValkeyCluster, ValkeyUpgrade};
 
 /// Create namespaced or cluster-wide API based on scope
 pub fn scoped_api<T>(client: Client, namespace: Option<&str>) -> Api<T>
@@ -134,11 +138,11 @@ pub async fn run_controller_scoped(
         .owns(deployments, watcher_config.clone())
         .owns_stream(metadata_watcher(services, watcher_config.clone()).touched_objects())
         .owns_stream(metadata_watcher(configmaps, watcher_config).touched_objects())
-        .run(reconcile, controller::cluster_reconciler::error_policy, ctx)
+        .run(reconcile_cluster, controller::cluster_reconciler::error_policy, ctx)
         .for_each(|result| async move {
             match result {
                 Ok((obj, _action)) => {
-                    debug!("Reconciled: {}", obj.name);
+                    debug!("Reconciled ValkeyCluster: {}", obj.name);
                 }
                 Err(e) => {
                     // ObjectNotFound/NotFound errors are expected after deletion when
@@ -152,9 +156,9 @@ pub async fn run_controller_scoped(
                         _ => false,
                     };
                     if is_not_found {
-                        debug!("Object no longer exists (likely deleted): {:?}", e);
+                        debug!("ValkeyCluster no longer exists (likely deleted): {:?}", e);
                     } else {
-                        error!("Reconciliation error: {:?}", e);
+                        error!("ValkeyCluster reconciliation error: {:?}", e);
                     }
                 }
             }
@@ -162,5 +166,64 @@ pub async fn run_controller_scoped(
         .await;
 
     // This should never complete in normal operation
-    error!("Controller stream ended unexpectedly");
+    error!("ValkeyCluster controller stream ended unexpectedly");
+}
+
+/// Run the ValkeyUpgrade controller (cluster-wide).
+///
+/// This controller watches ValkeyUpgrade resources and orchestrates
+/// rolling upgrades of ValkeyCluster instances.
+pub async fn run_upgrade_controller(client: Client) {
+    run_upgrade_controller_scoped(client, None).await
+}
+
+/// Run the ValkeyUpgrade controller with optional namespace scoping.
+///
+/// When `namespace` is `Some(ns)`, only watches resources in that namespace.
+/// When `namespace` is `None`, watches resources cluster-wide.
+pub async fn run_upgrade_controller_scoped(client: Client, namespace: Option<&str>) {
+    let scope_msg = namespace.unwrap_or("cluster-wide");
+    info!(
+        "Starting controller for ValkeyUpgrade resources (scope: {})",
+        scope_msg
+    );
+
+    let ctx = Arc::new(Context::new(client.clone(), None));
+
+    // Set up APIs for the controller
+    let valkeyupgrades: Api<ValkeyUpgrade> = scoped_api(client.clone(), namespace);
+
+    // Use consistent watcher configuration
+    let watcher_config = default_watcher_config();
+
+    // Create filtered stream with standard optimizations
+    let (reader, resource_stream) = create_filtered_stream(valkeyupgrades, watcher_config);
+
+    // Create and run the controller
+    Controller::for_stream(resource_stream, reader)
+        .run(reconcile_upgrade, controller::upgrade_reconciler::error_policy, ctx)
+        .for_each(|result| async move {
+            match result {
+                Ok((obj, _action)) => {
+                    debug!("Reconciled ValkeyUpgrade: {}", obj.name);
+                }
+                Err(e) => {
+                    let is_not_found = match &e {
+                        kube::runtime::controller::Error::ObjectNotFound(_) => true,
+                        kube::runtime::controller::Error::ReconcilerFailed(err, _) => {
+                            err.is_not_found()
+                        }
+                        _ => false,
+                    };
+                    if is_not_found {
+                        debug!("ValkeyUpgrade no longer exists (likely deleted): {:?}", e);
+                    } else {
+                        error!("ValkeyUpgrade reconciliation error: {:?}", e);
+                    }
+                }
+            }
+        })
+        .await;
+
+    error!("ValkeyUpgrade controller stream ended unexpectedly");
 }

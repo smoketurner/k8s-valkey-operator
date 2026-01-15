@@ -18,6 +18,6 @@ pub mod cluster_reconciler;
 pub mod cluster_state_machine;
 pub mod cluster_validation;
 
-// ValkeyUpgrade controller (to be implemented)
-// pub mod upgrade_reconciler;
-// pub mod upgrade_state_machine;
+// ValkeyUpgrade controller
+pub mod upgrade_reconciler;
+pub mod upgrade_state_machine;

@@ -17,7 +17,7 @@ use tokio::signal;
 use tracing::{error, info, warn};
 
 use valkey_operator::health::{HealthState, run_health_server};
-use valkey_operator::run_controller;
+use valkey_operator::{run_controller, run_upgrade_controller};
 use valkey_operator::{WEBHOOK_CERT_PATH, WEBHOOK_KEY_PATH, run_webhook_server};
 
 /// Lease configuration
@@ -150,12 +150,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    // Start controller (only runs as leader)
-    let controller_handle = {
+    // Start ValkeyCluster controller (only runs as leader)
+    let cluster_controller_handle = {
         let health_state = health_state.clone();
         let controller_client = client.clone();
         tokio::spawn(async move {
             run_controller(controller_client, Some(health_state)).await;
+        })
+    };
+
+    // Start ValkeyUpgrade controller (only runs as leader)
+    let upgrade_controller_handle = {
+        let controller_client = client.clone();
+        tokio::spawn(async move {
+            run_upgrade_controller(controller_client).await;
         })
     };
 
@@ -178,9 +186,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for any task to complete (or fail), or shutdown signal
     tokio::select! {
-        result = controller_handle => {
+        result = cluster_controller_handle => {
             if let Err(e) = result {
-                error!("Controller task panicked: {}", e);
+                error!("ValkeyCluster controller task panicked: {}", e);
+            }
+        }
+        result = upgrade_controller_handle => {
+            if let Err(e) = result {
+                error!("ValkeyUpgrade controller task panicked: {}", e);
             }
         }
         result = health_handle => {
