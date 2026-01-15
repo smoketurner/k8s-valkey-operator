@@ -9,7 +9,7 @@ use std::time::Instant;
 use k8s_openapi::api::core::v1::Secret;
 use kube::{
     Api, ResourceExt,
-    api::{Patch, PatchParams},
+    api::{ApiResource, DynamicObject, Patch, PatchParams},
     runtime::controller::Action,
 };
 use tracing::{debug, error, info, warn};
@@ -22,7 +22,7 @@ use crate::{
         cluster_init,
     },
     crd::{Condition, ValkeyCluster, ValkeyClusterStatus, ClusterPhase, total_pods},
-    resources,
+    resources::{certificate, common, pdb, services, statefulset},
 };
 
 /// Field manager name for server-side apply
@@ -470,7 +470,7 @@ async fn create_owned_resources(
     let name = obj.name_any();
 
     // Apply StatefulSet
-    let statefulset = resources::generate_statefulset(obj);
+    let statefulset = statefulset::generate_statefulset(obj);
     let sts_api: Api<k8s_openapi::api::apps::v1::StatefulSet> =
         Api::namespaced(ctx.client.clone(), namespace);
     sts_api
@@ -482,8 +482,8 @@ async fn create_owned_resources(
         .await?;
 
     // Apply Headless Service (for cluster discovery)
-    let headless_svc = resources::generate_headless_service(obj);
-    let headless_name = resources::common::headless_service_name(obj);
+    let headless_svc = services::generate_headless_service(obj);
+    let headless_name = common::headless_service_name(obj);
     let svc_api: Api<k8s_openapi::api::core::v1::Service> =
         Api::namespaced(ctx.client.clone(), namespace);
     svc_api
@@ -495,7 +495,7 @@ async fn create_owned_resources(
         .await?;
 
     // Apply Client Service (for client connections)
-    let client_svc = resources::generate_client_service(obj);
+    let client_svc = services::generate_client_service(obj);
     svc_api
         .patch(
             &name,
@@ -505,7 +505,7 @@ async fn create_owned_resources(
         .await?;
 
     // Apply PodDisruptionBudget
-    let pdb = resources::generate_pod_disruption_budget(obj);
+    let pdb = pdb::generate_pod_disruption_budget(obj);
     let pdb_api: Api<k8s_openapi::api::policy::v1::PodDisruptionBudget> =
         Api::namespaced(ctx.client.clone(), namespace);
     pdb_api
@@ -513,6 +513,26 @@ async fn create_owned_resources(
             &name,
             &PatchParams::apply(FIELD_MANAGER).force(),
             &Patch::Apply(&pdb),
+        )
+        .await?;
+
+    // Apply cert-manager Certificate for TLS
+    let certificate = certificate::generate_certificate(obj);
+    let cert_name = certificate::certificate_secret_name(obj);
+    let cert_ar = ApiResource::from_gvk(&kube::api::GroupVersionKind {
+        group: "cert-manager.io".to_string(),
+        version: "v1".to_string(),
+        kind: "Certificate".to_string(),
+    });
+    let cert_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), namespace, &cert_ar);
+    let cert_value: serde_json::Value = serde_json::to_value(&certificate)
+        .map_err(|e| Error::Validation(format!("Failed to serialize certificate: {}", e)))?;
+    cert_api
+        .patch(
+            &cert_name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(&cert_value),
         )
         .await?;
 
@@ -842,6 +862,9 @@ async fn update_status(
         ("0/16384".to_string(), None, 0)
     };
 
+    // Get TLS secret name from certificate
+    let tls_secret_name = certificate::certificate_secret_name(&obj);
+
     let status = ValkeyClusterStatus {
         phase,
         ready_nodes: format!("{}/{}", ready_replicas, desired_replicas),
@@ -854,7 +877,7 @@ async fn update_status(
         valkey_version: Some("9".to_string()),
         connection_endpoint,
         connection_secret: None,
-        tls_secret: None,
+        tls_secret: Some(tls_secret_name),
     };
 
     let patch = serde_json::json!({

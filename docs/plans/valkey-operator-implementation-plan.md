@@ -25,13 +25,13 @@ Create a production-grade Kubernetes operator to deploy and manage Valkey Cluste
 | 9 | Health monitoring | ✅ Complete | `src/controller/cluster_reconciler.rs` |
 | 10 | ValkeyUpgrade CRD | ✅ Complete | `src/crd/valkey_upgrade.rs` |
 | 11 | Upgrade reconciler | ✅ Complete | `src/controller/upgrade_reconciler.rs`, `src/controller/upgrade_state_machine.rs` |
-| 12 | TLS integration | ⏳ Pending | `src/resources/certificate.rs` |
+| 12 | TLS integration | ✅ Complete | `src/resources/certificate.rs`, `src/controller/cluster_reconciler.rs` |
 | 13 | Scaling operations | ⏳ Pending | `src/controller/cluster_reconciler.rs` |
 | 14 | Update manifests | ⏳ Pending | `config/**/*.yaml`, `charts/` |
 | 15 | Integration tests | ⏳ Pending | `tests/integration/` |
 | 16 | Property/fuzz tests | ⏳ Pending | `tests/proptest/`, `tests/fuzz/` |
 
-**Current Status:** 11/16 phases complete (68.75%)
+**Current Status:** 12/16 phases complete (75%)
 
 ### Phase Details
 
@@ -77,15 +77,24 @@ Create a production-grade Kubernetes operator to deploy and manage Valkey Cluste
 - Status updates with health info
 
 **Phase 10:** ValkeyUpgrade CRD:
-- ValkeyUpgradeSpec (cluster ref, target version, strategy, failover config)
+- ValkeyUpgradeSpec (cluster ref, target version)
 - ValkeyUpgradeStatus (phase, conditions, shard progress)
 - Upgrade phases: Pending → PreChecks → InProgress → Completed
+- Simplified spec with sensible defaults (removed config "footguns")
+
+**Phase 11:** Upgrade reconciler:
+- Per-shard rolling upgrades with failover orchestration
+- State machine for upgrade phase transitions
+- Automatic rollback on any shard failure
+- Always wait for replication sync before failover (5 min timeout)
+
+**Phase 12:** TLS integration:
+- cert-manager Certificate resource generation
+- DNS SANs for headless service wildcard and client service
+- Certificate integrated into cluster reconciler via DynamicObject
+- TLS secret name exposed in ValkeyCluster status
 
 #### Remaining Phases
-
-**Phase 11:** Upgrade reconciler - per-shard rolling upgrades with failover orchestration
-
-**Phase 12:** TLS integration - cert-manager Certificate resource generation
 
 **Phase 13:** Scaling operations - slot rebalancing for scale up/down
 
