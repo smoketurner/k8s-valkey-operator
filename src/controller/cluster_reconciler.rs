@@ -15,6 +15,7 @@ use kube::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    client::{ScalingContext, ScalingOps},
     controller::{
         context::Context,
         error::Error,
@@ -169,15 +170,47 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
 
             let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
             let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+
             if ready_replicas >= desired_replicas {
-                ctx.publish_normal_event(
-                    &obj,
-                    "Updated",
-                    "Updating",
-                    Some("Resource update completed successfully".to_string()),
-                )
-                .await;
-                ClusterPhase::Running
+                // Check if this update involves scaling (masters count change)
+                let current_masters = get_current_master_count(&obj, &ctx, &namespace).await?;
+                let target_masters = obj.spec.masters;
+
+                if current_masters != target_masters && current_masters > 0 {
+                    // Scaling operation needed - transition to Resharding
+                    let direction = if target_masters > current_masters {
+                        "up"
+                    } else {
+                        "down"
+                    };
+                    info!(
+                        name = %name,
+                        current_masters = current_masters,
+                        target_masters = target_masters,
+                        direction = direction,
+                        "Scaling detected, transitioning to Resharding"
+                    );
+                    ctx.publish_normal_event(
+                        &obj,
+                        "ScalingDetected",
+                        "Updating",
+                        Some(format!(
+                            "Scaling {} from {} to {} masters",
+                            direction, current_masters, target_masters
+                        )),
+                    )
+                    .await;
+                    ClusterPhase::Resharding
+                } else {
+                    ctx.publish_normal_event(
+                        &obj,
+                        "Updated",
+                        "Updating",
+                        Some("Resource update completed successfully".to_string()),
+                    )
+                    .await;
+                    ClusterPhase::Running
+                }
             } else {
                 ClusterPhase::Updating
             }
@@ -281,16 +314,65 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
         }
         ClusterPhase::Resharding => {
             // Hash slots are being migrated (scaling operation)
-            // TODO: Phase 13 - Implement resharding logic
-            // For now, transition directly to Running
-            ctx.publish_normal_event(
-                &obj,
-                "ReshardingComplete",
-                "Scaling",
-                Some("Hash slot migration complete".to_string()),
-            )
-            .await;
-            ClusterPhase::Running
+            info!(name = %name, "Executing scaling operation");
+
+            match execute_scaling_operation(&obj, &ctx, &namespace).await {
+                Ok(result) => {
+                    if result.success {
+                        let direction = if !result.nodes_added.is_empty() {
+                            "up"
+                        } else {
+                            "down"
+                        };
+                        info!(
+                            name = %name,
+                            direction = direction,
+                            nodes_added = result.nodes_added.len(),
+                            nodes_removed = result.nodes_removed.len(),
+                            slots_moved = result.slots_moved,
+                            "Scaling operation completed"
+                        );
+                        ctx.publish_normal_event(
+                            &obj,
+                            "ReshardingComplete",
+                            "Scaling",
+                            Some(format!(
+                                "Scaling {} complete: {} slots moved",
+                                direction, result.slots_moved
+                            )),
+                        )
+                        .await;
+                        ClusterPhase::Running
+                    } else {
+                        warn!(
+                            name = %name,
+                            error = ?result.error,
+                            "Scaling operation failed"
+                        );
+                        ctx.publish_warning_event(
+                            &obj,
+                            "ReshardingFailed",
+                            "Scaling",
+                            result.error.clone(),
+                        )
+                        .await;
+                        // Stay in Resharding to retry
+                        ClusterPhase::Resharding
+                    }
+                }
+                Err(e) => {
+                    warn!(name = %name, error = %e, "Scaling operation error, will retry");
+                    ctx.publish_warning_event(
+                        &obj,
+                        "ReshardingFailed",
+                        "Scaling",
+                        Some(format!("Scaling failed: {}", e)),
+                    )
+                    .await;
+                    // Stay in Resharding to retry
+                    ClusterPhase::Resharding
+                }
+            }
         }
         ClusterPhase::Failed => {
             // Manual intervention required
@@ -892,4 +974,133 @@ async fn update_status(
     .await?;
 
     Ok(())
+}
+
+/// Get the current number of master nodes from the Valkey cluster.
+async fn get_current_master_count(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<i32, Error> {
+    use crate::client::cluster_ops::ClusterOps;
+    use crate::client::valkey_client::ValkeyClient;
+
+    // Get password from secret
+    let password = get_auth_password(
+        ctx,
+        namespace,
+        &obj.spec.auth.secret_ref.name,
+        &obj.spec.auth.secret_ref.key,
+    )
+    .await?;
+
+    // Build host list for connecting to the cluster
+    let pod_addresses = cluster_init::master_pod_dns_names(obj);
+    if pod_addresses.is_empty() {
+        return Ok(0);
+    }
+
+    // Connect to first master to query cluster state
+    let (host, port) = &pod_addresses[0];
+    let use_tls = true;
+
+    let client = match ValkeyClient::connect_single(host, *port, password.as_deref(), use_tls).await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(error = %e, "Failed to connect to cluster for master count");
+            return Ok(0);
+        }
+    };
+
+    // Get cluster nodes
+    let cluster_nodes = match client.cluster_nodes().await {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            debug!(error = %e, "Failed to get cluster nodes");
+            let _ = client.close().await;
+            return Ok(0);
+        }
+    };
+
+    let _ = client.close().await;
+
+    let masters = cluster_nodes.masters();
+    Ok(masters.len() as i32)
+}
+
+/// Execute a scaling operation (scale up or scale down).
+async fn execute_scaling_operation(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<crate::client::ScalingResult, Error> {
+    use crate::client::cluster_ops::ClusterOps;
+    use crate::client::valkey_client::ValkeyClient;
+
+    // Get password from secret
+    let password = get_auth_password(
+        ctx,
+        namespace,
+        &obj.spec.auth.secret_ref.name,
+        &obj.spec.auth.secret_ref.key,
+    )
+    .await?;
+
+    // Build host list for connecting to the cluster
+    let pod_addresses = cluster_init::master_pod_dns_names(obj);
+    if pod_addresses.is_empty() {
+        return Err(Error::Valkey("No pod addresses available".to_string()));
+    }
+
+    // Connect to first master
+    let (host, port) = &pod_addresses[0];
+    let use_tls = true;
+
+    let client = ValkeyClient::connect_single(host, *port, password.as_deref(), use_tls)
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to connect for scaling: {}", e)))?;
+
+    // Get current master count
+    let cluster_nodes = client
+        .cluster_nodes()
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to get cluster nodes: {}", e)))?;
+
+    let current_masters = cluster_nodes.masters().len() as i32;
+    let target_masters = obj.spec.masters;
+
+    // Build scaling context
+    let scaling_ctx = ScalingContext {
+        current_masters,
+        target_masters,
+        namespace: namespace.to_string(),
+        headless_service: common::headless_service_name(obj),
+        port: *port,
+    };
+
+    // Execute the appropriate scaling operation
+    let result = if scaling_ctx.is_scale_up() {
+        info!(
+            current = current_masters,
+            target = target_masters,
+            "Executing scale up"
+        );
+        client.scale_up(&scaling_ctx).await
+    } else if scaling_ctx.is_scale_down() {
+        info!(
+            current = current_masters,
+            target = target_masters,
+            "Executing scale down"
+        );
+        client.scale_down(&scaling_ctx).await
+    } else {
+        // No scaling needed
+        let _ = client.close().await;
+        return Ok(crate::client::ScalingResult::default());
+    };
+
+    let _ = client.close().await;
+
+    result.map_err(|e| Error::Valkey(format!("Scaling operation failed: {}", e)))
 }

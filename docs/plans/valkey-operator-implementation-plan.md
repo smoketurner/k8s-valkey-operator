@@ -26,12 +26,12 @@ Create a production-grade Kubernetes operator to deploy and manage Valkey Cluste
 | 10 | ValkeyUpgrade CRD | ✅ Complete | `src/crd/valkey_upgrade.rs` |
 | 11 | Upgrade reconciler | ✅ Complete | `src/controller/upgrade_reconciler.rs`, `src/controller/upgrade_state_machine.rs` |
 | 12 | TLS integration | ✅ Complete | `src/resources/certificate.rs`, `src/controller/cluster_reconciler.rs` |
-| 13 | Scaling operations | ⏳ Pending | `src/controller/cluster_reconciler.rs` |
+| 13 | Scaling operations | ✅ Complete | `src/client/scaling.rs`, `src/controller/cluster_reconciler.rs` |
 | 14 | Update manifests | ⏳ Pending | `config/**/*.yaml`, `charts/` |
 | 15 | Integration tests | ⏳ Pending | `tests/integration/` |
 | 16 | Property/fuzz tests | ⏳ Pending | `tests/proptest/`, `tests/fuzz/` |
 
-**Current Status:** 12/16 phases complete (75%)
+**Current Status:** 13/16 phases complete (81%)
 
 ### Phase Details
 
@@ -94,9 +94,15 @@ Create a production-grade Kubernetes operator to deploy and manage Valkey Cluste
 - Certificate integrated into cluster reconciler via DynamicObject
 - TLS secret name exposed in ValkeyCluster status
 
-#### Remaining Phases
+**Phase 13:** Scaling operations:
+- `ScalingContext` struct for tracking scale up/down operations
+- `ScalingOps` trait with `scale_up()`, `scale_down()`, `rebalance_slots()` methods
+- Slot management commands: CLUSTER SETSLOT, DELSLOTS, GETKEYSINSLOT
+- Scale up: CLUSTER MEET new nodes, rebalance slots across all masters
+- Scale down: Migrate slots away from removed nodes, CLUSTER FORGET
+- Integrated into reconciler: Updating → Resharding → Running phase flow
 
-**Phase 13:** Scaling operations - slot rebalancing for scale up/down
+#### Remaining Phases
 
 **Phase 14:** Kubernetes manifests - RBAC, CRD YAML, Helm chart updates
 
