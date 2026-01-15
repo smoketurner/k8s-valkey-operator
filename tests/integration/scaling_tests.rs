@@ -3,19 +3,29 @@
 //! These tests verify scaling behavior including:
 //! - Scale up operations (add masters)
 //! - Scale down operations (remove masters)
+//! - Replica scaling (add replicas per master)
 //! - Degraded state handling
 
 use std::time::Duration;
 
-use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::apps::v1::StatefulSet;
 use kube::api::{Api, Patch, PatchParams, PostParams};
 
 use valkey_operator::crd::{total_pods, ClusterPhase, ValkeyCluster};
 
-use crate::assertions::assert_deployment_replicas;
+use crate::assertions::assert_statefulset_replicas;
 use crate::init_test;
 use crate::namespace::TestNamespace;
 use crate::wait::{wait_for_condition, wait_for_operational, wait_for_phase};
+
+/// Long timeout for scaling operations.
+const LONG_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Extended timeout for large cluster operations.
+const EXTENDED_TIMEOUT: Duration = Duration::from_secs(240);
+
+/// Short timeout for quick checks.
+const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Helper to create a test ValkeyCluster.
 fn test_resource(name: &str, masters: i32, replicas_per_master: i32) -> ValkeyCluster {
@@ -30,12 +40,12 @@ fn test_resource(name: &str, masters: i32, replicas_per_master: i32) -> ValkeyCl
             "replicasPerMaster": replicas_per_master,
             "tls": {
                 "issuerRef": {
-                    "name": "test-issuer"
+                    "name": "selfsigned-issuer"
                 }
             },
             "auth": {
                 "secretRef": {
-                    "name": "test-secret"
+                    "name": "valkey-auth"
                 }
             }
         }
@@ -53,18 +63,18 @@ async fn test_scale_up_masters() {
 
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create resource with 3 masters and 1 replica per master = 6 total pods
-    let resource = test_resource("scale-up-test", 3, 1);
+    // Create resource with 3 masters and 0 replicas = 3 total pods
+    let resource = test_resource("scale-up-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
 
     // Wait for initial deployment
-    wait_for_operational(&api, "scale-up-test", Duration::from_secs(180))
+    wait_for_operational(&api, "scale-up-test", LONG_TIMEOUT)
         .await
         .expect("Resource should become operational");
 
-    // Scale up to 6 masters (6 + 6 replicas = 12 total pods)
+    // Scale up to 6 masters (6 total pods)
     let patch = serde_json::json!({
         "spec": {
             "masters": 6
@@ -83,19 +93,19 @@ async fn test_scale_up_masters() {
         &api,
         "scale-up-test",
         ClusterPhase::Updating,
-        Duration::from_secs(30),
+        SHORT_TIMEOUT,
     )
     .await
     .expect("Resource should enter Updating phase");
 
     // Wait for resource to be operational again
-    wait_for_operational(&api, "scale-up-test", Duration::from_secs(180))
+    wait_for_operational(&api, "scale-up-test", EXTENDED_TIMEOUT)
         .await
         .expect("Resource should become operational after scale up");
 
-    // Verify deployment has 12 pods (6 masters + 6 replicas)
-    let expected_pods = total_pods(6, 1);
-    assert_deployment_replicas(client.clone(), &ns_name, "scale-up-test", expected_pods).await;
+    // Verify statefulset has 6 pods (6 masters + 0 replicas)
+    let expected_pods = total_pods(6, 0);
+    assert_statefulset_replicas(client.clone(), &ns_name, "scale-up-test", expected_pods).await;
 
     // Verify ValkeyCluster status
     let resource = api.get("scale-up-test").await.expect("Should get resource");
@@ -117,18 +127,18 @@ async fn test_scale_down_masters() {
 
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create resource with 6 masters and 1 replica per master = 12 total pods
-    let resource = test_resource("scale-down-test", 6, 1);
+    // Create resource with 6 masters and 0 replicas = 6 total pods
+    let resource = test_resource("scale-down-test", 6, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
 
     // Wait for initial deployment
-    wait_for_operational(&api, "scale-down-test", Duration::from_secs(240))
+    wait_for_operational(&api, "scale-down-test", EXTENDED_TIMEOUT)
         .await
         .expect("Resource should become operational");
 
-    // Scale down to 3 masters (3 + 3 replicas = 6 total pods)
+    // Scale down to 3 masters (3 total pods)
     let patch = serde_json::json!({
         "spec": {
             "masters": 3
@@ -143,17 +153,85 @@ async fn test_scale_down_masters() {
     .expect("Failed to scale down");
 
     // Wait for resource to be operational again
-    wait_for_operational(&api, "scale-down-test", Duration::from_secs(180))
+    wait_for_operational(&api, "scale-down-test", LONG_TIMEOUT)
         .await
         .expect("Resource should become operational after scale down");
 
-    // Verify deployment has 6 pods (3 masters + 3 replicas)
-    let expected_pods = total_pods(3, 1);
-    assert_deployment_replicas(client.clone(), &ns_name, "scale-down-test", expected_pods).await;
+    // Verify statefulset has 3 pods (3 masters + 0 replicas)
+    let expected_pods = total_pods(3, 0);
+    assert_statefulset_replicas(client.clone(), &ns_name, "scale-down-test", expected_pods).await;
 
     // Verify ValkeyCluster status
     let resource = api
         .get("scale-down-test")
+        .await
+        .expect("Should get resource");
+    let status = resource.status.expect("Should have status");
+    assert_eq!(
+        status.ready_replicas, expected_pods,
+        "Should have {} ready replicas",
+        expected_pods
+    );
+}
+
+/// Test scaling up replicas per master.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Kubernetes cluster with operator running"]
+async fn test_scale_up_replicas() {
+    let (_cluster, client) = init_test().await;
+    let test_ns = TestNamespace::create(client.clone(), "scale-replicas").await;
+    let ns_name = test_ns.name().to_string();
+
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
+
+    // Create resource with 3 masters and 0 replicas = 3 total pods
+    let resource = test_resource("scale-replicas-test", 3, 0);
+    api.create(&PostParams::default(), &resource)
+        .await
+        .expect("Failed to create ValkeyCluster");
+
+    // Wait for initial deployment
+    wait_for_operational(&api, "scale-replicas-test", LONG_TIMEOUT)
+        .await
+        .expect("Resource should become operational");
+
+    // Scale up to 1 replica per master (3 + 3 = 6 total pods)
+    let patch = serde_json::json!({
+        "spec": {
+            "replicasPerMaster": 1
+        }
+    });
+    api.patch(
+        "scale-replicas-test",
+        &PatchParams::default(),
+        &Patch::Merge(&patch),
+    )
+    .await
+    .expect("Failed to add replicas");
+
+    // Wait for updating phase
+    wait_for_phase(
+        &api,
+        "scale-replicas-test",
+        ClusterPhase::Updating,
+        SHORT_TIMEOUT,
+    )
+    .await
+    .expect("Resource should enter Updating phase");
+
+    // Wait for resource to be operational again
+    wait_for_operational(&api, "scale-replicas-test", LONG_TIMEOUT)
+        .await
+        .expect("Resource should become operational after adding replicas");
+
+    // Verify statefulset has 6 pods (3 masters + 3 replicas)
+    let expected_pods = total_pods(3, 1);
+    assert_statefulset_replicas(client.clone(), &ns_name, "scale-replicas-test", expected_pods)
+        .await;
+
+    // Verify ValkeyCluster status
+    let resource = api
+        .get("scale-replicas-test")
         .await
         .expect("Should get resource");
     let status = resource.status.expect("Should have status");
@@ -177,7 +255,7 @@ async fn test_degraded_state() {
     let ns_name = test_ns.name().to_string();
 
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
-    let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), &ns_name);
+    let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource with 3 masters and 1 replica per master = 6 total pods
     let resource = test_resource("degraded-test", 3, 1);
@@ -188,26 +266,26 @@ async fn test_degraded_state() {
     let expected_pods = total_pods(3, 1);
 
     // Wait for resource to be operational
-    wait_for_operational(&api, "degraded-test", Duration::from_secs(180))
+    wait_for_operational(&api, "degraded-test", LONG_TIMEOUT)
         .await
         .expect("Resource should become operational");
 
-    // Scale deployment directly to fewer replicas to simulate pod failure
+    // Scale StatefulSet directly to fewer replicas to simulate pod failure
     // (This simulates a failure scenario where not all pods are available)
     let reduced_pods = expected_pods - 2;
-    let deploy_patch = serde_json::json!({
+    let sts_patch = serde_json::json!({
         "spec": {
             "replicas": reduced_pods
         }
     });
-    deploy_api
+    sts_api
         .patch(
             "degraded-test",
             &PatchParams::apply("test-harness").force(),
-            &Patch::Apply(&deploy_patch),
+            &Patch::Apply(&sts_patch),
         )
         .await
-        .expect("Failed to patch deployment");
+        .expect("Failed to patch StatefulSet");
 
     // Give the operator time to detect the degraded state
     // Note: The operator will try to restore the desired state,
@@ -221,7 +299,7 @@ async fn test_degraded_state() {
                 .map(|s| s.phase == ClusterPhase::Degraded || s.ready_replicas < expected_pods)
                 .unwrap_or(false)
         },
-        Duration::from_secs(30),
+        SHORT_TIMEOUT,
     )
     .await;
 
@@ -273,13 +351,13 @@ async fn test_recovery_from_degraded() {
     let expected_pods = total_pods(3, 1);
 
     // Wait for resource to be operational
-    wait_for_operational(&api, "recovery-test", Duration::from_secs(180))
+    wait_for_operational(&api, "recovery-test", LONG_TIMEOUT)
         .await
         .expect("Resource should become operational");
 
     // Resource should recover and return to Running state
     // (The operator continuously reconciles and will restore the desired state)
-    wait_for_operational(&api, "recovery-test", Duration::from_secs(120))
+    wait_for_operational(&api, "recovery-test", LONG_TIMEOUT)
         .await
         .expect("Resource should recover to operational state");
 

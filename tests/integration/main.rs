@@ -30,6 +30,7 @@ mod functional_tests;
 mod namespace;
 mod operator;
 mod scaling_tests;
+mod upgrade_tests;
 mod wait;
 
 use cluster::SharedTestCluster;

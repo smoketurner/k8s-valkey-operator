@@ -95,7 +95,7 @@ fn generate_pod_template(
     labels: &BTreeMap<String, String>,
     annotations: &BTreeMap<String, String>,
 ) -> PodTemplateSpec {
-    let name = resource.name_any();
+    let _name = resource.name_any();
 
     PodTemplateSpec {
         metadata: Some(ObjectMeta {
@@ -283,7 +283,7 @@ fn generate_env_vars(resource: &ValkeyCluster) -> Vec<EnvVar> {
 }
 
 /// Build the VALKEY_EXTRA_FLAGS environment variable value.
-fn build_valkey_extra_flags(resource: &ValkeyCluster, namespace: &str, headless_svc: &str) -> String {
+fn build_valkey_extra_flags(_resource: &ValkeyCluster, namespace: &str, headless_svc: &str) -> String {
     let mut flags = vec![
         // Cluster mode
         "--cluster-enabled yes".to_string(),
@@ -489,7 +489,7 @@ fn generate_volumes(resource: &ValkeyCluster) -> Vec<Volume> {
 }
 
 /// Generate volume mounts for the container.
-fn generate_volume_mounts(resource: &ValkeyCluster) -> Vec<VolumeMount> {
+fn generate_volume_mounts(_resource: &ValkeyCluster) -> Vec<VolumeMount> {
     vec![
         VolumeMount {
             name: "data".to_string(),

@@ -2,8 +2,9 @@
 //!
 //! Provides convenient assertion functions for verifying resource state.
 
-use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ConfigMap, Service};
+use k8s_openapi::api::apps::v1::StatefulSet;
+use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::Client;
 use kube::api::Api;
 
@@ -35,25 +36,25 @@ pub async fn assert_valkeycluster_phase(
     );
 }
 
-/// Assert that a ValkeyCluster is in the Ready phase.
+/// Assert that a ValkeyCluster is in the Running phase.
 pub async fn assert_valkeycluster_ready(client: Client, namespace: &str, name: &str) {
     assert_valkeycluster_phase(client, namespace, name, ClusterPhase::Running).await;
 }
 
-/// Assert that a Deployment exists with expected replica count.
-pub async fn assert_deployment_replicas(
+/// Assert that a StatefulSet exists with expected replica count.
+pub async fn assert_statefulset_replicas(
     client: Client,
     namespace: &str,
     name: &str,
     expected_replicas: i32,
 ) {
-    let api: Api<Deployment> = Api::namespaced(client, namespace);
-    let deployment = api
+    let api: Api<StatefulSet> = Api::namespaced(client, namespace);
+    let statefulset = api
         .get(name)
         .await
-        .unwrap_or_else(|e| panic!("Failed to get Deployment {}/{}: {}", namespace, name, e));
+        .unwrap_or_else(|e| panic!("Failed to get StatefulSet {}/{}: {}", namespace, name, e));
 
-    let actual_replicas = deployment
+    let actual_replicas = statefulset
         .spec
         .as_ref()
         .and_then(|s| s.replicas)
@@ -61,26 +62,26 @@ pub async fn assert_deployment_replicas(
 
     assert_eq!(
         actual_replicas, expected_replicas,
-        "Deployment {}/{} replicas mismatch: expected {}, got {}",
+        "StatefulSet {}/{} replicas mismatch: expected {}, got {}",
         namespace, name, expected_replicas, actual_replicas
     );
 }
 
-/// Assert that a Deployment has all replicas ready.
-pub async fn assert_deployment_ready(client: Client, namespace: &str, name: &str) {
-    let api: Api<Deployment> = Api::namespaced(client, namespace);
-    let deployment = api
+/// Assert that a StatefulSet has all replicas ready.
+pub async fn assert_statefulset_ready(client: Client, namespace: &str, name: &str) {
+    let api: Api<StatefulSet> = Api::namespaced(client, namespace);
+    let statefulset = api
         .get(name)
         .await
-        .unwrap_or_else(|e| panic!("Failed to get Deployment {}/{}: {}", namespace, name, e));
+        .unwrap_or_else(|e| panic!("Failed to get StatefulSet {}/{}: {}", namespace, name, e));
 
-    let desired = deployment
+    let desired = statefulset
         .spec
         .as_ref()
         .and_then(|s| s.replicas)
         .unwrap_or(1);
 
-    let ready = deployment
+    let ready = statefulset
         .status
         .as_ref()
         .and_then(|s| s.ready_replicas)
@@ -88,57 +89,8 @@ pub async fn assert_deployment_ready(client: Client, namespace: &str, name: &str
 
     assert_eq!(
         ready, desired,
-        "Deployment {}/{} not ready: {}/{} replicas ready",
+        "StatefulSet {}/{} not ready: {}/{} replicas ready",
         namespace, name, ready, desired
-    );
-}
-
-/// Assert that a ConfigMap exists with expected data key.
-pub async fn assert_configmap_has_key(client: Client, namespace: &str, name: &str, key: &str) {
-    let api: Api<ConfigMap> = Api::namespaced(client, namespace);
-    let configmap = api
-        .get(name)
-        .await
-        .unwrap_or_else(|e| panic!("Failed to get ConfigMap {}/{}: {}", namespace, name, e));
-
-    let has_key = configmap.data.as_ref().is_some_and(|d| d.contains_key(key));
-
-    assert!(
-        has_key,
-        "ConfigMap {}/{} missing expected key: {}",
-        namespace, name, key
-    );
-}
-
-/// Assert that a ConfigMap has a specific value for a key.
-pub async fn assert_configmap_value(
-    client: Client,
-    namespace: &str,
-    name: &str,
-    key: &str,
-    expected_value: &str,
-) {
-    let api: Api<ConfigMap> = Api::namespaced(client, namespace);
-    let configmap = api
-        .get(name)
-        .await
-        .unwrap_or_else(|e| panic!("Failed to get ConfigMap {}/{}: {}", namespace, name, e));
-
-    let actual_value = configmap
-        .data
-        .as_ref()
-        .and_then(|d| d.get(key))
-        .map(|s| s.as_str());
-
-    assert_eq!(
-        actual_value,
-        Some(expected_value),
-        "ConfigMap {}/{} key {} value mismatch: expected {:?}, got {:?}",
-        namespace,
-        name,
-        key,
-        expected_value,
-        actual_value
     );
 }
 
@@ -148,6 +100,55 @@ pub async fn assert_service_exists(client: Client, namespace: &str, name: &str) 
     api.get(name)
         .await
         .unwrap_or_else(|e| panic!("Service {}/{} should exist: {}", namespace, name, e));
+}
+
+/// Assert that a headless Service exists (ClusterIP: None).
+pub async fn assert_headless_service_exists(client: Client, namespace: &str, name: &str) {
+    let api: Api<Service> = Api::namespaced(client, namespace);
+    let service = api
+        .get(name)
+        .await
+        .unwrap_or_else(|e| panic!("Service {}/{} should exist: {}", namespace, name, e));
+
+    let cluster_ip = service
+        .spec
+        .as_ref()
+        .and_then(|s| s.cluster_ip.as_ref())
+        .map(|s| s.as_str());
+
+    assert_eq!(
+        cluster_ip,
+        Some("None"),
+        "Service {}/{} should be headless (ClusterIP: None)",
+        namespace, name
+    );
+}
+
+/// Assert that a Secret exists with expected keys.
+pub async fn assert_secret_has_keys(client: Client, namespace: &str, name: &str, keys: &[&str]) {
+    let api: Api<Secret> = Api::namespaced(client, namespace);
+    let secret = api
+        .get(name)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to get Secret {}/{}: {}", namespace, name, e));
+
+    let data = secret.data.as_ref();
+    for key in keys {
+        let has_key = data.is_some_and(|d| d.contains_key(*key));
+        assert!(
+            has_key,
+            "Secret {}/{} missing expected key: {}",
+            namespace, name, key
+        );
+    }
+}
+
+/// Assert that a PodDisruptionBudget exists.
+pub async fn assert_pdb_exists(client: Client, namespace: &str, name: &str) {
+    let api: Api<PodDisruptionBudget> = Api::namespaced(client, namespace);
+    api.get(name)
+        .await
+        .unwrap_or_else(|e| panic!("PDB {}/{} should exist: {}", namespace, name, e));
 }
 
 /// Assert that a resource has the expected owner reference.
@@ -192,5 +193,52 @@ where
         key,
         expected_value,
         actual_value
+    );
+}
+
+/// Assert that a ValkeyCluster has the expected number of ready nodes.
+pub async fn assert_valkeycluster_ready_nodes(
+    client: Client,
+    namespace: &str,
+    name: &str,
+    expected_ready: i32,
+) {
+    let api: Api<ValkeyCluster> = Api::namespaced(client, namespace);
+    let resource = api
+        .get(name)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to get ValkeyCluster {}/{}: {}", namespace, name, e));
+
+    let actual_ready = resource
+        .status
+        .as_ref()
+        .map(|s| s.ready_replicas)
+        .unwrap_or(0);
+
+    assert_eq!(
+        actual_ready, expected_ready,
+        "ValkeyCluster {}/{} ready nodes mismatch: expected {}, got {}",
+        namespace, name, expected_ready, actual_ready
+    );
+}
+
+/// Assert that a ValkeyCluster has all slots assigned.
+pub async fn assert_valkeycluster_slots_assigned(client: Client, namespace: &str, name: &str) {
+    let api: Api<ValkeyCluster> = Api::namespaced(client, namespace);
+    let resource = api
+        .get(name)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to get ValkeyCluster {}/{}: {}", namespace, name, e));
+
+    let assigned_slots = resource
+        .status
+        .as_ref()
+        .map(|s| s.assigned_slots.as_str())
+        .unwrap_or("0/16384");
+
+    assert_eq!(
+        assigned_slots, "16384/16384",
+        "ValkeyCluster {}/{} should have all 16384 slots assigned, got {}",
+        namespace, name, assigned_slots
     );
 }
