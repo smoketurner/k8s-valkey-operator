@@ -22,120 +22,74 @@ use crate::{
     wait_for_operational, wait_for_phase,
 };
 
-/// Test that creating a ValkeyCluster creates the expected StatefulSet.
+/// Test that creating a ValkeyCluster creates all expected owned resources.
+/// This consolidated test verifies StatefulSet, Services, and PDB creation in one test
+/// to reduce resource usage while maintaining test coverage.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
-async fn test_creates_statefulset() {
-    let cluster = init_test().await;
+async fn test_creates_owned_resources() {
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
-    let test_ns = TestNamespace::create(client.clone(), "creates-statefulset").await;
+    let test_ns = TestNamespace::create(client.clone(), "creates-resources").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
     let ns_name = test_ns.name().to_string();
     create_auth_secret(client.clone(), &ns_name).await;
 
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
+    let svc_api: Api<Service> = Api::namespaced(client.clone(), &ns_name);
+    let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource with 3 masters and 0 replicas per master = 3 total pods
-    let resource = test_cluster_with_config("test-sts", 3, 0);
+    let resource = test_cluster_with_config("test-resources", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
 
     // Wait for resource to start creating
-    wait_for_phase(&api, "test-sts", ClusterPhase::Creating, SHORT_TIMEOUT)
-        .await
-        .expect("Resource should reach Creating phase");
+    wait_for_phase(
+        &api,
+        "test-resources",
+        ClusterPhase::Creating,
+        SHORT_TIMEOUT,
+    )
+    .await
+    .expect("Resource should reach Creating phase");
 
-    // Wait for statefulset to exist
-    wait::wait_for_resource(&sts_api, "test-sts", SHORT_TIMEOUT)
+    // Verify StatefulSet is created
+    wait::wait_for_resource(&sts_api, "test-resources", SHORT_TIMEOUT)
         .await
         .expect("StatefulSet should be created");
+    assert_statefulset_replicas(client.clone(), &ns_name, "test-resources", 3).await;
+    let statefulset = sts_api.get("test-resources").await.unwrap();
+    assert_has_owner_reference(&statefulset, "test-resources", "ValkeyCluster");
 
-    // Verify statefulset properties (3 masters + 0 replicas = 3 pods)
-    assert_statefulset_replicas(client.clone(), &ns_name, "test-sts", 3).await;
-
-    // Verify owner reference
-    let statefulset = sts_api.get("test-sts").await.unwrap();
-    assert_has_owner_reference(&statefulset, "test-sts", "ValkeyCluster");
-}
-
-/// Test that creating a ValkeyCluster creates the expected Services.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Kubernetes cluster with operator running"]
-async fn test_creates_services() {
-    let cluster = init_test().await;
-    let client = cluster.new_client().await.expect("create client");
-    let test_ns = TestNamespace::create(client.clone(), "creates-services").await;
-    let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
-    let ns_name = test_ns.name().to_string();
-    create_auth_secret(client.clone(), &ns_name).await;
-
-    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
-    let svc_api: Api<Service> = Api::namespaced(client.clone(), &ns_name);
-
-    // Create resource
-    let resource = test_cluster_with_config("test-svc", 3, 0);
-    api.create(&PostParams::default(), &resource)
-        .await
-        .expect("Failed to create ValkeyCluster");
-
-    // Wait for headless service to exist
-    wait::wait_for_resource(&svc_api, "test-svc-headless", SHORT_TIMEOUT)
+    // Verify Services are created
+    wait::wait_for_resource(&svc_api, "test-resources-headless", SHORT_TIMEOUT)
         .await
         .expect("Headless service should be created");
-
-    // Wait for client service to exist
-    wait::wait_for_resource(&svc_api, "test-svc", SHORT_TIMEOUT)
+    wait::wait_for_resource(&svc_api, "test-resources", SHORT_TIMEOUT)
         .await
         .expect("Client service should be created");
+    assert_headless_service_exists(client.clone(), &ns_name, "test-resources-headless").await;
+    assert_service_exists(client.clone(), &ns_name, "test-resources").await;
+    let headless_svc = svc_api.get("test-resources-headless").await.unwrap();
+    assert_has_owner_reference(&headless_svc, "test-resources", "ValkeyCluster");
 
-    // Verify headless service
-    assert_headless_service_exists(client.clone(), &ns_name, "test-svc-headless").await;
-
-    // Verify client service
-    assert_service_exists(client.clone(), &ns_name, "test-svc").await;
-
-    // Verify owner reference on headless service
-    let headless_svc = svc_api.get("test-svc-headless").await.unwrap();
-    assert_has_owner_reference(&headless_svc, "test-svc", "ValkeyCluster");
-}
-
-/// Test that creating a ValkeyCluster creates a PodDisruptionBudget.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Kubernetes cluster with operator running"]
-async fn test_creates_pdb() {
-    let cluster = init_test().await;
-    let client = cluster.new_client().await.expect("create client");
-    let test_ns = TestNamespace::create(client.clone(), "creates-pdb").await;
-    let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
-    let ns_name = test_ns.name().to_string();
-    create_auth_secret(client.clone(), &ns_name).await;
-
-    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
-    let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), &ns_name);
-
-    // Create resource
-    let resource = test_cluster_with_config("test-pdb", 3, 0);
-    api.create(&PostParams::default(), &resource)
-        .await
-        .expect("Failed to create ValkeyCluster");
-
-    // Wait for PDB to exist
-    wait::wait_for_resource(&pdb_api, "test-pdb", SHORT_TIMEOUT)
+    // Verify PDB is created
+    wait::wait_for_resource(&pdb_api, "test-resources", SHORT_TIMEOUT)
         .await
         .expect("PDB should be created");
-
-    // Verify owner reference
-    let pdb = pdb_api.get("test-pdb").await.unwrap();
-    assert_has_owner_reference(&pdb, "test-pdb", "ValkeyCluster");
+    let pdb = pdb_api.get("test-resources").await.unwrap();
+    assert_has_owner_reference(&pdb, "test-resources", "ValkeyCluster");
 }
 
-/// Test that a ValkeyCluster transitions through phases correctly.
+/// Test that a ValkeyCluster transitions through phases correctly and reaches Running.
+/// This consolidated test verifies phase progression and final Running state in one test.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
-async fn test_phase_transitions() {
-    let cluster = init_test().await;
+async fn test_phase_transitions_to_running() {
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "phase-transitions").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -188,43 +142,9 @@ async fn test_phase_transitions() {
         ClusterPhase::Running,
     )
     .await;
-}
-
-/// Test that a ValkeyCluster reaches Running phase when pods are ready.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Kubernetes cluster with operator running"]
-async fn test_resource_becomes_running() {
-    let cluster = init_test().await;
-    let client = cluster.new_client().await.expect("create client");
-    let test_ns = TestNamespace::create(client.clone(), "becomes-running").await;
-    let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
-    let ns_name = test_ns.name().to_string();
-    create_auth_secret(client.clone(), &ns_name).await;
-
-    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
-
-    // Create resource
-    let resource = test_cluster_with_config("test-running", 3, 0);
-    api.create(&PostParams::default(), &resource)
-        .await
-        .expect("Failed to create ValkeyCluster");
-
-    // Wait for resource to become operational (Running with replicas ready)
-    wait_for_operational(&api, "test-running", LONG_TIMEOUT)
-        .await
-        .expect("Resource should become operational");
-
-    // Verify final state
-    assert_valkeycluster_phase(
-        client.clone(),
-        &ns_name,
-        "test-running",
-        ClusterPhase::Running,
-    )
-    .await;
 
     // Verify cluster status fields
-    let resource = api.get("test-running").await.expect("Should get resource");
+    let resource = api.get("test-phases").await.expect("Should get resource");
     let status = resource.status.expect("Should have status");
     assert_eq!(status.ready_replicas, 3, "Should have 3 ready replicas");
 }
@@ -233,7 +153,7 @@ async fn test_resource_becomes_running() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_resource_deletion() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "deletion-test").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -274,7 +194,7 @@ async fn test_resource_deletion() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_validation_rejects_invalid_masters() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "validation-test").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -318,7 +238,7 @@ async fn test_validation_rejects_invalid_masters() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_observed_generation_updated() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "observed-gen").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -359,7 +279,7 @@ async fn test_observed_generation_updated() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_connection_endpoint_populated() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "conn-endpoint").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;

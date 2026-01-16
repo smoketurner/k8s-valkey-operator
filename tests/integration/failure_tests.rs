@@ -24,7 +24,7 @@ use crate::{
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_single_pod_failure_recovery() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "single-pod-fail").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -34,8 +34,8 @@ async fn test_single_pod_failure_recovery() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster with replicas for redundancy
-    let resource = test_cluster_with_config("single-fail-test", 3, 1);
+    // Create cluster with 3 masters and 0 replicas = 3 total pods
+    let resource = test_cluster_with_config("single-fail-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -45,7 +45,7 @@ async fn test_single_pod_failure_recovery() {
         .await
         .expect("Cluster should become operational");
 
-    let expected_pods = total_pods(3, 1);
+    let expected_pods = total_pods(3, 0);
 
     // Verify initial state
     let initial = api
@@ -101,7 +101,7 @@ async fn test_single_pod_failure_recovery() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_multiple_pod_failure_recovery() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "multi-pod-fail").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -111,8 +111,8 @@ async fn test_multiple_pod_failure_recovery() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster with replicas for redundancy
-    let resource = test_cluster_with_config("multi-fail-test", 3, 1);
+    // Create cluster with 3 masters and 0 replicas = 3 total pods
+    let resource = test_cluster_with_config("multi-fail-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -122,7 +122,7 @@ async fn test_multiple_pod_failure_recovery() {
         .await
         .expect("Cluster should become operational");
 
-    let expected_pods = total_pods(3, 1);
+    let expected_pods = total_pods(3, 0);
 
     // Delete multiple pods (but leave enough for quorum)
     for i in [0, 2] {
@@ -154,7 +154,7 @@ async fn test_multiple_pod_failure_recovery() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_statefulset_replica_correction() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "sts-correct").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -224,7 +224,7 @@ async fn test_statefulset_replica_correction() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_degraded_phase_detection() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "degraded-detect").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -234,13 +234,13 @@ async fn test_degraded_phase_detection() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster with replicas
-    let resource = test_cluster_with_config("degraded-detect-test", 3, 1);
+    // Create cluster with 3 masters and 0 replicas = 3 total pods
+    let resource = test_cluster_with_config("degraded-detect-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
 
-    let expected_pods = total_pods(3, 1);
+    let expected_pods = total_pods(3, 0);
 
     // Wait for cluster to become operational
     wait_for_operational(&api, "degraded-detect-test", LONG_TIMEOUT)
@@ -248,7 +248,8 @@ async fn test_degraded_phase_detection() {
         .expect("Cluster should become operational");
 
     // Force the StatefulSet to fewer replicas to simulate failure
-    let reduced = expected_pods - 2;
+    // With 3 pods, reduce by 1 to leave 2 pods (below quorum)
+    let reduced = expected_pods - 1;
     let patch = serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
@@ -296,7 +297,7 @@ async fn test_degraded_phase_detection() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_full_cluster_restart() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "full-restart").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -346,7 +347,7 @@ async fn test_full_cluster_restart() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_rapid_successive_failures() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "rapid-fail").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -356,13 +357,13 @@ async fn test_rapid_successive_failures() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster with replicas
-    let resource = test_cluster_with_config("rapid-fail-test", 3, 1);
+    // Create cluster with 3 masters and 0 replicas = 3 total pods
+    let resource = test_cluster_with_config("rapid-fail-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
 
-    let expected_pods = total_pods(3, 1);
+    let expected_pods = total_pods(3, 0);
 
     // Wait for cluster to become operational
     wait_for_operational(&api, "rapid-fail-test", LONG_TIMEOUT)
@@ -398,7 +399,7 @@ async fn test_rapid_successive_failures() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_condition_updates_during_failure() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "cond-fail").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;

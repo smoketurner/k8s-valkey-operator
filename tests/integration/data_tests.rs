@@ -44,7 +44,7 @@ fn all_slots_assigned(resource: &ValkeyCluster) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_persistence_enabled() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "persistence-test").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -99,7 +99,7 @@ async fn test_persistence_enabled() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_data_survives_pod_deletion() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "data-survive").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -178,7 +178,7 @@ async fn test_data_survives_pod_deletion() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_data_survives_scale_operations() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "data-scale").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -263,7 +263,7 @@ async fn test_data_survives_scale_operations() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_recovery_maintains_data() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "data-recovery").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -342,7 +342,7 @@ async fn test_recovery_maintains_data() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_pvc_size_configuration() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "pvc-size").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;

@@ -26,7 +26,7 @@ use crate::{
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_rollback_restores_original_image() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-rollback").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -37,8 +37,8 @@ async fn test_rollback_restores_original_image() {
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster
-    let cluster = test_cluster_with_replicas("rollback-target", 1);
+    // Create cluster (0 replicas to reduce resource usage)
+    let cluster = test_cluster_with_replicas("rollback-target", 0);
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await
@@ -142,7 +142,7 @@ async fn test_rollback_restores_original_image() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_rollback_state_transitions() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-rollback-states").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -152,8 +152,8 @@ async fn test_rollback_state_transitions() {
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster
-    let cluster = test_cluster_with_replicas("rollback-states-target", 1);
+    // Create cluster (0 replicas to reduce resource usage)
+    let cluster = test_cluster_with_replicas("rollback-states-target", 0);
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await

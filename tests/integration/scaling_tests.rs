@@ -22,7 +22,7 @@ use crate::{
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_scale_up_masters() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "scale-up").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -84,7 +84,7 @@ async fn test_scale_up_masters() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_scale_down_masters() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "scale-down").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -154,7 +154,7 @@ async fn test_scale_down_masters() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_scale_up_replicas() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "scale-replicas").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -234,7 +234,7 @@ async fn test_scale_up_replicas() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_degraded_state() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "degraded-state").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -244,13 +244,13 @@ async fn test_degraded_state() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create resource with 3 masters and 1 replica per master = 6 total pods
-    let resource = test_cluster_with_config("degraded-test", 3, 1);
+    // Create resource with 3 masters and 0 replicas = 3 total pods
+    let resource = test_cluster_with_config("degraded-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
 
-    let expected_pods = total_pods(3, 1);
+    let expected_pods = total_pods(3, 0);
 
     // Wait for resource to be operational
     wait_for_operational(&api, "degraded-test", LONG_TIMEOUT)
@@ -259,7 +259,8 @@ async fn test_degraded_state() {
 
     // Scale StatefulSet directly to fewer replicas to simulate pod failure
     // (This simulates a failure scenario where not all pods are available)
-    let reduced_pods = expected_pods - 2;
+    // With 3 pods, reduce by 1 to leave 2 pods (below quorum)
+    let reduced_pods = expected_pods - 1;
     let sts_patch = serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
@@ -323,7 +324,7 @@ async fn test_degraded_state() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_recovery_from_degraded() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "recovery-test").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -332,13 +333,13 @@ async fn test_recovery_from_degraded() {
 
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create resource with 3 masters and 1 replica per master
-    let resource = test_cluster_with_config("recovery-test", 3, 1);
+    // Create resource with 3 masters and 0 replicas = 3 total pods
+    let resource = test_cluster_with_config("recovery-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
 
-    let expected_pods = total_pods(3, 1);
+    let expected_pods = total_pods(3, 0);
 
     // Wait for resource to be operational
     wait_for_operational(&api, "recovery-test", LONG_TIMEOUT)

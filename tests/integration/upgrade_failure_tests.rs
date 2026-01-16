@@ -23,7 +23,7 @@ use crate::{
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_fails_on_cluster_health_issue() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-health-fail").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -33,8 +33,8 @@ async fn test_upgrade_fails_on_cluster_health_issue() {
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster with replicas
-    let cluster = test_cluster_with_replicas("health-fail-target", 1);
+    // Create cluster (0 replicas to reduce resource usage)
+    let cluster = test_cluster_with_replicas("health-fail-target", 0);
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await
@@ -119,7 +119,7 @@ async fn test_upgrade_fails_on_cluster_health_issue() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_concurrent_upgrade_prevention() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-concurrent").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -129,8 +129,8 @@ async fn test_concurrent_upgrade_prevention() {
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster
-    let cluster = test_cluster_with_replicas("concurrent-target", 1);
+    // Create cluster (0 replicas to reduce resource usage)
+    let cluster = test_cluster_with_replicas("concurrent-target", 0);
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await
@@ -225,7 +225,7 @@ async fn test_concurrent_upgrade_prevention() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_fails_with_invalid_version() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-invalid-version").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;

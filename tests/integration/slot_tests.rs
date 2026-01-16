@@ -34,7 +34,7 @@ fn all_slots_assigned(resource: &ValkeyCluster) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_initial_slot_distribution() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "slot-init").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -74,7 +74,7 @@ async fn test_initial_slot_distribution() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_slot_rebalancing_on_scale_up() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "slot-scale-up").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -176,7 +176,7 @@ async fn test_slot_rebalancing_on_scale_up() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_slot_migration_on_scale_down() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "slot-scale-down").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -262,7 +262,7 @@ async fn test_slot_migration_on_scale_down() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_slot_stability_during_multiple_scales() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "slot-multi-scale").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -347,7 +347,7 @@ async fn test_slot_stability_during_multiple_scales() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_resharding_phase_detection() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "resharding-detect").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;

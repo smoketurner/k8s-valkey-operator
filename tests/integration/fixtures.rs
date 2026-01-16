@@ -2,13 +2,49 @@
 //!
 //! This module provides shared utilities for integration tests.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, PostParams};
+use tokio::sync::Semaphore;
 
 use crate::common::fixtures::{ValkeyClusterBuilder, ValkeyUpgradeBuilder};
 use crate::{SharedTestCluster, ensure_cluster_crd_installed, ensure_upgrade_crd_installed};
+
+// ============================================================
+// Concurrency Control
+// ============================================================
+
+/// Global semaphore to limit concurrent cluster creation.
+/// This prevents resource exhaustion when many tests run in parallel.
+/// Set to 3 to allow 3 clusters to be created concurrently.
+static CLUSTER_CREATION_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+
+/// Get the cluster creation semaphore, initializing it if needed.
+/// Limits concurrent cluster creation to prevent resource exhaustion.
+fn get_cluster_semaphore() -> &'static Semaphore {
+    CLUSTER_CREATION_SEMAPHORE.get_or_init(|| {
+        // Allow 3 concurrent cluster creations to balance throughput and resource usage
+        // This can be adjusted based on cluster capacity
+        let max_concurrent = std::env::var("VALKEY_TEST_MAX_CONCURRENT_CLUSTERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        Semaphore::new(max_concurrent)
+    })
+}
+
+/// Acquire a permit to create a cluster.
+/// This throttles cluster creation to prevent resource exhaustion.
+/// The permit is automatically released when the guard is dropped.
+pub async fn acquire_cluster_creation_permit() -> tokio::sync::SemaphorePermit<'static> {
+    let semaphore = get_cluster_semaphore();
+    semaphore
+        .acquire()
+        .await
+        .expect("Semaphore should not be closed")
+}
 
 // ============================================================
 // Timeout Constants
@@ -35,12 +71,20 @@ pub const UPGRADE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Initialize tracing and ensure ValkeyCluster CRD is installed.
 ///
-/// Returns the shared test cluster instance.
-pub async fn init_test() -> std::sync::Arc<SharedTestCluster> {
+/// Returns the shared test cluster instance and a semaphore permit.
+/// The permit throttles concurrent cluster creation to prevent resource exhaustion.
+/// The permit should be held for the duration of the test.
+pub async fn init_test() -> (
+    std::sync::Arc<SharedTestCluster>,
+    tokio::sync::SemaphorePermit<'static>,
+) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info,kube=warn,valkey_operator=debug")
         .with_test_writer()
         .try_init();
+
+    // Acquire permit to throttle concurrent cluster creation (held for test duration)
+    let permit = acquire_cluster_creation_permit().await;
 
     let cluster = SharedTestCluster::get()
         .await
@@ -50,20 +94,25 @@ pub async fn init_test() -> std::sync::Arc<SharedTestCluster> {
         .await
         .expect("Failed to install ValkeyCluster CRD");
 
-    cluster
+    (cluster, permit)
 }
 
 /// Initialize tracing and ensure both CRDs are installed.
 ///
-/// Returns the shared test cluster instance.
-pub async fn init_test_with_upgrade() -> std::sync::Arc<SharedTestCluster> {
-    let cluster = init_test().await;
+/// Returns the shared test cluster instance and a semaphore permit.
+/// The permit throttles concurrent cluster creation to prevent resource exhaustion.
+/// The permit should be held for the duration of the test.
+pub async fn init_test_with_upgrade() -> (
+    std::sync::Arc<SharedTestCluster>,
+    tokio::sync::SemaphorePermit<'static>,
+) {
+    let (cluster, permit) = init_test().await;
 
     ensure_upgrade_crd_installed(&cluster)
         .await
         .expect("Failed to install ValkeyUpgrade CRD");
 
-    cluster
+    (cluster, permit)
 }
 
 // ============================================================

@@ -3,7 +3,8 @@
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 use valkey_operator::crd::{
-    AuthSpec, ClusterReference, IssuerRef, PersistenceSpec, ResourceLimitsSpec, ResourceRequirementsSpec, ResourceSpec, SecretKeyRef, TlsSpec, ValkeyCluster,
+    AuthSpec, ClusterReference, IssuerRef, PersistenceSpec, ResourceLimitsSpec,
+    ResourceRequirementsSpec, ResourceSpec, SecretKeyRef, TlsSpec, ValkeyCluster,
     ValkeyClusterSpec, ValkeyUpgrade, ValkeyUpgradeSpec,
 };
 

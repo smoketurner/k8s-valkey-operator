@@ -21,7 +21,7 @@ use crate::{
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_fails_without_cluster() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-no-cluster").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -61,7 +61,7 @@ async fn test_upgrade_fails_without_cluster() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_phase_transitions() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-phases").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -118,7 +118,7 @@ async fn test_upgrade_phase_transitions() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_status_initialization() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-status").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -195,7 +195,7 @@ async fn test_upgrade_status_initialization() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_observed_generation() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-gen").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -234,7 +234,7 @@ async fn test_upgrade_observed_generation() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_finalizer_added() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-finalizer").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -270,7 +270,7 @@ async fn test_upgrade_finalizer_added() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_deletion() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-delete").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -312,7 +312,7 @@ async fn test_upgrade_deletion() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_progress_tracking() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-progress").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -386,7 +386,7 @@ async fn test_upgrade_progress_tracking() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_execution_with_replicas() {
-    let cluster = init_test_with_upgrade().await;
+    let (cluster, _permit) = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-exec").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -396,8 +396,8 @@ async fn test_upgrade_execution_with_replicas() {
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster with 3 masters and 1 replica per master (6 total pods)
-    let cluster = test_cluster_with_replicas("upgrade-exec-target", 1);
+    // Create cluster with 3 masters and 0 replicas (3 total pods) to reduce resource usage
+    let cluster = test_cluster_with_replicas("upgrade-exec-target", 0);
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await

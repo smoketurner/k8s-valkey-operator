@@ -19,7 +19,7 @@ use crate::{
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running and cert-manager"]
 async fn test_tls_secret_in_status() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "tls-status").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -66,7 +66,7 @@ async fn test_tls_secret_in_status() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_connection_secret_in_status() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "conn-secret").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -115,7 +115,7 @@ async fn test_connection_secret_in_status() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running and cert-manager"]
 async fn test_cluster_operational_with_tls() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "tls-operational").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -162,7 +162,7 @@ async fn test_cluster_operational_with_tls() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_cluster_requires_tls() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "tls-required").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -229,7 +229,7 @@ async fn test_cluster_requires_tls() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_cluster_requires_auth() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "auth-required").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -295,7 +295,7 @@ async fn test_cluster_requires_auth() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_missing_auth_secret_detection() {
-    let cluster = init_test().await;
+    let (cluster, _permit) = init_test().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "missing-auth").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
