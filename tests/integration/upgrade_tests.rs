@@ -179,9 +179,14 @@ async fn test_upgrade_status_initialization() {
                 "Total shards should match cluster masters"
             );
         }
-        // Target version should be set
+        // Target version should be set (stored as full image reference)
         if let Some(target) = status.target_version {
-            assert_eq!(target, "9.0.1", "Target version should be set in status");
+            // The status stores the full image reference, e.g., "valkey/valkey:9.0.1-alpine"
+            assert!(
+                target.contains("9.0.1"),
+                "Target version should contain 9.0.1, got: {}",
+                target
+            );
         }
     }
 }

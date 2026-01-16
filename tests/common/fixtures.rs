@@ -3,7 +3,7 @@
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 use valkey_operator::crd::{
-    AuthSpec, ClusterReference, IssuerRef, PersistenceSpec, SecretKeyRef, TlsSpec, ValkeyCluster,
+    AuthSpec, ClusterReference, IssuerRef, PersistenceSpec, ResourceLimitsSpec, ResourceRequirementsSpec, ResourceSpec, SecretKeyRef, TlsSpec, ValkeyCluster,
     ValkeyClusterSpec, ValkeyUpgrade, ValkeyUpgradeSpec,
 };
 
@@ -169,6 +169,17 @@ impl ValkeyClusterBuilder {
                         enabled: false,
                         ..Default::default()
                     }
+                },
+                // Use minimal resources for integration tests to avoid resource exhaustion
+                resources: ResourceRequirementsSpec {
+                    requests: ResourceSpec {
+                        cpu: "50m".to_string(),
+                        memory: "64Mi".to_string(),
+                    },
+                    limits: ResourceLimitsSpec {
+                        cpu: "200m".to_string(),
+                        memory: "256Mi".to_string(),
+                    },
                 },
                 ..Default::default()
             },

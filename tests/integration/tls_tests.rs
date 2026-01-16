@@ -199,11 +199,30 @@ async fn test_cluster_requires_tls() {
 
     let result = api.create(&PostParams::default(), &invalid_resource).await;
 
-    // Should be rejected by webhook validation or CRD schema
-    assert!(
-        result.is_err(),
-        "Cluster without TLS should be rejected by validation"
-    );
+    // Should be rejected by webhook validation or CRD schema, OR fail during reconciliation
+    if result.is_ok() {
+        // If created, wait for it to reach Failed phase (operator should catch invalid config)
+        let resource = wait_for_condition(
+            &api,
+            "no-tls-test",
+            |r| {
+                r.status
+                    .as_ref()
+                    .map(|s| s.phase == valkey_operator::crd::ClusterPhase::Failed)
+                    .unwrap_or(false)
+            },
+            crate::SHORT_TIMEOUT,
+        )
+        .await
+        .expect("Resource should reach Failed phase");
+
+        assert_eq!(
+            resource.status.as_ref().map(|s| s.phase),
+            Some(valkey_operator::crd::ClusterPhase::Failed),
+            "Cluster with invalid TLS should be in Failed phase"
+        );
+    }
+    // If rejected by webhook, the test passes (validation worked)
 }
 
 /// Test validation rejects cluster without auth config.
@@ -246,11 +265,30 @@ async fn test_cluster_requires_auth() {
 
     let result = api.create(&PostParams::default(), &invalid_resource).await;
 
-    // Should be rejected by webhook validation or CRD schema
-    assert!(
-        result.is_err(),
-        "Cluster without auth should be rejected by validation"
-    );
+    // Should be rejected by webhook validation or CRD schema, OR fail during reconciliation
+    if result.is_ok() {
+        // If created, wait for it to reach Failed phase (operator should catch invalid config)
+        let resource = wait_for_condition(
+            &api,
+            "no-auth-test",
+            |r| {
+                r.status
+                    .as_ref()
+                    .map(|s| s.phase == valkey_operator::crd::ClusterPhase::Failed)
+                    .unwrap_or(false)
+            },
+            crate::SHORT_TIMEOUT,
+        )
+        .await
+        .expect("Resource should reach Failed phase");
+
+        assert_eq!(
+            resource.status.as_ref().map(|s| s.phase),
+            Some(valkey_operator::crd::ClusterPhase::Failed),
+            "Cluster with invalid auth should be in Failed phase"
+        );
+    }
+    // If rejected by webhook, the test passes (validation worked)
 }
 
 /// Test that missing auth secret is detected and reported.

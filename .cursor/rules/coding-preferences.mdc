@@ -1,3 +1,8 @@
+---
+description: "Coding standards, Rust patterns, and error handling conventions for the Valkey Kubernetes Operator"
+alwaysApply: false
+---
+
 # Coding Preferences
 
 This file defines coding standards, Rust patterns, and error handling conventions for the Valkey Kubernetes Operator.

@@ -1,3 +1,8 @@
+---
+description: "Architecture patterns, Kubernetes operator patterns, and Valkey-specific patterns for the operator"
+alwaysApply: false
+---
+
 # Architecture Patterns
 
 This file defines architecture patterns, Kubernetes operator patterns, and Valkey-specific patterns.
