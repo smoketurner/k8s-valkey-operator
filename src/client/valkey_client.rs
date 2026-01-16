@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use fred::prelude::*;
 use fred::types::InfoKind;
-use fred::types::config::ClusterDiscoveryPolicy;
 use fred::types::cluster::{ClusterFailoverFlag, ClusterResetFlag};
+use fred::types::config::ClusterDiscoveryPolicy;
 use rustls::pki_types::CertificateDer;
 use thiserror::Error;
 use tracing::{debug, instrument};
@@ -28,7 +28,10 @@ pub enum ValkeyError {
     Parse(#[from] crate::client::types::ParseError),
 
     #[error("Timeout after {duration:?}: {operation}")]
-    Timeout { operation: String, duration: Duration },
+    Timeout {
+        operation: String,
+        duration: Duration,
+    },
 
     #[error("Cluster not ready: {0}")]
     ClusterNotReady(String),
@@ -175,9 +178,7 @@ impl ValkeyClient {
     #[instrument(skip(config), fields(hosts = ?config.hosts))]
     pub async fn connect(config: ValkeyClientConfig) -> Result<Self, ValkeyError> {
         if config.hosts.is_empty() {
-            return Err(ValkeyError::InvalidConfig(
-                "No hosts provided".to_string(),
-            ));
+            return Err(ValkeyError::InvalidConfig("No hosts provided".to_string()));
         }
 
         // Build server configuration
@@ -377,14 +378,18 @@ impl ValkeyClient {
     /// Execute CLUSTER FAILOVER FORCE.
     #[instrument(skip(self))]
     pub async fn cluster_failover_force(&self) -> Result<(), ValkeyError> {
-        self.client.cluster_failover(Some(ClusterFailoverFlag::Force)).await?;
+        self.client
+            .cluster_failover(Some(ClusterFailoverFlag::Force))
+            .await?;
         Ok(())
     }
 
     /// Execute CLUSTER FAILOVER TAKEOVER.
     #[instrument(skip(self))]
     pub async fn cluster_failover_takeover(&self) -> Result<(), ValkeyError> {
-        self.client.cluster_failover(Some(ClusterFailoverFlag::Takeover)).await?;
+        self.client
+            .cluster_failover(Some(ClusterFailoverFlag::Takeover))
+            .await?;
         Ok(())
     }
 
@@ -608,7 +613,11 @@ fn build_tls_connector(certs: &TlsCertData) -> Result<TlsConnector, ValkeyError>
     }
 
     let verifier = Arc::new(PortForwardVerifier);
-    let _ = root_store; // CA certs parsed but verifier trusts the port-forward tunnel
+    // TODO: The root_store (CA certs) is parsed but not used because PortForwardVerifier
+    // trusts all certificates. This is acceptable for port-forwarded connections where the
+    // operator runs outside the cluster, but a proper verifier should be used for in-cluster
+    // connections where DNS resolves to actual pod IPs.
+    let _ = root_store;
 
     // Build client config with custom verifier
     let config = if let (Some(cert_pem), Some(key_pem)) =
@@ -642,6 +651,7 @@ fn build_tls_connector(certs: &TlsCertData) -> Result<TlsConnector, ValkeyError>
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
 

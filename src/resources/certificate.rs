@@ -114,7 +114,9 @@ pub fn certificate_secret_name(resource: &ValkeyCluster) -> String {
 /// - Replication traffic
 pub fn generate_certificate(resource: &ValkeyCluster) -> Certificate {
     let name = resource.name_any();
-    let namespace = resource.namespace().unwrap_or_else(|| "default".to_string());
+    let namespace = resource
+        .namespace()
+        .unwrap_or_else(|| "default".to_string());
     let secret_name = certificate_secret_name(resource);
 
     let tls = &resource.spec.tls;
@@ -172,16 +174,13 @@ pub fn generate_certificate(resource: &ValkeyCluster) -> Certificate {
                 algorithm: "ECDSA".to_string(),
                 size: 256,
             }),
-            usages: Some(vec![
-                "server auth".to_string(),
-                "client auth".to_string(),
-            ]),
+            usages: Some(vec!["server auth".to_string(), "client auth".to_string()]),
         },
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
     use crate::crd::{AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyClusterSpec};
@@ -241,7 +240,7 @@ mod tests {
         // Check owner reference
         let owner_refs = cert.metadata.owner_references.unwrap();
         assert_eq!(owner_refs.len(), 1);
-        assert_eq!(owner_refs[0].name, "my-cluster");
+        assert_eq!(owner_refs.first().unwrap().name, "my-cluster");
 
         // Check labels
         let labels = cert.metadata.labels.unwrap();
@@ -260,11 +259,22 @@ mod tests {
         assert_eq!(cert.spec.renew_before, Some("360h".to_string()));
         assert_eq!(cert.spec.issuer_ref.name, "ca-issuer");
         assert_eq!(cert.spec.issuer_ref.kind, "ClusterIssuer");
-        assert_eq!(cert.spec.issuer_ref.group, Some("cert-manager.io".to_string()));
+        assert_eq!(
+            cert.spec.issuer_ref.group,
+            Some("cert-manager.io".to_string())
+        );
 
         // Check DNS names
-        assert!(cert.spec.dns_names.contains(&"*.my-cluster-headless.production.svc.cluster.local".to_string()));
-        assert!(cert.spec.dns_names.contains(&"my-cluster.production.svc.cluster.local".to_string()));
+        assert!(
+            cert.spec
+                .dns_names
+                .contains(&"*.my-cluster-headless.production.svc.cluster.local".to_string())
+        );
+        assert!(
+            cert.spec
+                .dns_names
+                .contains(&"my-cluster.production.svc.cluster.local".to_string())
+        );
 
         // Check private key
         let private_key = cert.spec.private_key.unwrap();

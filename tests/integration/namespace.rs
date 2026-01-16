@@ -9,7 +9,6 @@
 use k8s_openapi::api::core::v1::Namespace;
 use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::{Client, Resource};
-use valkey_operator::crd::{ValkeyCluster, ValkeyUpgrade};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -17,6 +16,7 @@ use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
+use valkey_operator::crd::{ValkeyCluster, ValkeyUpgrade};
 
 /// A test namespace that is automatically deleted when dropped.
 ///
@@ -86,6 +86,7 @@ impl TestNamespace {
     }
 
     /// Delete the namespace (called automatically on drop).
+    #[allow(dead_code)]
     async fn delete(&self) {
         let ns_api: Api<Namespace> = Api::all(self.client.clone());
 

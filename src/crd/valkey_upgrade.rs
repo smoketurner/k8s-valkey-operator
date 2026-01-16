@@ -256,7 +256,7 @@ impl UpgradePhase {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
 

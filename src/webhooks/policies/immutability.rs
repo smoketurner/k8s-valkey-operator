@@ -49,10 +49,12 @@ pub fn validate(ctx: &ValidationContext<'_>) -> ValidationResult {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
-    use crate::crd::{ValkeyCluster, ValkeyClusterSpec, TlsSpec, AuthSpec, IssuerRef, SecretKeyRef};
+    use crate::crd::{
+        AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyCluster, ValkeyClusterSpec,
+    };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::collections::BTreeMap;
 

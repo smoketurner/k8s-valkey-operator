@@ -263,7 +263,11 @@ impl UpgradeStateMachine {
     }
 
     /// Evaluate guards for a transition.
-    fn evaluate_guards(&self, transition: &UpgradeTransition, ctx: &UpgradeTransitionContext) -> bool {
+    fn evaluate_guards(
+        &self,
+        transition: &UpgradeTransition,
+        ctx: &UpgradeTransitionContext,
+    ) -> bool {
         match (transition.from, transition.to) {
             // Cannot start upgrade if cluster unhealthy
             (UpgradePhase::Pending, UpgradePhase::PreChecks) => ctx.cluster_healthy,
@@ -296,7 +300,9 @@ impl UpgradeStateMachine {
             return true;
         }
 
-        self.transitions.iter().any(|t| t.from == from && t.to == to)
+        self.transitions
+            .iter()
+            .any(|t| t.from == from && t.to == to)
     }
 
     /// Get the list of valid next phases from a given phase.
@@ -315,7 +321,10 @@ impl UpgradeStateMachine {
 
     /// Get all transitions from a phase.
     pub fn transitions_from(&self, phase: UpgradePhase) -> Vec<&UpgradeTransition> {
-        self.transitions.iter().filter(|t| t.from == phase).collect()
+        self.transitions
+            .iter()
+            .filter(|t| t.from == phase)
+            .collect()
     }
 }
 
@@ -487,7 +496,9 @@ impl ShardStateMachine {
             (ShardUpgradeState::Pending, ShardEvent::StartReplicaUpgrade) => {
                 ShardUpgradeState::UpgradingReplicas
             }
-            (ShardUpgradeState::Pending, ShardEvent::ReplicationSynced) if ctx.replica_count == 0 => {
+            (ShardUpgradeState::Pending, ShardEvent::ReplicationSynced)
+                if ctx.replica_count == 0 =>
+            {
                 // No replicas, skip to waiting for sync
                 ShardUpgradeState::WaitingForSync
             }
@@ -500,7 +511,9 @@ impl ShardStateMachine {
             (ShardUpgradeState::UpgradingReplicas, ShardEvent::Failed) => ShardUpgradeState::Failed,
 
             // From WaitingForSync
-            (ShardUpgradeState::WaitingForSync, ShardEvent::ReplicationSynced) if ctx.replica_count > 0 => {
+            (ShardUpgradeState::WaitingForSync, ShardEvent::ReplicationSynced)
+                if ctx.replica_count > 0 =>
+            {
                 ShardUpgradeState::FailingOver
             }
             (ShardUpgradeState::WaitingForSync, ShardEvent::ReplicationSynced) => {
@@ -519,7 +532,9 @@ impl ShardStateMachine {
             (ShardUpgradeState::UpgradingOldMaster, ShardEvent::OldMasterUpgraded) => {
                 ShardUpgradeState::Completed
             }
-            (ShardUpgradeState::UpgradingOldMaster, ShardEvent::Failed) => ShardUpgradeState::Failed,
+            (ShardUpgradeState::UpgradingOldMaster, ShardEvent::Failed) => {
+                ShardUpgradeState::Failed
+            }
 
             // Invalid transitions
             _ => return None,
@@ -586,10 +601,9 @@ impl ShardStateMachine {
                 ShardUpgradeState::WaitingForSync,
                 ShardUpgradeState::Skipped,
             ],
-            ShardUpgradeState::UpgradingReplicas => vec![
-                ShardUpgradeState::WaitingForSync,
-                ShardUpgradeState::Failed,
-            ],
+            ShardUpgradeState::UpgradingReplicas => {
+                vec![ShardUpgradeState::WaitingForSync, ShardUpgradeState::Failed]
+            }
             ShardUpgradeState::WaitingForSync => vec![
                 ShardUpgradeState::FailingOver,
                 ShardUpgradeState::UpgradingOldMaster,
@@ -599,12 +613,13 @@ impl ShardStateMachine {
                 ShardUpgradeState::UpgradingOldMaster,
                 ShardUpgradeState::Failed,
             ],
-            ShardUpgradeState::UpgradingOldMaster => vec![
-                ShardUpgradeState::Completed,
-                ShardUpgradeState::Failed,
-            ],
+            ShardUpgradeState::UpgradingOldMaster => {
+                vec![ShardUpgradeState::Completed, ShardUpgradeState::Failed]
+            }
             // Terminal states
-            ShardUpgradeState::Completed | ShardUpgradeState::Failed | ShardUpgradeState::Skipped => {
+            ShardUpgradeState::Completed
+            | ShardUpgradeState::Failed
+            | ShardUpgradeState::Skipped => {
                 vec![]
             }
         }
@@ -666,7 +681,9 @@ pub fn determine_shard_event(
         }
 
         // Terminal states
-        ShardUpgradeState::Completed | ShardUpgradeState::Failed | ShardUpgradeState::Skipped => None,
+        ShardUpgradeState::Completed | ShardUpgradeState::Failed | ShardUpgradeState::Skipped => {
+            None
+        }
     }
 }
 
@@ -675,6 +692,7 @@ pub fn determine_shard_event(
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
 
@@ -761,7 +779,11 @@ mod tests {
             upgraded_shards: 2,
             ..Default::default()
         };
-        let transition = sm.transition(UpgradePhase::InProgress, UpgradeEvent::AllShardsCompleted, &ctx);
+        let transition = sm.transition(
+            UpgradePhase::InProgress,
+            UpgradeEvent::AllShardsCompleted,
+            &ctx,
+        );
         assert!(transition.is_none());
 
         // Can complete when all shards done
@@ -771,7 +793,11 @@ mod tests {
             upgraded_shards: 3,
             ..Default::default()
         };
-        let transition = sm.transition(UpgradePhase::InProgress, UpgradeEvent::AllShardsCompleted, &ctx);
+        let transition = sm.transition(
+            UpgradePhase::InProgress,
+            UpgradeEvent::AllShardsCompleted,
+            &ctx,
+        );
         assert!(transition.is_some());
     }
 
@@ -815,11 +841,26 @@ mod tests {
         let sm = ShardStateMachine::new();
 
         // Valid transitions
-        assert!(sm.can_transition(ShardUpgradeState::Pending, ShardUpgradeState::UpgradingReplicas));
-        assert!(sm.can_transition(ShardUpgradeState::UpgradingReplicas, ShardUpgradeState::WaitingForSync));
-        assert!(sm.can_transition(ShardUpgradeState::WaitingForSync, ShardUpgradeState::FailingOver));
-        assert!(sm.can_transition(ShardUpgradeState::FailingOver, ShardUpgradeState::UpgradingOldMaster));
-        assert!(sm.can_transition(ShardUpgradeState::UpgradingOldMaster, ShardUpgradeState::Completed));
+        assert!(sm.can_transition(
+            ShardUpgradeState::Pending,
+            ShardUpgradeState::UpgradingReplicas
+        ));
+        assert!(sm.can_transition(
+            ShardUpgradeState::UpgradingReplicas,
+            ShardUpgradeState::WaitingForSync
+        ));
+        assert!(sm.can_transition(
+            ShardUpgradeState::WaitingForSync,
+            ShardUpgradeState::FailingOver
+        ));
+        assert!(sm.can_transition(
+            ShardUpgradeState::FailingOver,
+            ShardUpgradeState::UpgradingOldMaster
+        ));
+        assert!(sm.can_transition(
+            ShardUpgradeState::UpgradingOldMaster,
+            ShardUpgradeState::Completed
+        ));
 
         // Invalid transitions
         assert!(!sm.can_transition(ShardUpgradeState::Pending, ShardUpgradeState::Completed));
@@ -862,7 +903,11 @@ mod tests {
             replica_count: 1,
             ..Default::default()
         };
-        let next = sm.transition(ShardUpgradeState::Pending, ShardEvent::StartReplicaUpgrade, &ctx);
+        let next = sm.transition(
+            ShardUpgradeState::Pending,
+            ShardEvent::StartReplicaUpgrade,
+            &ctx,
+        );
         assert_eq!(next, Some(ShardUpgradeState::UpgradingReplicas));
 
         // Skip to WaitingForSync when no replicas
@@ -870,20 +915,36 @@ mod tests {
             replica_count: 0,
             ..Default::default()
         };
-        let next = sm.transition(ShardUpgradeState::Pending, ShardEvent::ReplicationSynced, &ctx);
+        let next = sm.transition(
+            ShardUpgradeState::Pending,
+            ShardEvent::ReplicationSynced,
+            &ctx,
+        );
         assert_eq!(next, Some(ShardUpgradeState::WaitingForSync));
     }
 
     #[test]
     fn test_upgrade_event_display() {
         assert_eq!(format!("{}", UpgradeEvent::Created), "Created");
-        assert_eq!(format!("{}", UpgradeEvent::PreChecksPassed), "PreChecksPassed");
-        assert_eq!(format!("{}", UpgradeEvent::RollbackRequested), "RollbackRequested");
+        assert_eq!(
+            format!("{}", UpgradeEvent::PreChecksPassed),
+            "PreChecksPassed"
+        );
+        assert_eq!(
+            format!("{}", UpgradeEvent::RollbackRequested),
+            "RollbackRequested"
+        );
     }
 
     #[test]
     fn test_shard_event_display() {
-        assert_eq!(format!("{}", ShardEvent::StartReplicaUpgrade), "StartReplicaUpgrade");
-        assert_eq!(format!("{}", ShardEvent::FailoverCompleted), "FailoverCompleted");
+        assert_eq!(
+            format!("{}", ShardEvent::StartReplicaUpgrade),
+            "StartReplicaUpgrade"
+        );
+        assert_eq!(
+            format!("{}", ShardEvent::FailoverCompleted),
+            "FailoverCompleted"
+        );
     }
 }

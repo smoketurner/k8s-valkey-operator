@@ -17,8 +17,8 @@ use tokio::signal;
 use tracing::{error, info, warn};
 
 use valkey_operator::health::{HealthState, run_health_server};
-use valkey_operator::{run_controller, run_upgrade_controller};
 use valkey_operator::{WEBHOOK_CERT_PATH, WEBHOOK_KEY_PATH, run_webhook_server};
+use valkey_operator::{run_controller, run_upgrade_controller};
 
 /// Lease configuration
 const LEASE_NAME: &str = "valkey-operator-leader";

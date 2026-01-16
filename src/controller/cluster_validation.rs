@@ -144,8 +144,15 @@ impl SpecDiff {
     }
 
     /// Calculate total pod delta
-    pub fn total_pod_delta(&self, old_masters: i32, old_replicas_per_master: i32, new_masters: i32, new_replicas_per_master: i32) -> i32 {
-        total_pods(new_masters, new_replicas_per_master) - total_pods(old_masters, old_replicas_per_master)
+    pub fn total_pod_delta(
+        &self,
+        old_masters: i32,
+        old_replicas_per_master: i32,
+        new_masters: i32,
+        new_replicas_per_master: i32,
+    ) -> i32 {
+        total_pods(new_masters, new_replicas_per_master)
+            - total_pods(old_masters, old_replicas_per_master)
     }
 }
 
@@ -221,10 +228,12 @@ pub fn generation_changed(resource: &ValkeyCluster) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
-    use crate::crd::{ValkeyClusterSpec, ValkeyClusterStatus, TlsSpec, AuthSpec, IssuerRef, SecretKeyRef};
+    use crate::crd::{
+        AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyClusterSpec, ValkeyClusterStatus,
+    };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::collections::BTreeMap;
 

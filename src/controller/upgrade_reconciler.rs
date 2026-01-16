@@ -17,7 +17,6 @@ use kube::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    client::cluster_ops::ClusterOps,
     client::valkey_client::{TlsCertData, ValkeyClient},
     controller::{
         cluster_init::{master_pod_dns_names, replica_pod_dns_names_for_master},
@@ -26,8 +25,8 @@ use crate::{
         error::Error,
     },
     crd::{
-        Condition, ValkeyCluster, ValkeyUpgrade, ValkeyUpgradeSpec, ValkeyUpgradeStatus,
-        UpgradePhase, ShardUpgradeState, ShardUpgradeStatus,
+        Condition, ShardUpgradeState, ShardUpgradeStatus, UpgradePhase, ValkeyCluster,
+        ValkeyUpgrade, ValkeyUpgradeSpec, ValkeyUpgradeStatus,
     },
 };
 
@@ -83,7 +82,7 @@ pub async fn reconcile(obj: Arc<ValkeyUpgrade>, ctx: Arc<Context>) -> Result<Act
     };
 
     // Determine next phase based on current state
-    let result = match current_phase {
+    match current_phase {
         UpgradePhase::Pending => {
             // Validate and start pre-checks
             handle_pending_phase(&obj, &ctx, &api, &cluster, &namespace).await
@@ -101,9 +100,7 @@ pub async fn reconcile(obj: Arc<ValkeyUpgrade>, ctx: Arc<Context>) -> Result<Act
             handle_rollback_phase(&obj, &ctx, &api, &cluster, &namespace).await
         }
         _ => Ok(Action::requeue(Duration::from_secs(60))),
-    };
-
-    result
+    }
 }
 
 /// Error policy for the upgrade controller
@@ -199,17 +196,18 @@ async fn handle_prechecks_phase(
 
     // Connect to cluster and check health
     let master_pods = master_pod_dns_names(cluster);
-    if master_pods.is_empty() {
-        return Err(Error::Validation("No master pods found".to_string()));
-    }
-
-    let (host, port) = &master_pods[0];
+    let (host, port) = master_pods
+        .first()
+        .ok_or_else(|| Error::Validation("No master pods found".to_string()))?;
     let client = ValkeyClient::connect_single(host, *port, password.as_deref(), tls_certs.as_ref())
         .await
         .map_err(|e| Error::Valkey(e.to_string()))?;
 
     // Check cluster health - always required before upgrade
-    let cluster_info = client.cluster_info().await.map_err(|e| Error::Valkey(e.to_string()))?;
+    let cluster_info = client
+        .cluster_info()
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
     if !cluster_info.is_healthy() {
         let _ = client.close().await;
         warn!(name = %name, "Cluster not healthy, waiting...");
@@ -217,7 +215,10 @@ async fn handle_prechecks_phase(
     }
 
     // Check slots are stable - always required before upgrade
-    let cluster_nodes = client.cluster_nodes().await.map_err(|e| Error::Valkey(e.to_string()))?;
+    let cluster_nodes = client
+        .cluster_nodes()
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
     if !cluster_nodes.all_slots_assigned() {
         let _ = client.close().await;
         warn!(name = %name, "Slots not fully assigned, waiting...");
@@ -254,7 +255,10 @@ async fn handle_inprogress_phase(
     namespace: &str,
 ) -> Result<Action, Error> {
     let name = obj.name_any();
-    let status = obj.status.as_ref().ok_or_else(|| Error::MissingField("status".to_string()))?;
+    let status = obj
+        .status
+        .as_ref()
+        .ok_or_else(|| Error::MissingField("status".to_string()))?;
 
     let current_shard = status.current_shard;
     let total_shards = status.total_shards;
@@ -266,9 +270,12 @@ async fn handle_inprogress_phase(
         new_status.phase = UpgradePhase::Completed;
         new_status.progress = format!("{}/{} shards upgraded", total_shards, total_shards);
         new_status.completed_at = Some(Timestamp::now().to_string());
-        new_status.conditions = vec![
-            Condition::ready(true, "UpgradeCompleted", "All shards upgraded successfully", obj.metadata.generation),
-        ];
+        new_status.conditions = vec![Condition::ready(
+            true,
+            "UpgradeCompleted",
+            "All shards upgraded successfully",
+            obj.metadata.generation,
+        )];
         update_status(api, &name, new_status).await?;
 
         ctx.publish_upgrade_event(
@@ -304,7 +311,7 @@ async fn handle_inprogress_phase(
     );
 
     // Process shard based on its state
-    let result = match shard_status.status {
+    match shard_status.status {
         ShardUpgradeState::Pending => {
             upgrade_shard_replicas(obj, ctx, api, cluster, namespace, current_shard).await
         }
@@ -345,9 +352,7 @@ async fn handle_inprogress_phase(
             update_status(api, &name, new_status).await?;
             Ok(Action::requeue(Duration::from_secs(1)))
         }
-    };
-
-    result
+    }
 }
 
 /// Upgrade replicas for a shard (first step)
@@ -375,7 +380,8 @@ async fn upgrade_shard_replicas(
 
     // Delete replica pods to trigger restart with new image
     // StatefulSet with updateStrategy: OnDelete means we control when pods restart
-    let pod_api: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(ctx.client.clone(), namespace);
+    let pod_api: Api<k8s_openapi::api::core::v1::Pod> =
+        Api::namespaced(ctx.client.clone(), namespace);
 
     for (dns_name, _) in &replica_pods {
         // Extract pod name from DNS name (e.g., "cluster-3.cluster-headless.ns.svc..." -> "cluster-3")
@@ -398,7 +404,13 @@ async fn upgrade_shard_replicas(
     }
 
     // Update shard status to UpgradingReplicas
-    update_shard_status(api, &name, shard_index, ShardUpgradeState::UpgradingReplicas).await?;
+    update_shard_status(
+        api,
+        &name,
+        shard_index,
+        ShardUpgradeState::UpgradingReplicas,
+    )
+    .await?;
 
     ctx.publish_upgrade_event(
         obj,
@@ -433,7 +445,8 @@ async fn check_replicas_upgraded(
     }
 
     // Check if all replica pods are ready with the new image
-    let pod_api: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(ctx.client.clone(), namespace);
+    let pod_api: Api<k8s_openapi::api::core::v1::Pod> =
+        Api::namespaced(ctx.client.clone(), namespace);
 
     let target_image = resolve_target_image(&obj.spec, cluster);
 
@@ -447,7 +460,11 @@ async fn check_replicas_upgraded(
                     .status
                     .as_ref()
                     .and_then(|s| s.conditions.as_ref())
-                    .map(|conds| conds.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+                    .map(|conds| {
+                        conds
+                            .iter()
+                            .any(|c| c.type_ == "Ready" && c.status == "True")
+                    })
                     .unwrap_or(false);
 
                 let current_image = pod
@@ -501,7 +518,13 @@ async fn wait_for_replication_sync(
 
     if replica_pods.is_empty() {
         // No replicas, skip failover entirely - just upgrade the master
-        update_shard_status(api, &name, shard_index, ShardUpgradeState::UpgradingOldMaster).await?;
+        update_shard_status(
+            api,
+            &name,
+            shard_index,
+            ShardUpgradeState::UpgradingOldMaster,
+        )
+        .await?;
         return Ok(Action::requeue(Duration::from_secs(1)));
     }
 
@@ -518,8 +541,18 @@ async fn wait_for_replication_sync(
     let tls_certs = get_tls_certs(ctx, namespace, &cluster.name_any()).await?;
 
     // Connect to the first replica and check replication status
-    let (replica_host, replica_port) = &replica_pods[0];
-    let client = match ValkeyClient::connect_single(replica_host, *replica_port, password.as_deref(), tls_certs.as_ref()).await {
+    let Some((replica_host, replica_port)) = replica_pods.first() else {
+        // This shouldn't happen since we checked is_empty above
+        return Err(Error::Validation("No replica pods found".to_string()));
+    };
+    let client = match ValkeyClient::connect_single(
+        replica_host,
+        *replica_port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
+    {
         Ok(c) => c,
         Err(e) => {
             debug!(error = %e, "Failed to connect to replica for sync check");
@@ -562,7 +595,13 @@ async fn execute_failover(
     if replica_pods.is_empty() {
         // No replicas, can't failover - just upgrade the master directly
         warn!(name = %name, shard = shard_index, "No replicas available for failover, upgrading master directly");
-        update_shard_status(api, &name, shard_index, ShardUpgradeState::UpgradingOldMaster).await?;
+        update_shard_status(
+            api,
+            &name,
+            shard_index,
+            ShardUpgradeState::UpgradingOldMaster,
+        )
+        .await?;
         return Ok(Action::requeue(Duration::from_secs(1)));
     }
 
@@ -579,7 +618,10 @@ async fn execute_failover(
     let tls_certs = get_tls_certs(ctx, namespace, &cluster.name_any()).await?;
 
     // Connect to the first replica (best replica selection would be an enhancement)
-    let (replica_host, replica_port) = &replica_pods[0];
+    let Some((replica_host, replica_port)) = replica_pods.first() else {
+        // This shouldn't happen since we checked is_empty above
+        return Err(Error::Validation("No replica pods found".to_string()));
+    };
     let replica_pod_name = replica_host.split('.').next().unwrap_or(replica_host);
 
     info!(
@@ -589,9 +631,14 @@ async fn execute_failover(
         "Executing CLUSTER FAILOVER"
     );
 
-    let client = ValkeyClient::connect_single(replica_host, *replica_port, password.as_deref(), tls_certs.as_ref())
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let client = ValkeyClient::connect_single(
+        replica_host,
+        *replica_port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
+    .map_err(|e| Error::Valkey(e.to_string()))?;
 
     // Execute failover
     let failover_result = client.cluster_failover().await;
@@ -613,7 +660,10 @@ async fn execute_failover(
                 obj,
                 "FailoverExecuted",
                 "Upgrading",
-                Some(format!("Failover executed for shard {}, promoted {}", shard_index, replica_pod_name)),
+                Some(format!(
+                    "Failover executed for shard {}, promoted {}",
+                    shard_index, replica_pod_name
+                )),
             )
             .await;
 
@@ -652,9 +702,13 @@ async fn upgrade_old_master(
     );
 
     // Delete the old master pod to trigger restart with new image
-    let pod_api: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(ctx.client.clone(), namespace);
+    let pod_api: Api<k8s_openapi::api::core::v1::Pod> =
+        Api::namespaced(ctx.client.clone(), namespace);
 
-    match pod_api.delete(&master_pod_name, &DeleteParams::default()).await {
+    match pod_api
+        .delete(&master_pod_name, &DeleteParams::default())
+        .await
+    {
         Ok(_) => {
             debug!(pod = %master_pod_name, "Old master pod deleted");
         }
@@ -679,7 +733,11 @@ async fn upgrade_old_master(
                 .status
                 .as_ref()
                 .and_then(|s| s.conditions.as_ref())
-                .map(|conds| conds.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+                .map(|conds| {
+                    conds
+                        .iter()
+                        .any(|c| c.type_ == "Ready" && c.status == "True")
+                })
                 .unwrap_or(false);
 
             let current_image = pod
@@ -780,9 +838,7 @@ async fn get_target_cluster(
 fn validate_upgrade_spec(spec: &ValkeyUpgradeSpec, cluster: &ValkeyCluster) -> Result<(), Error> {
     // Validate target_version is not empty
     if spec.target_version.is_empty() {
-        return Err(Error::Validation(
-            "targetVersion is required".to_string(),
-        ));
+        return Err(Error::Validation("targetVersion is required".to_string()));
     }
 
     // Cluster must be in Running state
@@ -828,17 +884,19 @@ async fn initialize_shard_statuses(
     let tls_certs = get_tls_certs(ctx, namespace, &cluster.name_any()).await?;
 
     let master_pods = master_pod_dns_names(cluster);
-    if master_pods.is_empty() {
-        return Err(Error::Validation("No master pods found".to_string()));
-    }
+    let (host, port) = master_pods
+        .first()
+        .ok_or_else(|| Error::Validation("No master pods found".to_string()))?;
 
     // Connect to cluster to get topology
-    let (host, port) = &master_pods[0];
     let client = ValkeyClient::connect_single(host, *port, password.as_deref(), tls_certs.as_ref())
         .await
         .map_err(|e| Error::Valkey(e.to_string()))?;
 
-    let cluster_nodes = client.cluster_nodes().await.map_err(|e| Error::Valkey(e.to_string()))?;
+    let cluster_nodes = client
+        .cluster_nodes()
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
     let _ = client.close().await;
 
     let masters = cluster_nodes.masters();
@@ -870,12 +928,13 @@ async fn get_auth_password(
 
     match secret_api.get(secret_name).await {
         Ok(secret) => {
-            if let Some(data) = secret.data {
-                if let Some(password_bytes) = data.get(secret_key) {
-                    let password = String::from_utf8(password_bytes.0.clone())
-                        .map_err(|e| Error::Validation(format!("Invalid password encoding: {}", e)))?;
-                    return Ok(Some(password));
-                }
+            if let Some(data) = secret.data
+                && let Some(password_bytes) = data.get(secret_key)
+            {
+                let password = String::from_utf8(password_bytes.0.clone()).map_err(|e| {
+                    Error::Validation(format!("Invalid password encoding: {}", e))
+                })?;
+                return Ok(Some(password));
             }
             Ok(None)
         }
@@ -1041,4 +1100,240 @@ async fn update_shard_status_with_error(
     }
 
     update_status(api, name, status).await
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
+mod tests {
+    use super::*;
+    use crate::crd::{
+        AuthSpec, ClusterPhase, ClusterReference, ImageSpec, IssuerRef, PersistenceSpec,
+        ResourceRequirementsSpec, SchedulingSpec, SecretKeyRef, TlsSpec, ValkeyCluster,
+        ValkeyClusterSpec, ValkeyClusterStatus,
+    };
+    use std::collections::BTreeMap;
+
+    /// Helper to create a minimal valid ValkeyCluster for testing
+    fn create_test_cluster(name: &str, phase: ClusterPhase) -> ValkeyCluster {
+        ValkeyCluster {
+            metadata: kube::api::ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some("test-ns".to_string()),
+                ..Default::default()
+            },
+            spec: ValkeyClusterSpec {
+                masters: 3,
+                replicas_per_master: 1,
+                image: ImageSpec {
+                    repository: "valkey/valkey".to_string(),
+                    tag: "8-alpine".to_string(),
+                    pull_policy: "IfNotPresent".to_string(),
+                    pull_secrets: Vec::new(),
+                },
+                auth: AuthSpec {
+                    secret_ref: SecretKeyRef {
+                        name: "test-auth-secret".to_string(),
+                        key: "password".to_string(),
+                    },
+                },
+                tls: TlsSpec {
+                    issuer_ref: IssuerRef {
+                        name: "test-issuer".to_string(),
+                        kind: "ClusterIssuer".to_string(),
+                        group: "cert-manager.io".to_string(),
+                    },
+                    duration: "2160h".to_string(),
+                    renew_before: "360h".to_string(),
+                },
+                persistence: PersistenceSpec::default(),
+                resources: ResourceRequirementsSpec::default(),
+                scheduling: SchedulingSpec::default(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            status: Some(ValkeyClusterStatus {
+                phase,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Helper to create a test upgrade spec
+    fn create_test_upgrade_spec(target_version: &str) -> ValkeyUpgradeSpec {
+        ValkeyUpgradeSpec {
+            cluster_ref: ClusterReference {
+                name: "test-cluster".to_string(),
+                namespace: None,
+            },
+            target_version: target_version.to_string(),
+        }
+    }
+
+    // ==========================================================================
+    // validate_upgrade_spec() tests
+    // ==========================================================================
+
+    #[test]
+    fn test_validate_upgrade_spec_valid() {
+        let spec = create_test_upgrade_spec("9");
+        let cluster = create_test_cluster("test", ClusterPhase::Running);
+        assert!(validate_upgrade_spec(&spec, &cluster).is_ok());
+    }
+
+    #[test]
+    fn test_validate_upgrade_spec_empty_target_version() {
+        let spec = create_test_upgrade_spec("");
+        let cluster = create_test_cluster("test", ClusterPhase::Running);
+        let result = validate_upgrade_spec(&spec, &cluster);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("targetVersion is required")
+        );
+    }
+
+    #[test]
+    fn test_validate_upgrade_spec_cluster_not_running() {
+        let spec = create_test_upgrade_spec("9");
+        let cluster = create_test_cluster("test", ClusterPhase::Creating);
+        let result = validate_upgrade_spec(&spec, &cluster);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be in Running state")
+        );
+    }
+
+    #[test]
+    fn test_validate_upgrade_spec_cluster_pending() {
+        let spec = create_test_upgrade_spec("9");
+        let cluster = create_test_cluster("test", ClusterPhase::Pending);
+        let result = validate_upgrade_spec(&spec, &cluster);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be in Running state")
+        );
+    }
+
+    #[test]
+    fn test_validate_upgrade_spec_cluster_failed() {
+        let spec = create_test_upgrade_spec("9");
+        let cluster = create_test_cluster("test", ClusterPhase::Failed);
+        let result = validate_upgrade_spec(&spec, &cluster);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_upgrade_spec_cluster_degraded() {
+        let spec = create_test_upgrade_spec("9");
+        let cluster = create_test_cluster("test", ClusterPhase::Degraded);
+        let result = validate_upgrade_spec(&spec, &cluster);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_upgrade_spec_cluster_updating() {
+        let spec = create_test_upgrade_spec("9");
+        let cluster = create_test_cluster("test", ClusterPhase::Updating);
+        let result = validate_upgrade_spec(&spec, &cluster);
+        assert!(result.is_err());
+    }
+
+    // ==========================================================================
+    // resolve_target_image() tests
+    // ==========================================================================
+
+    #[test]
+    fn test_resolve_target_image_basic() {
+        let spec = create_test_upgrade_spec("9");
+        let cluster = create_test_cluster("test", ClusterPhase::Running);
+        let image = resolve_target_image(&spec, &cluster);
+        assert_eq!(image, "valkey/valkey:9-alpine");
+    }
+
+    #[test]
+    fn test_resolve_target_image_with_patch_version() {
+        let spec = create_test_upgrade_spec("9.0.1");
+        let cluster = create_test_cluster("test", ClusterPhase::Running);
+        let image = resolve_target_image(&spec, &cluster);
+        assert_eq!(image, "valkey/valkey:9.0.1-alpine");
+    }
+
+    #[test]
+    fn test_resolve_target_image_custom_repository() {
+        let spec = create_test_upgrade_spec("9");
+        let mut cluster = create_test_cluster("test", ClusterPhase::Running);
+        cluster.spec.image.repository = "my-registry.com/valkey".to_string();
+        let image = resolve_target_image(&spec, &cluster);
+        assert_eq!(image, "my-registry.com/valkey:9-alpine");
+    }
+
+    #[test]
+    fn test_resolve_target_image_private_registry() {
+        let spec = create_test_upgrade_spec("10");
+        let mut cluster = create_test_cluster("test", ClusterPhase::Running);
+        cluster.spec.image.repository = "gcr.io/my-project/valkey".to_string();
+        let image = resolve_target_image(&spec, &cluster);
+        assert_eq!(image, "gcr.io/my-project/valkey:10-alpine");
+    }
+
+    // ==========================================================================
+    // Constants tests
+    // ==========================================================================
+
+    #[test]
+    fn test_upgrade_finalizer_constant() {
+        assert_eq!(
+            UPGRADE_FINALIZER,
+            "valkey-operator.smoketurner.com/upgrade-finalizer"
+        );
+        assert!(UPGRADE_FINALIZER.contains("valkey-operator"));
+        assert!(UPGRADE_FINALIZER.contains("upgrade"));
+    }
+
+    // ==========================================================================
+    // UpgradePhase terminal state tests
+    // ==========================================================================
+
+    #[test]
+    fn test_upgrade_phase_terminal_completed() {
+        assert!(UpgradePhase::Completed.is_terminal());
+    }
+
+    #[test]
+    fn test_upgrade_phase_terminal_failed() {
+        assert!(UpgradePhase::Failed.is_terminal());
+    }
+
+    #[test]
+    fn test_upgrade_phase_terminal_rolled_back() {
+        assert!(UpgradePhase::RolledBack.is_terminal());
+    }
+
+    #[test]
+    fn test_upgrade_phase_not_terminal_pending() {
+        assert!(!UpgradePhase::Pending.is_terminal());
+    }
+
+    #[test]
+    fn test_upgrade_phase_not_terminal_prechecks() {
+        assert!(!UpgradePhase::PreChecks.is_terminal());
+    }
+
+    #[test]
+    fn test_upgrade_phase_not_terminal_inprogress() {
+        assert!(!UpgradePhase::InProgress.is_terminal());
+    }
+
+    #[test]
+    fn test_upgrade_phase_not_terminal_rolling_back() {
+        assert!(!UpgradePhase::RollingBack.is_terminal());
+    }
 }

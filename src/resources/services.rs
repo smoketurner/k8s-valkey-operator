@@ -124,7 +124,7 @@ pub fn generate_client_service(resource: &ValkeyCluster) -> Service {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
     use crate::crd::{AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyClusterSpec};
@@ -174,9 +174,11 @@ mod tests {
         let ports = spec.ports.unwrap();
         assert_eq!(ports.len(), 2);
         assert!(ports.iter().any(|p| p.name == Some("client".to_string())));
-        assert!(ports
-            .iter()
-            .any(|p| p.name == Some("cluster-bus".to_string())));
+        assert!(
+            ports
+                .iter()
+                .any(|p| p.name == Some("cluster-bus".to_string()))
+        );
     }
 
     #[test]
@@ -192,8 +194,8 @@ mod tests {
 
         let ports = spec.ports.unwrap();
         assert_eq!(ports.len(), 1);
-        assert_eq!(ports[0].name, Some("client".to_string()));
-        assert_eq!(ports[0].port, CLIENT_PORT);
+        assert_eq!(ports.first().unwrap().name, Some("client".to_string()));
+        assert_eq!(ports.first().unwrap().port, CLIENT_PORT);
     }
 
     #[test]

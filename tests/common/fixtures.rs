@@ -16,7 +16,7 @@ use valkey_operator::crd::{
 ///     .replicas_per_master(1)
 ///     .build();
 /// ```
-#[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct ValkeyClusterBuilder {
     name: String,
     namespace: Option<String>,
@@ -30,6 +30,7 @@ pub struct ValkeyClusterBuilder {
     uid: Option<String>,
 }
 
+#[allow(dead_code)]
 impl ValkeyClusterBuilder {
     /// Create a new builder with the given resource name.
     pub fn new(name: impl Into<String>) -> Self {

@@ -114,7 +114,12 @@ pub struct Transition {
 
 impl Transition {
     /// Create a new transition
-    const fn new(from: ClusterPhase, to: ClusterPhase, event: ClusterEvent, description: &'static str) -> Self {
+    const fn new(
+        from: ClusterPhase,
+        to: ClusterPhase,
+        event: ClusterEvent,
+        description: &'static str,
+    ) -> Self {
         Self {
             from,
             to,
@@ -432,7 +437,11 @@ impl ClusterStateMachine {
         match (&transition.from, &transition.to, &transition.event) {
             // Guard: AllReplicasReady requires all replicas to be ready
             (_, ClusterPhase::Running, ClusterEvent::AllReplicasReady)
-            | (ClusterPhase::Creating, ClusterPhase::Initializing, ClusterEvent::AllReplicasReady) => {
+            | (
+                ClusterPhase::Creating,
+                ClusterPhase::Initializing,
+                ClusterEvent::AllReplicasReady,
+            ) => {
                 if !ctx.all_replicas_ready() {
                     Some(format!(
                         "Not all replicas ready: {}/{}",
@@ -482,7 +491,12 @@ pub fn determine_event(
     }
 
     // Check for spec change
-    if ctx.spec_changed && matches!(current_phase, ClusterPhase::Running | ClusterPhase::Degraded) {
+    if ctx.spec_changed
+        && matches!(
+            current_phase,
+            ClusterPhase::Running | ClusterPhase::Degraded
+        )
+    {
         return ClusterEvent::SpecChanged;
     }
 
@@ -497,7 +511,11 @@ pub fn determine_event(
         ClusterEvent::ReplicasDegraded
     } else if *current_phase == ClusterPhase::Pending {
         ClusterEvent::ResourcesApplied
-    } else if ctx.no_replicas_ready() && matches!(current_phase, ClusterPhase::Creating | ClusterPhase::Updating)
+    } else if ctx.no_replicas_ready()
+        && matches!(
+            current_phase,
+            ClusterPhase::Creating | ClusterPhase::Updating
+        )
     {
         // During initial bootstrap or updates, having 0 ready replicas
         // is a normal transitional state, not an error. Return ResourcesApplied
@@ -515,6 +533,7 @@ pub fn determine_event(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
+    clippy::get_unwrap,
     clippy::panic
 )]
 mod tests {
@@ -542,12 +561,20 @@ mod tests {
 
         // Should fail with 0/3 replicas ready
         let ctx = TransitionContext::new(0, 3);
-        let result = sm.transition(&ClusterPhase::Creating, ClusterEvent::AllReplicasReady, &ctx);
+        let result = sm.transition(
+            &ClusterPhase::Creating,
+            ClusterEvent::AllReplicasReady,
+            &ctx,
+        );
         assert!(matches!(result, TransitionResult::GuardFailed { .. }));
 
         // Should succeed with 3/3 replicas ready and transition to Initializing
         let ctx = TransitionContext::new(3, 3);
-        let result = sm.transition(&ClusterPhase::Creating, ClusterEvent::AllReplicasReady, &ctx);
+        let result = sm.transition(
+            &ClusterPhase::Creating,
+            ClusterEvent::AllReplicasReady,
+            &ctx,
+        );
         match result {
             TransitionResult::Success { from, to, .. } => {
                 assert_eq!(from, ClusterPhase::Creating);

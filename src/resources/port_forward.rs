@@ -187,9 +187,7 @@ async fn resolve_selector_to_pod(
 
     tracing::debug!(label_selector = %selector, "Resolving selector to pod");
 
-    let pod_list = pods
-        .list(&ListParams::default().labels(selector))
-        .await?;
+    let pod_list = pods.list(&ListParams::default().labels(selector)).await?;
 
     let pod = pod_list
         .items
@@ -383,7 +381,7 @@ impl PodPortForwards {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
 

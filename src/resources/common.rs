@@ -23,10 +23,7 @@ pub fn standard_labels(resource: &ValkeyCluster) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
 
     labels.insert("app.kubernetes.io/name".to_string(), name.clone());
-    labels.insert(
-        "app.kubernetes.io/instance".to_string(),
-        name,
-    );
+    labels.insert("app.kubernetes.io/instance".to_string(), name);
     labels.insert(
         "app.kubernetes.io/managed-by".to_string(),
         "valkey-operator".to_string(),
@@ -93,11 +90,11 @@ pub fn client_service_name(resource: &ValkeyCluster) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
+    use crate::crd::{AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyClusterSpec};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-    use crate::crd::{ValkeyClusterSpec, TlsSpec, AuthSpec, IssuerRef, SecretKeyRef};
 
     fn test_resource(name: &str) -> ValkeyCluster {
         ValkeyCluster {
@@ -134,9 +131,18 @@ mod tests {
         let resource = test_resource("my-cluster");
         let labels = standard_labels(&resource);
 
-        assert_eq!(labels.get("app.kubernetes.io/name"), Some(&"my-cluster".to_string()));
-        assert_eq!(labels.get("app.kubernetes.io/managed-by"), Some(&"valkey-operator".to_string()));
-        assert_eq!(labels.get("app.kubernetes.io/component"), Some(&"valkeycluster".to_string()));
+        assert_eq!(
+            labels.get("app.kubernetes.io/name"),
+            Some(&"my-cluster".to_string())
+        );
+        assert_eq!(
+            labels.get("app.kubernetes.io/managed-by"),
+            Some(&"valkey-operator".to_string())
+        );
+        assert_eq!(
+            labels.get("app.kubernetes.io/component"),
+            Some(&"valkeycluster".to_string())
+        );
     }
 
     #[test]
@@ -146,7 +152,10 @@ mod tests {
 
         assert_eq!(owner_ref.name, "my-cluster");
         assert_eq!(owner_ref.kind, "ValkeyCluster");
-        assert_eq!(owner_ref.api_version, "valkey-operator.smoketurner.com/v1alpha1");
+        assert_eq!(
+            owner_ref.api_version,
+            "valkey-operator.smoketurner.com/v1alpha1"
+        );
         assert_eq!(owner_ref.controller, Some(true));
     }
 

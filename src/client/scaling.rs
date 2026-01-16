@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use tracing::{debug, info, instrument, warn};
 
-use super::cluster_ops::{calculate_slot_distribution, ClusterOps};
 use super::types::ClusterNode;
 use super::valkey_client::{ClusterSetSlotState, ValkeyClient, ValkeyError};
+use crate::slots::{calculate_distribution, planner::extract_ordinal_from_address};
 
 /// Result of a scaling operation.
 #[derive(Debug, Clone)]
@@ -100,49 +100,16 @@ impl ScalingContext {
     }
 }
 
-/// Extension trait for scaling operations.
-pub trait ScalingOps {
+/// Scaling operations for ValkeyClient.
+impl ValkeyClient {
     /// Execute a scale up operation.
     ///
     /// Steps:
     /// 1. CLUSTER MEET new nodes to join the cluster
     /// 2. Wait for nodes to be recognized
     /// 3. Rebalance slots across all masters
-    fn scale_up(
-        &self,
-        ctx: &ScalingContext,
-    ) -> impl std::future::Future<Output = Result<ScalingResult, ValkeyError>> + Send;
-
-    /// Execute a scale down operation.
-    ///
-    /// Steps:
-    /// 1. Migrate slots from nodes being removed to remaining nodes
-    /// 2. CLUSTER FORGET to remove nodes from cluster
-    fn scale_down(
-        &self,
-        ctx: &ScalingContext,
-    ) -> impl std::future::Future<Output = Result<ScalingResult, ValkeyError>> + Send;
-
-    /// Rebalance slots across all master nodes.
-    ///
-    /// This redistributes slots evenly across all masters.
-    fn rebalance_slots(
-        &self,
-        master_count: i32,
-    ) -> impl std::future::Future<Output = Result<i32, ValkeyError>> + Send;
-
-    /// Migrate a single slot from one node to another.
-    fn migrate_slot(
-        &self,
-        slot: u16,
-        source_node_id: &str,
-        dest_node_id: &str,
-    ) -> impl std::future::Future<Output = Result<(), ValkeyError>> + Send;
-}
-
-impl ScalingOps for ValkeyClient {
     #[instrument(skip(self, ctx))]
-    async fn scale_up(&self, ctx: &ScalingContext) -> Result<ScalingResult, ValkeyError> {
+    pub async fn scale_up(&self, ctx: &ScalingContext) -> Result<ScalingResult, ValkeyError> {
         let mut result = ScalingResult::default();
 
         if !ctx.is_scale_up() {
@@ -194,8 +161,13 @@ impl ScalingOps for ValkeyClient {
         Ok(result)
     }
 
+    /// Execute a scale down operation.
+    ///
+    /// Steps:
+    /// 1. Migrate slots from nodes being removed to remaining nodes
+    /// 2. CLUSTER FORGET to remove nodes from cluster
     #[instrument(skip(self, ctx))]
-    async fn scale_down(&self, ctx: &ScalingContext) -> Result<ScalingResult, ValkeyError> {
+    pub async fn scale_down(&self, ctx: &ScalingContext) -> Result<ScalingResult, ValkeyError> {
         let mut result = ScalingResult::default();
 
         if !ctx.is_scale_down() {
@@ -222,7 +194,7 @@ impl ScalingOps for ValkeyClient {
             .filter(|m| {
                 // Extract ordinal from address and check if it should be removed
                 if let Some(ordinal) = extract_ordinal_from_address(&m.address) {
-                    ordinals_to_remove.contains(&ordinal)
+                    ordinals_to_remove.contains(&(ordinal as i32))
                 } else {
                     false
                 }
@@ -234,9 +206,6 @@ impl ScalingOps for ValkeyClient {
             warn!("No nodes found to remove, skipping scale down");
             return Ok(result);
         }
-
-        // Calculate new slot distribution for remaining masters
-        let _new_distribution = calculate_slot_distribution(ctx.target_masters);
 
         // Migrate slots from nodes being removed
         for node in &nodes_to_remove {
@@ -253,22 +222,24 @@ impl ScalingOps for ValkeyClient {
             for (i, slot) in node_slots.iter().enumerate() {
                 // Determine destination node (round-robin to remaining masters)
                 let dest_idx = i % ctx.target_masters as usize;
-                if let Some(dest_node) = masters.get(dest_idx) {
-                    if !nodes_to_remove.iter().any(|n| n.node_id == dest_node.node_id) {
-                        debug!(
-                            slot = slot,
-                            from = %node.node_id,
-                            to = %dest_node.node_id,
-                            "Migrating slot"
-                        );
-                        // Use CLUSTER SETSLOT NODE to reassign slot
-                        self.cluster_setslot(
-                            *slot,
-                            ClusterSetSlotState::Node(dest_node.node_id.clone()),
-                        )
-                        .await?;
-                        result.slots_moved += 1;
-                    }
+                if let Some(dest_node) = masters.get(dest_idx)
+                    && !nodes_to_remove
+                        .iter()
+                        .any(|n| n.node_id == dest_node.node_id)
+                {
+                    debug!(
+                        slot = slot,
+                        from = %node.node_id,
+                        to = %dest_node.node_id,
+                        "Migrating slot"
+                    );
+                    // Use CLUSTER SETSLOT NODE to reassign slot
+                    self.cluster_setslot(
+                        *slot,
+                        ClusterSetSlotState::Node(dest_node.node_id.clone()),
+                    )
+                    .await?;
+                    result.slots_moved += 1;
                 }
             }
         }
@@ -289,8 +260,11 @@ impl ScalingOps for ValkeyClient {
         Ok(result)
     }
 
+    /// Rebalance slots across all master nodes.
+    ///
+    /// This redistributes slots evenly across all masters.
     #[instrument(skip(self))]
-    async fn rebalance_slots(&self, master_count: i32) -> Result<i32, ValkeyError> {
+    pub async fn rebalance_slots(&self, master_count: i32) -> Result<i32, ValkeyError> {
         let mut slots_moved = 0;
 
         // Get current cluster state
@@ -305,8 +279,8 @@ impl ScalingOps for ValkeyClient {
             )));
         }
 
-        // Calculate target slot distribution
-        let target_distribution = calculate_slot_distribution(master_count);
+        // Calculate target slot distribution using new slots module
+        let target_distribution = calculate_distribution(master_count as u16);
 
         // Build current slot ownership map
         let mut current_ownership: HashMap<u16, String> = HashMap::new();
@@ -319,14 +293,10 @@ impl ScalingOps for ValkeyClient {
         }
 
         // For each master, determine what slots it should own
-        for (idx, master) in masters.iter().enumerate() {
-            let (start, end) = target_distribution[idx];
-
-            for slot in start..=end {
-                let slot_u16 = slot as u16;
-
+        for (master, range) in masters.iter().zip(target_distribution.iter()) {
+            for slot in range.iter() {
                 // Check if slot needs to be moved to this master
-                if let Some(current_owner) = current_ownership.get(&slot_u16) {
+                if let Some(current_owner) = current_ownership.get(&slot) {
                     if *current_owner != master.node_id {
                         debug!(
                             slot = slot,
@@ -337,7 +307,7 @@ impl ScalingOps for ValkeyClient {
 
                         // Reassign slot to this master
                         self.cluster_setslot(
-                            slot_u16,
+                            slot,
                             ClusterSetSlotState::Node(master.node_id.clone()),
                         )
                         .await?;
@@ -351,11 +321,8 @@ impl ScalingOps for ValkeyClient {
                         to = %master.node_id,
                         "Assigning unowned slot"
                     );
-                    self.cluster_setslot(
-                        slot_u16,
-                        ClusterSetSlotState::Node(master.node_id.clone()),
-                    )
-                    .await?;
+                    self.cluster_setslot(slot, ClusterSetSlotState::Node(master.node_id.clone()))
+                        .await?;
                     slots_moved += 1;
                 }
             }
@@ -365,8 +332,9 @@ impl ScalingOps for ValkeyClient {
         Ok(slots_moved)
     }
 
+    /// Migrate a single slot from one node to another.
     #[instrument(skip(self))]
-    async fn migrate_slot(
+    pub async fn migrate_slot(
         &self,
         slot: u16,
         _source_node_id: &str,
@@ -382,25 +350,8 @@ impl ScalingOps for ValkeyClient {
     }
 }
 
-/// Extract pod ordinal from a Valkey node address.
-///
-/// Addresses are in format: `hostname:port` or `ip:port`
-/// For StatefulSet pods, hostname is like `cluster-name-0`
-fn extract_ordinal_from_address(address: &str) -> Option<i32> {
-    // Remove port if present
-    let hostname = address.split(':').next()?;
-
-    // Try to extract ordinal from end of hostname
-    // Format: name-N where N is the ordinal
-    let parts: Vec<&str> = hostname.rsplitn(2, '-').collect();
-    if parts.len() == 2 {
-        parts[0].parse().ok()
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
 
@@ -447,19 +398,8 @@ mod tests {
 
         let names = ctx.new_master_dns_names();
         assert_eq!(names.len(), 2);
-        assert!(names[0].contains("valkey-3"));
-        assert!(names[1].contains("valkey-4"));
-    }
-
-    #[test]
-    fn test_extract_ordinal_from_address() {
-        assert_eq!(extract_ordinal_from_address("my-cluster-0:6379"), Some(0));
-        assert_eq!(extract_ordinal_from_address("my-cluster-5:6379"), Some(5));
-        assert_eq!(
-            extract_ordinal_from_address("my-cluster-10.ns.svc:6379"),
-            None
-        );
-        assert_eq!(extract_ordinal_from_address("192.168.1.1:6379"), Some(1));
+        assert!(names.first().unwrap().contains("valkey-3"));
+        assert!(names.get(1).unwrap().contains("valkey-4"));
     }
 
     #[test]

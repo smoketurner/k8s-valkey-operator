@@ -5,13 +5,13 @@
 
 use futures::StreamExt;
 use kube::Resource;
-use kube::api::{Api, ListParams};
+use kube::api::Api;
 use kube::runtime::watcher::{self, Event};
 use std::fmt::Debug;
 use std::time::Duration;
 use tokio::time::timeout;
 
-use valkey_operator::crd::{ValkeyCluster, ClusterPhase};
+use valkey_operator::crd::{ClusterPhase, ValkeyCluster};
 
 /// Error type for wait operations.
 #[derive(Debug, thiserror::Error)]
@@ -54,8 +54,6 @@ where
     <K as Resource>::DynamicType: Default,
     F: Fn(&K) -> bool,
 {
-    let params = ListParams::default().fields(&format!("metadata.name={}", name));
-
     let watch_future = async {
         let mut stream = watcher::watcher(
             api.clone(),
@@ -197,10 +195,8 @@ pub fn has_ready_replicas(resource: &ValkeyCluster, count: i32) -> bool {
 
 /// Check if a ValkeyCluster is operational (Running phase with all replicas ready).
 pub fn is_operational(resource: &ValkeyCluster) -> bool {
-    let total_pods = valkey_operator::crd::total_pods(
-        resource.spec.masters,
-        resource.spec.replicas_per_master,
-    );
+    let total_pods =
+        valkey_operator::crd::total_pods(resource.spec.masters, resource.spec.replicas_per_master);
     resource
         .status
         .as_ref()

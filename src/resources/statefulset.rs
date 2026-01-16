@@ -10,10 +10,10 @@
 
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec, StatefulSetUpdateStrategy};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
-    ExecAction, Lifecycle, LifecycleHandler, ObjectFieldSelector, PersistentVolumeClaim,
+    Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource, ExecAction,
+    Lifecycle, LifecycleHandler, LocalObjectReference, ObjectFieldSelector, PersistentVolumeClaim,
     PersistentVolumeClaimSpec, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
-    ResourceRequirements, SecretKeySelector, SecurityContext, Volume, VolumeMount,
+    ResourceRequirements, SecretKeySelector, SecurityContext, Toleration, Volume, VolumeMount,
     VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -21,7 +21,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use kube::ResourceExt;
 use std::collections::BTreeMap;
 
-use crate::crd::{total_pods, ValkeyCluster};
+use crate::crd::{ValkeyCluster, total_pods};
 use crate::resources::common::{
     headless_service_name, owner_reference, pod_selector_labels, standard_annotations,
     standard_labels,
@@ -95,7 +95,18 @@ fn generate_pod_template(
     labels: &BTreeMap<String, String>,
     annotations: &BTreeMap<String, String>,
 ) -> PodTemplateSpec {
-    let _name = resource.name_any();
+    // Convert custom Toleration to k8s Toleration
+    let tolerations = convert_tolerations(&resource.spec.scheduling.tolerations);
+
+    // Convert pull_secrets to LocalObjectReference
+    let image_pull_secrets = convert_pull_secrets(&resource.spec.image.pull_secrets);
+
+    // Convert node_selector to Option
+    let node_selector = if resource.spec.scheduling.node_selector.is_empty() {
+        None
+    } else {
+        Some(resource.spec.scheduling.node_selector.clone())
+    };
 
     PodTemplateSpec {
         metadata: Some(ObjectMeta {
@@ -113,10 +124,48 @@ fn generate_pod_template(
             affinity: Some(generate_affinity(resource)),
             containers: vec![generate_valkey_container(resource)],
             volumes: Some(generate_volumes(resource)),
+            // Apply scheduling constraints from spec
+            node_selector,
+            tolerations,
+            image_pull_secrets,
             // Use the default service account - Valkey pods don't need K8s API access
             ..Default::default()
         }),
     }
+}
+
+/// Convert CRD tolerations to k8s-openapi Tolerations.
+fn convert_tolerations(crd_tolerations: &[crate::crd::Toleration]) -> Option<Vec<Toleration>> {
+    if crd_tolerations.is_empty() {
+        return None;
+    }
+
+    Some(
+        crd_tolerations
+            .iter()
+            .map(|t| Toleration {
+                key: t.key.clone(),
+                operator: t.operator.clone(),
+                value: t.value.clone(),
+                effect: t.effect.clone(),
+                toleration_seconds: t.toleration_seconds,
+            })
+            .collect(),
+    )
+}
+
+/// Convert pull_secrets list to LocalObjectReference list.
+fn convert_pull_secrets(pull_secrets: &[String]) -> Option<Vec<LocalObjectReference>> {
+    if pull_secrets.is_empty() {
+        return None;
+    }
+
+    Some(
+        pull_secrets
+            .iter()
+            .map(|name| LocalObjectReference { name: name.clone() })
+            .collect(),
+    )
 }
 
 /// Generate pod security context.
@@ -283,7 +332,11 @@ fn generate_env_vars(resource: &ValkeyCluster) -> Vec<EnvVar> {
 }
 
 /// Build the VALKEY_EXTRA_FLAGS environment variable value.
-fn build_valkey_extra_flags(_resource: &ValkeyCluster, namespace: &str, headless_svc: &str) -> String {
+fn build_valkey_extra_flags(
+    _resource: &ValkeyCluster,
+    namespace: &str,
+    headless_svc: &str,
+) -> String {
     let mut flags = vec![
         // Cluster mode
         "--cluster-enabled yes".to_string(),
@@ -418,8 +471,8 @@ fn generate_liveness_probe() -> Probe {
 /// Checks that the cluster state is OK, meaning:
 /// - Node is part of the cluster
 /// - Cluster is consistent and operational
-/// Uses VALKEYCLI_AUTH environment variable for secure password handling.
-/// Uses --tls --insecure for localhost connections (skips cert validation).
+///   Uses VALKEYCLI_AUTH environment variable for secure password handling.
+///   Uses --tls --insecure for localhost connections (skips cert validation).
 fn generate_readiness_probe() -> Probe {
     Probe {
         exec: Some(ExecAction {
@@ -450,7 +503,8 @@ fn generate_lifecycle() -> Lifecycle {
                 command: Some(vec![
                     "sh".to_string(),
                     "-c".to_string(),
-                    "VALKEYCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure bgsave && sleep 5".to_string(),
+                    "VALKEYCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure bgsave && sleep 5"
+                        .to_string(),
                 ]),
             }),
             ..Default::default()
@@ -533,7 +587,7 @@ fn generate_pvc_template(resource: &ValkeyCluster) -> PersistentVolumeClaim {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
     use crate::crd::{AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyClusterSpec};

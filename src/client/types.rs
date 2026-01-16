@@ -365,11 +365,19 @@ impl ClusterNode {
             )));
         }
 
-        let node_id = parts[0].to_string();
+        let node_id = parts
+            .first()
+            .ok_or_else(|| ParseError::MissingField("node_id".to_string()))?
+            .to_string();
 
         // Parse address: ip:port@cport or ip:port
-        let addr_parts: Vec<&str> = parts[1].split('@').collect();
-        let ip_port = addr_parts[0];
+        let addr_field = parts
+            .get(1)
+            .ok_or_else(|| ParseError::MissingField("address".to_string()))?;
+        let addr_parts: Vec<&str> = addr_field.split('@').collect();
+        let ip_port = addr_parts
+            .first()
+            .ok_or_else(|| ParseError::MissingField("ip:port".to_string()))?;
         let (ip, port) = if let Some((ip, port_str)) = ip_port.rsplit_once(':') {
             let port = port_str.parse().map_err(|_| {
                 ParseError::InvalidClusterNodes(format!("Invalid port: {}", port_str))
@@ -382,32 +390,37 @@ impl ClusterNode {
             )));
         };
 
-        let cluster_bus_port = if addr_parts.len() > 1 {
-            addr_parts[1]
-                .split(',')
-                .next()
-                .unwrap_or("")
-                .parse()
-                .unwrap_or(port + 10000)
-        } else {
-            port + 10000
-        };
+        let cluster_bus_port = addr_parts
+            .get(1)
+            .map(|s| s.split(',').next().unwrap_or("").parse().unwrap_or(port + 10000))
+            .unwrap_or(port + 10000);
 
-        let flags = NodeFlags::parse(parts[2]);
+        let flags_str = parts
+            .get(2)
+            .ok_or_else(|| ParseError::MissingField("flags".to_string()))?;
+        let flags = NodeFlags::parse(flags_str);
 
-        let master_id = if parts[3] == "-" {
+        let master_field = parts
+            .get(3)
+            .ok_or_else(|| ParseError::MissingField("master_id".to_string()))?;
+        let master_id = if *master_field == "-" {
             None
         } else {
-            Some(parts[3].to_string())
+            Some(master_field.to_string())
         };
 
-        let ping_sent = parts[4].parse().unwrap_or(0);
-        let pong_recv = parts[5].parse().unwrap_or(0);
-        let config_epoch = parts[6].parse().unwrap_or(0);
-        let link_state = parts[7].to_string();
+        let ping_sent = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let pong_recv = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let config_epoch = parts.get(6).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let link_state = parts
+            .get(7)
+            .ok_or_else(|| ParseError::MissingField("link_state".to_string()))?
+            .to_string();
 
         // Parse slot ranges (remaining parts for master nodes)
-        let slots: Vec<SlotRange> = parts[8..]
+        let slots: Vec<SlotRange> = parts
+            .get(8..)
+            .unwrap_or_default()
             .iter()
             .filter_map(|s| SlotRange::parse(s).ok())
             .collect();
@@ -493,6 +506,7 @@ impl ParsedClusterNodes {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
 
@@ -591,7 +605,7 @@ cluster_my_epoch:2
         assert!(node.is_myself());
         assert!(node.is_connected());
         assert_eq!(node.slots.len(), 1);
-        assert_eq!(node.slots[0], SlotRange::new(5461, 10922));
+        assert_eq!(node.slots.first().unwrap(), &SlotRange::new(5461, 10922));
         assert_eq!(node.slot_count(), 5462);
     }
 

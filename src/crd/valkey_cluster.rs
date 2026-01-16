@@ -356,7 +356,7 @@ fn default_rdb_save_rules() -> Vec<String> {
 }
 
 /// Resource requests and limits for Valkey pods.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceRequirementsSpec {
     /// CPU and memory requests.
@@ -366,15 +366,6 @@ pub struct ResourceRequirementsSpec {
     /// CPU and memory limits.
     #[serde(default)]
     pub limits: ResourceLimitsSpec,
-}
-
-impl Default for ResourceRequirementsSpec {
-    fn default() -> Self {
-        Self {
-            requests: ResourceSpec::default(),
-            limits: ResourceLimitsSpec::default(),
-        }
-    }
 }
 
 /// Resource requests specification.
@@ -750,6 +741,7 @@ pub fn total_pods(masters: i32, replicas_per_master: i32) -> i32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
 

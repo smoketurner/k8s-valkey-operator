@@ -27,14 +27,12 @@ pub const WEBHOOK_KEY_PATH: &str = "/etc/webhook/certs/tls.key";
 pub const WEBHOOK_PORT: u16 = 9443;
 
 /// Shared state for webhook handlers
-pub struct WebhookState {
-    #[allow(dead_code)]
-    pub client: Client,
-}
+pub struct WebhookState;
 
 impl WebhookState {
-    pub fn new(client: Client) -> Self {
-        Self { client }
+    pub fn new(_client: Client) -> Self {
+        // Client intentionally not stored - available for future use if needed
+        Self
     }
 }
 
@@ -203,12 +201,12 @@ pub async fn run_webhook_server(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
+    use crate::crd::{AuthSpec, IssuerRef, SecretKeyRef, TlsSpec};
     use crate::crd::{ValkeyCluster, ValkeyClusterSpec};
     use crate::webhooks::policies::ValidationContext;
-    use crate::crd::{TlsSpec, AuthSpec, IssuerRef, SecretKeyRef};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::collections::BTreeMap;
 

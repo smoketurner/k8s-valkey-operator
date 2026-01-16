@@ -4,7 +4,7 @@
 //! components in isolation.
 
 mod crd_tests {
-    use valkey_operator::crd::{Condition, ClusterPhase};
+    use valkey_operator::crd::{ClusterPhase, Condition};
 
     #[test]
     fn test_phase_display() {

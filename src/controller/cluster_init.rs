@@ -18,10 +18,10 @@ use kube::{Api, Client, ResourceExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
 
-use crate::client::cluster_ops::calculate_slot_distribution;
 use crate::client::valkey_client::{TlsCertData, ValkeyClient, ValkeyError};
 use crate::crd::ValkeyCluster;
 use crate::resources::port_forward::{PortForward, PortForwardError, PortForwardTarget};
+use crate::slots::{calculate_distribution, planner::extract_ordinal_from_address};
 
 /// Build the DNS name for a pod in the StatefulSet.
 ///
@@ -37,9 +37,7 @@ pub fn pod_dns_name(cluster_name: &str, namespace: &str, ordinal: i32) -> String
 /// Build a list of all pod DNS names for a cluster.
 pub fn all_pod_dns_names(cluster: &ValkeyCluster) -> Vec<(String, u16)> {
     let name = cluster.name_any();
-    let namespace = cluster
-        .namespace()
-        .unwrap_or_else(|| "default".to_string());
+    let namespace = cluster.namespace().unwrap_or_else(|| "default".to_string());
     let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
 
     (0..total_pods)
@@ -52,9 +50,7 @@ pub fn all_pod_dns_names(cluster: &ValkeyCluster) -> Vec<(String, u16)> {
 /// Masters are pods 0 through (masters-1) in the StatefulSet.
 pub fn master_pod_dns_names(cluster: &ValkeyCluster) -> Vec<(String, u16)> {
     let name = cluster.name_any();
-    let namespace = cluster
-        .namespace()
-        .unwrap_or_else(|| "default".to_string());
+    let namespace = cluster.namespace().unwrap_or_else(|| "default".to_string());
 
     (0..cluster.spec.masters)
         .map(|i| (pod_dns_name(&name, &namespace, i), 6379))
@@ -70,9 +66,7 @@ pub fn replica_pod_dns_names_for_master(
     master_index: i32,
 ) -> Vec<(String, u16)> {
     let name = cluster.name_any();
-    let namespace = cluster
-        .namespace()
-        .unwrap_or_else(|| "default".to_string());
+    let namespace = cluster.namespace().unwrap_or_else(|| "default".to_string());
     let replicas = cluster.spec.replicas_per_master;
 
     let base_ordinal = cluster.spec.masters + (master_index * replicas);
@@ -91,9 +85,7 @@ pub fn all_pod_names(cluster: &ValkeyCluster) -> Vec<String> {
     let name = cluster.name_any();
     let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
 
-    (0..total_pods)
-        .map(|i| pod_name(&name, i))
-        .collect()
+    (0..total_pods).map(|i| pod_name(&name, i)).collect()
 }
 
 /// Get pod IP addresses from the Kubernetes API.
@@ -107,7 +99,8 @@ pub async fn get_pod_ips(
     total_pods: i32,
 ) -> Result<Vec<(String, String, u16)>, ValkeyError> {
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let label_selector = format!("app.kubernetes.io/instance={}", cluster_name);
+    // Use app.kubernetes.io/name for consistency with check_running_pods and StatefulSet
+    let label_selector = format!("app.kubernetes.io/name={}", cluster_name);
 
     let pods = pod_api
         .list(&ListParams::default().labels(&label_selector))
@@ -123,17 +116,13 @@ pub async fn get_pod_ips(
             .items
             .iter()
             .find(|p| p.metadata.name.as_deref() == Some(&pod_name))
-            .ok_or_else(|| {
-                ValkeyError::ClusterNotReady(format!("Pod {} not found", pod_name))
-            })?;
+            .ok_or_else(|| ValkeyError::ClusterNotReady(format!("Pod {} not found", pod_name)))?;
 
         let ip = pod
             .status
             .as_ref()
             .and_then(|s| s.pod_ip.as_ref())
-            .ok_or_else(|| {
-                ValkeyError::ClusterNotReady(format!("Pod {} has no IP", pod_name))
-            })?;
+            .ok_or_else(|| ValkeyError::ClusterNotReady(format!("Pod {} has no IP", pod_name)))?;
 
         pod_ips.push((pod_name, ip.clone(), 6379));
     }
@@ -189,7 +178,10 @@ impl ClusterPortForwards {
     }
 
     /// Ensure a port forward exists for the given pod ordinal
-    pub async fn ensure_forward(&mut self, ordinal: i32) -> Result<(String, u16), PortForwardError> {
+    pub async fn ensure_forward(
+        &mut self,
+        ordinal: i32,
+    ) -> Result<(String, u16), PortForwardError> {
         if let Some(pf) = self.forwards.get(&ordinal) {
             return Ok(("127.0.0.1".to_string(), pf.local_port()));
         }
@@ -214,7 +206,9 @@ impl ClusterPortForwards {
 
     /// Get the connection address for a pod ordinal
     pub fn get_address(&self, ordinal: i32) -> Option<(String, u16)> {
-        self.forwards.get(&ordinal).map(|pf| ("127.0.0.1".to_string(), pf.local_port()))
+        self.forwards
+            .get(&ordinal)
+            .map(|pf| ("127.0.0.1".to_string(), pf.local_port()))
     }
 
     /// Create port forwards for all pods in the cluster
@@ -264,7 +258,8 @@ pub async fn execute_cluster_meet(
 
     // Connect to the first node via port forward
     // TLS is still used - the port forward is just a transport layer tunnel
-    let client = ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
+    let client =
+        ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
 
     // Execute CLUSTER MEET for all other nodes using their IP addresses
     for (_pod_name, ip, port) in pod_ips.iter().skip(1) {
@@ -291,6 +286,8 @@ pub async fn execute_cluster_meet(
 /// Assign hash slots evenly across master nodes.
 ///
 /// Connects to each master and assigns its portion of the 16384 hash slots.
+/// This function is idempotent - it checks existing slot assignments and only
+/// assigns slots that haven't been assigned yet.
 #[instrument(skip(cluster, password, tls_certs, strategy))]
 pub async fn assign_slots_to_masters(
     cluster: &ValkeyCluster,
@@ -299,7 +296,7 @@ pub async fn assign_slots_to_masters(
     strategy: &ConnectionStrategy,
 ) -> Result<(), ValkeyError> {
     let masters = cluster.spec.masters;
-    let slot_ranges = calculate_slot_distribution(masters);
+    let slot_ranges = calculate_distribution(masters as u16);
     let master_pods = master_pod_dns_names(cluster);
 
     if slot_ranges.len() != master_pods.len() {
@@ -310,15 +307,63 @@ pub async fn assign_slots_to_masters(
         )));
     }
 
+    // First, check if all slots are already assigned by querying the cluster
+    let (connect_host, connect_port) = strategy.get_connection(0).await?;
+    let check_client =
+        ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
+
+    let cluster_info = check_client.cluster_info().await?;
+    check_client.close().await?;
+
+    if cluster_info.all_slots_assigned() {
+        info!(
+            slots_assigned = cluster_info.slots_assigned,
+            "All slots already assigned, skipping slot assignment"
+        );
+        return Ok(());
+    }
+
     info!(
         masters = masters,
+        slots_assigned = cluster_info.slots_assigned,
         "Assigning slots to {} masters",
         masters
     );
 
-    for (i, ((_dns_host, _dns_port), (start_slot, end_slot))) in
+    // Get current slot assignments from cluster nodes
+    let (connect_host, connect_port) = strategy.get_connection(0).await?;
+    let check_client =
+        ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
+    let cluster_nodes = check_client.cluster_nodes().await?;
+    check_client.close().await?;
+
+    // Build a set of already-assigned slots
+    let mut assigned_slots: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    for master in cluster_nodes.masters() {
+        for slot_range in &master.slots {
+            for slot in slot_range.start..=slot_range.end {
+                assigned_slots.insert(slot as u16);
+            }
+        }
+    }
+
+    for (i, ((_dns_host, _dns_port), range)) in
         master_pods.iter().zip(slot_ranges.iter()).enumerate()
     {
+        // Filter out already-assigned slots
+        let slots_to_assign: Vec<u16> = range
+            .iter()
+            .filter(|slot| !assigned_slots.contains(slot))
+            .collect();
+
+        if slots_to_assign.is_empty() {
+            debug!(
+                master_index = i,
+                "All slots for this master already assigned, skipping"
+            );
+            continue;
+        }
+
         // Get connection address via port forwarding
         let (connect_host, connect_port) = strategy.get_connection(i as i32).await?;
 
@@ -326,29 +371,29 @@ pub async fn assign_slots_to_masters(
             master_index = i,
             host = %connect_host,
             port = %connect_port,
-            start_slot = start_slot,
-            end_slot = end_slot,
+            start_slot = range.start,
+            end_slot = range.end,
+            slots_to_assign = slots_to_assign.len(),
             "Connecting to master to assign slots"
         );
 
         // Connect to this specific master via port forward
         // TLS is still used - the port forward is just a transport layer tunnel
-        let client = ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
+        let client =
+            ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
 
-        // Build slot range and assign
-        let slots: Vec<u16> = (*start_slot as u16..=*end_slot as u16).collect();
         debug!(
             master_index = i,
-            slot_count = slots.len(),
+            slot_count = slots_to_assign.len(),
             "Executing CLUSTER ADDSLOTS"
         );
 
-        client.cluster_add_slots(slots).await?;
+        client.cluster_add_slots(slots_to_assign).await?;
         client.close().await?;
 
         info!(
             master_index = i,
-            slots = format!("{}-{}", start_slot, end_slot),
+            slots = %range,
             "Slots assigned to master"
         );
     }
@@ -396,7 +441,8 @@ pub async fn setup_replicas(
 
     // Connect to first master to get cluster topology
     // TLS is still used - the port forward is just a transport layer tunnel
-    let client = ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
+    let client =
+        ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
 
     // Get cluster nodes to find master node IDs
     let nodes_raw = client.cluster_nodes_raw().await?;
@@ -417,9 +463,12 @@ pub async fn setup_replicas(
     for (master_index, master_node_id) in master_node_ids.iter().enumerate() {
         let replica_pods = replica_pod_dns_names_for_master(cluster, master_index as i32);
 
-        for (replica_index, (_replica_dns_host, _replica_dns_port)) in replica_pods.iter().enumerate() {
+        for (replica_index, (_replica_dns_host, _replica_dns_port)) in
+            replica_pods.iter().enumerate()
+        {
             // Calculate the ordinal for this replica pod
-            let replica_ordinal = masters + (master_index as i32 * replicas_per_master) + replica_index as i32;
+            let replica_ordinal =
+                masters + (master_index as i32 * replicas_per_master) + replica_index as i32;
 
             // Get connection address for this replica via port forwarding
             let (connect_host, connect_port) = strategy.get_connection(replica_ordinal).await?;
@@ -457,29 +506,40 @@ pub async fn setup_replicas(
 /// Parse master node IDs from CLUSTER NODES output.
 ///
 /// Returns node IDs for nodes that have slots assigned (masters).
-fn parse_master_node_ids(nodes_output: &str, expected_masters: usize) -> Result<Vec<String>, ValkeyError> {
+fn parse_master_node_ids(
+    nodes_output: &str,
+    expected_masters: usize,
+) -> Result<Vec<String>, ValkeyError> {
     let mut master_ids: Vec<(String, i32)> = Vec::new();
 
     for line in nodes_output.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 {
-            continue;
-        }
 
-        let node_id = parts[0];
-        let flags = parts[2];
+        // Extract required fields safely
+        let Some(node_id) = parts.first() else {
+            continue;
+        };
+        let Some(address) = parts.get(1) else {
+            continue;
+        };
+        let Some(flags) = parts.get(2) else { continue };
 
         // A master has "master" in flags and has slot assignments
         // After CLUSTER ADDSLOTS, masters will have slots listed after the 8th field
         if flags.contains("master") && parts.len() > 8 {
             // Check if this node has slots assigned (indicated by slot ranges after field 8)
-            let has_slots = parts.iter().skip(8).any(|p| p.contains('-') || p.parse::<i32>().is_ok());
+            let has_slots = parts
+                .iter()
+                .skip(8)
+                .any(|p| p.contains('-') || p.parse::<i32>().is_ok());
             if has_slots {
                 // Extract ordinal from address to maintain order
                 // Address format: hostname:port@cluster-bus-port
                 // For StatefulSet: my-cluster-0.my-cluster-headless.ns.svc.cluster.local:6379@16379
-                let ordinal = extract_ordinal_from_address(parts[1]).unwrap_or(master_ids.len() as i32);
-                master_ids.push((node_id.to_string(), ordinal));
+                let ordinal = extract_ordinal_from_address(address)
+                    .map(|o| o as i32)
+                    .unwrap_or(master_ids.len() as i32);
+                master_ids.push(((*node_id).to_string(), ordinal));
             }
         }
     }
@@ -495,38 +555,33 @@ fn parse_master_node_ids(nodes_output: &str, expected_masters: usize) -> Result<
 
         for line in nodes_output.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 3 {
-                continue;
-            }
 
-            let node_id = parts[0];
-            let flags = parts[2];
+            // Extract required fields safely
+            let Some(node_id) = parts.first() else {
+                continue;
+            };
+            let Some(address) = parts.get(1) else {
+                continue;
+            };
+            let Some(flags) = parts.get(2) else { continue };
 
             if flags.contains("master") && !flags.contains("fail") {
-                let ordinal = extract_ordinal_from_address(parts.get(1).unwrap_or(&""))
+                let ordinal = extract_ordinal_from_address(address)
+                    .map(|o| o as i32)
                     .unwrap_or(all_masters.len() as i32);
-                all_masters.push((node_id.to_string(), ordinal));
+                all_masters.push(((*node_id).to_string(), ordinal));
             }
         }
 
         all_masters.sort_by_key(|(_, ordinal)| *ordinal);
-        return Ok(all_masters.into_iter().map(|(id, _)| id).take(expected_masters).collect());
+        return Ok(all_masters
+            .into_iter()
+            .map(|(id, _)| id)
+            .take(expected_masters)
+            .collect());
     }
 
     Ok(ids)
-}
-
-/// Extract pod ordinal from a StatefulSet pod address.
-///
-/// Address format: `my-cluster-0.my-cluster-headless.ns.svc.cluster.local:6379@16379`
-fn extract_ordinal_from_address(address: &str) -> Option<i32> {
-    // Remove port suffix if present
-    let hostname = address.split(':').next()?;
-    // Get the pod name part (before first dot)
-    let pod_name = hostname.split('.').next()?;
-    // Extract ordinal from pod name (last part after last hyphen)
-    let ordinal_str = pod_name.rsplit('-').next()?;
-    ordinal_str.parse().ok()
 }
 
 /// Full cluster initialization workflow.
@@ -583,6 +638,7 @@ pub fn create_connection_strategy(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
 mod tests {
     use super::*;
     use crate::crd::{AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyClusterSpec};
@@ -682,23 +738,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_ordinal_from_address() {
-        assert_eq!(
-            extract_ordinal_from_address(
-                "my-cluster-0.my-cluster-headless.default.svc.cluster.local:6379@16379"
-            ),
-            Some(0)
-        );
-        assert_eq!(
-            extract_ordinal_from_address(
-                "my-cluster-5.my-cluster-headless.ns.svc.cluster.local:6379@16379"
-            ),
-            Some(5)
-        );
-        assert_eq!(extract_ordinal_from_address("invalid"), None);
-    }
-
-    #[test]
     fn test_parse_master_node_ids() {
         let nodes_output = r#"abc123 my-cluster-0.my-cluster-headless.default.svc.cluster.local:6379@16379 myself,master - 0 1234567890 1 connected 0-5461
 def456 my-cluster-1.my-cluster-headless.default.svc.cluster.local:6379@16379 master - 0 1234567890 2 connected 5462-10922
@@ -709,5 +748,70 @@ ghi789 my-cluster-2.my-cluster-headless.default.svc.cluster.local:6379@16379 mas
         assert_eq!(ids[0], "abc123");
         assert_eq!(ids[1], "def456");
         assert_eq!(ids[2], "ghi789");
+    }
+
+    // ==========================================================================
+    // Additional pod_name and all_pod_names tests
+    // ==========================================================================
+
+    #[test]
+    fn test_pod_name() {
+        assert_eq!(pod_name("my-cluster", 0), "my-cluster-0");
+        assert_eq!(pod_name("my-cluster", 5), "my-cluster-5");
+        assert_eq!(pod_name("valkey-prod", 10), "valkey-prod-10");
+    }
+
+    #[test]
+    fn test_all_pod_names() {
+        let cluster = test_cluster("my-cluster", 3, 1);
+        let names = all_pod_names(&cluster);
+
+        // 3 masters + 3 replicas = 6 pods
+        assert_eq!(names.len(), 6);
+        assert_eq!(names[0], "my-cluster-0");
+        assert_eq!(names[5], "my-cluster-5");
+    }
+
+    #[test]
+    fn test_all_pod_names_no_replicas() {
+        let cluster = test_cluster("my-cluster", 3, 0);
+        let names = all_pod_names(&cluster);
+
+        // 3 masters + 0 replicas = 3 pods
+        assert_eq!(names.len(), 3);
+        assert_eq!(names[0], "my-cluster-0");
+        assert_eq!(names[2], "my-cluster-2");
+    }
+
+    #[test]
+    fn test_master_pod_dns_names_only_masters() {
+        // Verify masters are correctly identified regardless of replicas
+        let cluster = test_cluster("my-cluster", 5, 2);
+        let masters = master_pod_dns_names(&cluster);
+
+        assert_eq!(masters.len(), 5);
+        for (i, (dns, port)) in masters.iter().enumerate() {
+            assert!(dns.contains(&format!("my-cluster-{}", i)));
+            assert_eq!(*port, 6379);
+        }
+    }
+
+    #[test]
+    fn test_pod_dns_name_special_namespace() {
+        assert_eq!(
+            pod_dns_name("cluster", "kube-system", 0),
+            "cluster-0.cluster-headless.kube-system.svc.cluster.local"
+        );
+        assert_eq!(
+            pod_dns_name("my-valkey", "prod-us-east-1", 3),
+            "my-valkey-3.my-valkey-headless.prod-us-east-1.svc.cluster.local"
+        );
+    }
+
+    #[test]
+    fn test_replica_pod_dns_names_no_replicas() {
+        let cluster = test_cluster("my-cluster", 3, 0);
+        let replicas = replica_pod_dns_names_for_master(&cluster, 0);
+        assert!(replicas.is_empty());
     }
 }

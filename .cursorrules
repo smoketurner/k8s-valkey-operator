@@ -1,0 +1,506 @@
+# Cursor Rules for Valkey Kubernetes Operator
+
+This file provides comprehensive guidance for AI assistance when working on this Kubernetes operator project. For detailed pattern explanations and rationale, see [GUIDE.md](GUIDE.md). For project-specific commands and quick reference, see [CLAUDE.md](CLAUDE.md).
+
+## Project Overview
+
+This is a **Kubernetes operator for managing Valkey Clusters** built in Rust using kube-rs 2.x.
+
+- **API Group**: `valkey-operator.smoketurner.com`
+- **API Version**: `v1alpha1`
+- **Kinds**: `ValkeyCluster`, `ValkeyUpgrade`
+- **Short Name**: `vc` (for ValkeyCluster)
+- **Minimum Kubernetes Version**: 1.35+
+- **Minimum Rust Version**: 1.92+ (Edition 2024)
+- **Valkey Version**: 9.x
+
+### Generated Resources
+
+For each ValkeyCluster, the operator creates:
+- **StatefulSet**: Valkey pods with stable identity
+- **Headless Service**: Cluster discovery
+- **Client Service**: Client access endpoint
+- **PodDisruptionBudget**: Maintain quorum
+- **Certificate**: TLS certs via cert-manager
+
+## Core Principles
+
+### 1. Panic-Free Code Policy (CRITICAL)
+
+**Production code must NEVER panic.** This is enforced by clippy lints in `Cargo.toml`.
+
+#### ❌ NEVER Do This:
+```rust
+// DON'T - These will fail clippy
+let value = option.unwrap();
+let result = operation().expect("should work");
+let item = items[0];
+panic!("error occurred");
+```
+
+#### ✅ ALWAYS Do This:
+```rust
+// DO - Safe alternatives
+let value = option.unwrap_or_default();
+let value = option.ok_or(Error::MissingField("field"))?;
+let item = items.first().ok_or(Error::Empty)?;
+let item = items.get(0).ok_or(Error::IndexOutOfBounds)?;
+return Err(Error::OperationFailed);
+```
+
+**Reference**: See `Cargo.toml` `[lints.clippy]` section for all enforced lints.
+
+### 2. Security by Default
+
+- Secure defaults should be enabled by default, not optional
+- Secrets should never be logged or exposed in status
+- Network policies should be deployed automatically
+- RBAC should follow least privilege
+- **Question to ask**: "If a developer deploys this with minimal config, is it secure?"
+
+### 3. Operational Simplicity
+
+- Fewer configuration options is better than more
+- Sensible defaults reduce support burden
+- Tier presets (small/medium/large) beat 50 knobs
+- Platform-level defaults reduce per-cluster configuration
+- **Question to ask**: "Does a developer need to understand internals to use this?"
+
+### 4. Self-Healing Over Manual Intervention
+
+- 90% of issues should resolve without human intervention
+- Failures should auto-retry with alerting
+- Degraded resources should attempt recovery before alerting
+- **Question to ask**: "What happens at 3 AM when this fails?"
+
+### 5. Observable by Default
+
+- Fleet-wide health should be visible at a glance
+- Standard alerts should be deployed automatically
+- Metrics should enable capacity planning and chargeback
+- Events should link to runbooks
+- **Question to ask**: "Can I see which resources are unhealthy without kubectl?"
+
+### 6. Idempotent Operations
+
+All reconciliation must be idempotent - running the same operation multiple times produces the same result.
+
+**Reference**: `src/controller/cluster_reconciler.rs` demonstrates idempotent reconciliation.
+
+## Coding Standards
+
+### Rust 2024 Edition Patterns
+
+#### let-else for Early Returns
+```rust
+let Some(name) = resource.metadata.name.as_ref() else {
+    return Err(Error::MissingField("metadata.name"));
+};
+```
+
+#### if-let Chains
+```rust
+if let Some(status) = resource.status.as_ref()
+    && let Some(phase) = status.phase.as_ref()
+    && *phase == Phase::Running
+{
+    // Handle running state
+}
+```
+
+#### is_some_and / is_none_or
+```rust
+let has_finalizer = resource.finalizers().iter().any(|f| f == FINALIZER);
+let should_reconcile = generation.is_none_or(|g| g != observed);
+```
+
+### Safe Option/Result Handling
+
+| Pattern | Use Case | Example |
+|---------|----------|---------|
+| `unwrap_or_default()` | When a sensible default exists | `replicas.unwrap_or_default()` |
+| `unwrap_or(value)` | When you have a specific fallback | `port.unwrap_or(6379)` |
+| `ok_or(Error::...)` | Convert Option to Result | `name.ok_or(Error::MissingName)?` |
+| `map(\|v\| ...)` | Transform the inner value | `value.map(\|v\| v * 2)` |
+| `and_then(\|v\| ...)` | Chain Option-returning operations | `value.and_then(parse_int)` |
+| `as_ref()` | Borrow without consuming | `option.as_ref().map(...)` |
+| `as_deref()` | Get `&str` from `Option<String>` | `name.as_deref().unwrap_or("default")` |
+
+### Error Handling
+
+- Use `thiserror` for custom error types (see `src/controller/error.rs`)
+- Classify errors: **Transient** (retry), **Permanent** (fail), **Validation** (reject)
+- Preserve error context through the call stack
+- Update CRD status conditions on validation errors
+- Emit Kubernetes events for significant errors
+
+**Reference**: `src/controller/error.rs` for error classification patterns.
+
+### Server-Side Apply (SSA)
+
+Always use server-side apply for Kubernetes resource updates:
+
+```rust
+let patch = Patch::Apply(&resource);
+let params = PatchParams::apply(FIELD_MANAGER).force();
+api.patch(name, &params, &patch).await?;
+```
+
+**Why**: Idempotent, handles field ownership, automatic conflict resolution.
+
+**Reference**: `src/controller/cluster_reconciler.rs` for SSA usage.
+
+### Generation Tracking
+
+Track which spec version the status reflects:
+
+```rust
+let spec_gen = resource.metadata.generation;
+let observed_gen = resource.status.as_ref()
+    .and_then(|s| s.observed_generation);
+
+if observed_gen.is_none_or(|g| g != spec_gen) {
+    // Status is stale, need to reconcile
+}
+```
+
+**Reference**: `src/controller/status.rs` for generation tracking.
+
+## Architecture Patterns
+
+### Controller Reconciliation Flow
+
+```
+Reconcile Called
+    ↓
+Check deletion timestamp
+    ↓ (Has finalizer + deletion timestamp?)
+    ├─ No → Handle normal reconcile
+    └─ Yes → Handle deletion
+    ↓
+Ensure finalizer exists
+    ↓
+Apply owned resources (SSA)
+    ↓
+Check resource readiness
+    ↓
+Update status & conditions
+    ↓
+Return Action (requeue or await)
+```
+
+**Reference**: `src/controller/cluster_reconciler.rs` for full implementation.
+
+### State Machine
+
+Formal FSM for resource lifecycle with valid transitions:
+
+- `Pending → Creating → Running ⟷ Updating`
+- `Running → Degraded → Running` (recovery)
+- `Any state → Deleting` (on deletion)
+
+**Reference**: `src/controller/cluster_state_machine.rs` for transition rules.
+
+### Finalizer Pattern
+
+Hook for cleanup before Kubernetes deletes the resource:
+
+1. **On Create**: Add finalizer to resource
+2. **On Delete Request**: Kubernetes sets `deletionTimestamp` but doesn't delete
+3. **Operator Cleanup**: Scale down, delete external resources
+4. **Remove Finalizer**: Kubernetes can now delete the resource
+
+**Reference**: `FINALIZER` constant and `handle_deletion()` in `src/controller/cluster_reconciler.rs`.
+
+### Owner References
+
+Link child resources to parent CRD for automatic garbage collection:
+
+```rust
+let owner_ref = owner_reference(&cluster);
+resource.owner_references = Some(vec![owner_ref]);
+```
+
+**Reference**: `src/resources/common.rs` for `owner_reference()` helper.
+
+### Health Server
+
+HTTP endpoints for probes and metrics:
+
+- `/healthz`: Liveness probe (200 if process alive)
+- `/readyz`: Readiness probe (200 if ready to serve)
+- `/metrics`: Prometheus metrics
+
+Readiness state changes:
+- Startup → `ready = false` (not yet leader)
+- Leadership → `ready = true` (controller running)
+- Shutdown → `ready = false` (draining)
+
+**Reference**: `src/health.rs` for implementation.
+
+## Kubernetes Operator Patterns
+
+### CRD Structure
+
+**ValkeyCluster** (`src/crd/valkey_cluster.rs`):
+- `spec`: User-defined desired state (masters, replicasPerMaster, image, resources, tls, auth)
+- `status`: Operator-reported observed state (phase, conditions, observedGeneration)
+- `status.conditions`: Kubernetes-standard detailed status
+
+**ValkeyUpgrade** (`src/crd/valkey_upgrade.rs`):
+- Manages rolling upgrades with proper failover orchestration
+
+### Phase Lifecycle
+
+High-level state indicator for the resource:
+
+| Phase | Meaning |
+|-------|---------|
+| `Pending` | Resource created, not yet processed |
+| `Creating` | Initial resources being created |
+| `Running` | All resources healthy and operational |
+| `Updating` | Spec change being applied |
+| `Degraded` | Partially functional (some replicas unhealthy) |
+| `Failed` | Unrecoverable error (requires intervention) |
+| `Deleting` | Cleanup in progress |
+
+**Reference**: `Phase` enum in `src/crd/valkey_cluster.rs`.
+
+### Status Conditions
+
+Kubernetes-standard detailed status reporting:
+
+| Type | True When | False When |
+|------|-----------|------------|
+| `Ready` | All replicas healthy | Any replica unhealthy |
+| `Progressing` | Changes being applied | Stable state reached |
+| `Degraded` | Partial functionality | Fully healthy or fully failed |
+
+**Reference**: Condition constants and builders in `src/controller/status.rs`.
+
+### Admission Webhooks
+
+Validation webhook for enforcing policies:
+
+- Reject invalid resources before they're stored
+- Enforce policies beyond what CEL can express
+- Cross-resource validation
+
+**Reference**: `src/webhooks/server.rs` for webhook implementation.
+
+### RBAC with Least Privilege
+
+- Separate rules by resource type
+- List explicit verbs (avoid wildcards)
+- Status subresource separate permissions
+- Events: create/patch only
+- Pods: read-only (operator shouldn't modify pods directly)
+
+**Reference**: `config/rbac/role.yaml` for RBAC configuration.
+
+## Kubernetes 1.35+ Features
+
+### In-Place Pod Resource Resizing
+
+Modify CPU/memory requests without pod restart:
+
+```rust
+fn check_resize_status(pod: &Pod) -> Option<&str> {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.resize.as_deref())
+}
+
+fn get_allocated_resources(pod: &Pod) -> Option<&BTreeMap<String, Quantity>> {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .and_then(|cs| cs.first())
+        .and_then(|c| c.allocated_resources.as_ref())
+}
+```
+
+**Resize Status Values**:
+- `Proposed`: Resize requested, awaiting scheduler
+- `InProgress`: Kubelet applying the resize
+- `Deferred`: Cannot resize now, will retry
+- `Infeasible`: Cannot resize (node constraints)
+
+### Pod Generation Tracking
+
+Track when kubelet has applied spec changes:
+
+```rust
+fn is_pod_synced(pod: &Pod) -> bool {
+    let spec_gen = pod.metadata.generation;
+    let observed_gen = pod.status.as_ref().and_then(|s| s.observed_generation);
+
+    match (spec_gen, observed_gen) {
+        (Some(spec), Some(observed)) => spec == observed,
+        _ => true,  // Assume synced if missing (backwards compat)
+    }
+}
+```
+
+## Valkey-Specific Patterns
+
+### Cluster Initialization
+
+- CLUSTER MEET commands to form cluster
+- CLUSTER ADDSLOTS to assign slots to masters
+- CLUSTER REPLICATE for replica assignment
+
+**Reference**: `src/controller/cluster_init.rs` for cluster initialization logic.
+
+### Slot Distribution
+
+- Even distribution of 16384 slots across masters
+- Slot migration planning for scaling operations
+
+**Reference**: `src/slots/distribution.rs` and `src/slots/migration.rs`.
+
+### Scaling Operations
+
+- Scale up: Add new nodes, redistribute slots
+- Scale down: Migrate slots, remove nodes gracefully
+- Maintain quorum during scaling
+
+**Reference**: `src/client/scaling.rs` for scaling logic.
+
+## Testing Requirements
+
+### Test Organization
+
+| Directory | Purpose | Requirements |
+|-----------|---------|--------------|
+| `tests/unit/` | Component tests | None |
+| `tests/integration/` | End-to-end tests | Kubernetes cluster |
+| `tests/proptest/` | Property-based tests | None |
+| `tests/common/` | Shared fixtures | None |
+
+### Test Fixtures
+
+Builder pattern for creating test resources:
+
+**Reference**: `tests/common/fixtures.rs` for test fixture builders.
+
+### Testing Patterns
+
+- **Unit tests**: Test individual functions with mocks
+- **Integration tests**: Test against real Kubernetes cluster
+- **Property-based tests**: Generate random inputs to find edge cases
+
+**Note**: Test code may use `unwrap()` where panicking is acceptable.
+
+## Build & Test Commands
+
+See [CLAUDE.md](CLAUDE.md) for complete command reference. Key commands:
+
+```bash
+make build              # Build release binary
+make test               # Run unit tests
+make test-integration   # Run integration tests
+make lint               # Run clippy lints
+make run                # Run operator locally
+make install            # Install CRD and RBAC
+make deploy             # Deploy operator to cluster
+```
+
+## File Reference Guide
+
+| Pattern | File |
+|---------|------|
+| CRD definition | `src/crd/valkey_cluster.rs`, `src/crd/valkey_upgrade.rs` |
+| Reconciliation | `src/controller/cluster_reconciler.rs`, `src/controller/upgrade_reconciler.rs` |
+| State machine | `src/controller/cluster_state_machine.rs`, `src/controller/upgrade_state_machine.rs` |
+| Error handling | `src/controller/error.rs` |
+| Status updates | `src/controller/status.rs` |
+| Shared context | `src/controller/context.rs` |
+| Resource generation | `src/resources/` |
+| Health server | `src/health.rs` |
+| Webhooks | `src/webhooks/server.rs` |
+| Leader election | `src/main.rs` |
+| Controller setup | `src/lib.rs` |
+| Test fixtures | `tests/common/fixtures.rs` |
+| Cluster operations | `src/client/cluster_ops.rs` |
+| Slot management | `src/slots/` |
+
+## Platform Engineering Evaluation Criteria
+
+When reviewing code or design, evaluate from these perspectives:
+
+### 1. Security by Default
+- ✅ Secure defaults enabled by default
+- ✅ Secrets never logged or exposed
+- ✅ Network policies deployed automatically
+- ✅ RBAC follows least privilege
+
+### 2. Operational Simplicity
+- ✅ Sensible defaults reduce support burden
+- ✅ Tier presets (small/medium/large) available
+- ✅ Platform-level defaults configured
+- ✅ Minimal configuration required
+
+### 3. Self-Healing
+- ✅ Auto-retry with exponential backoff
+- ✅ Degraded resources attempt recovery
+- ✅ Failures alert before manual intervention needed
+- ✅ Blast radius contained to one resource
+
+### 4. Observable by Default
+- ✅ Fleet-wide health visible at a glance
+- ✅ Standard alerts deployed automatically
+- ✅ Metrics enable capacity planning
+- ✅ Events link to runbooks
+
+### 5. Policy-Driven Governance
+- ✅ Admission webhooks enforce policies
+- ✅ Resource quotas prevent noisy neighbors
+- ✅ Compliance evidence automatic
+- ✅ Guardrails prevent dangerous configs
+
+## Red Flags to Identify
+
+When reviewing changes, flag these patterns:
+
+1. ❌ **New optional security features** - Security should be default, not opt-in
+2. ❌ **Expert-level configuration exposed** - Hide complexity behind presets
+3. ❌ **Silent failures** - All failures need alerting or auto-recovery
+4. ❌ **Per-resource configuration requirements** - Should be platform-level defaults
+5. ❌ **Manual operational procedures** - Should be automated or documented in runbooks
+6. ❌ **Missing status conditions** - Platform engineer needs visibility into health
+7. ❌ **Immutable decisions** - Avoid "can't change after creation" when possible
+
+## Common Scenarios
+
+### New Team Onboarding
+Developer needs a resource in 5 minutes with 10-line YAML. Ensure:
+- Minimal required configuration
+- Sensible defaults
+- Clear error messages
+
+### Production Incident
+3 AM alert, need to understand and resolve in 30 minutes. Ensure:
+- Clear status conditions
+- Actionable error messages
+- Self-healing where possible
+- Comprehensive logging
+
+### Security Audit
+Need to prove encryption, access controls, compliance. Ensure:
+- Secure by default
+- Audit logging
+- RBAC properly configured
+- Secrets properly handled
+
+## Key Links
+
+- [GUIDE.md](GUIDE.md) - Detailed pattern explanations and rationale
+- [CLAUDE.md](CLAUDE.md) - Project-specific commands and quick reference
+- [kube-rs documentation](https://kube.rs)
+- [k8s-openapi documentation](https://docs.rs/k8s-openapi)
+- [Kubernetes API conventions](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md)
+
+---
+
+**Remember**: When in doubt, refer to `GUIDE.md` for detailed explanations of why patterns exist, and `CLAUDE.md` for project-specific commands and context.

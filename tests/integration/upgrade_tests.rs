@@ -8,14 +8,16 @@
 
 use std::time::Duration;
 
-use kube::api::{Api, DeleteParams, PostParams};
 use kube::ResourceExt;
+use kube::api::{Api, DeleteParams, PostParams};
 
 use valkey_operator::crd::{UpgradePhase, ValkeyCluster, ValkeyUpgrade};
 
-use crate::init_test;
-use crate::namespace::TestNamespace;
-use crate::wait::{wait_for_condition, wait_for_operational};
+use crate::fixtures::create_auth_secret;
+use crate::{
+    ScopedOperator, SharedTestCluster, TestNamespace, ensure_cluster_crd_installed,
+    ensure_upgrade_crd_installed, wait_for_condition, wait_for_operational,
+};
 
 /// Long timeout for upgrade operations.
 const LONG_TIMEOUT: Duration = Duration::from_secs(180);
@@ -25,6 +27,28 @@ const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default timeout for most operations.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Initialize tracing and ensure CRD is installed
+async fn init_test() -> std::sync::Arc<SharedTestCluster> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,kube=warn,valkey_operator=debug")
+        .with_test_writer()
+        .try_init();
+
+    let cluster = SharedTestCluster::get()
+        .await
+        .expect("Failed to get cluster");
+
+    ensure_cluster_crd_installed(&cluster)
+        .await
+        .expect("Failed to install ValkeyCluster CRD");
+
+    ensure_upgrade_crd_installed(&cluster)
+        .await
+        .expect("Failed to install ValkeyUpgrade CRD");
+
+    cluster
+}
 
 /// Helper to create a test ValkeyCluster.
 fn test_cluster(name: &str) -> ValkeyCluster {
@@ -74,9 +98,12 @@ fn test_upgrade(name: &str, cluster_name: &str, target_version: &str) -> ValkeyU
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_fails_without_cluster() {
-    let (_cluster, client) = init_test().await;
+    let cluster = init_test().await;
+    let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-no-cluster").await;
+    let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
     let ns_name = test_ns.name().to_string();
+    create_auth_secret(client.clone(), &ns_name).await;
 
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
@@ -111,9 +138,12 @@ async fn test_upgrade_fails_without_cluster() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_phase_transitions() {
-    let (_cluster, client) = init_test().await;
+    let cluster = init_test().await;
+    let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-phases").await;
+    let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
     let ns_name = test_ns.name().to_string();
+    create_auth_secret(client.clone(), &ns_name).await;
 
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
@@ -165,9 +195,12 @@ async fn test_upgrade_phase_transitions() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_status_initialization() {
-    let (_cluster, client) = init_test().await;
+    let cluster = init_test().await;
+    let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-status").await;
+    let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
     let ns_name = test_ns.name().to_string();
+    create_auth_secret(client.clone(), &ns_name).await;
 
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
@@ -225,10 +258,7 @@ async fn test_upgrade_status_initialization() {
         }
         // Target version should be set
         if let Some(target) = status.target_version {
-            assert_eq!(
-                target, "9.0.1",
-                "Target version should be set in status"
-            );
+            assert_eq!(target, "9.0.1", "Target version should be set in status");
         }
     }
 }
@@ -237,9 +267,12 @@ async fn test_upgrade_status_initialization() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_observed_generation() {
-    let (_cluster, client) = init_test().await;
+    let cluster = init_test().await;
+    let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-gen").await;
+    let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
     let ns_name = test_ns.name().to_string();
+    create_auth_secret(client.clone(), &ns_name).await;
 
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
@@ -273,9 +306,12 @@ async fn test_upgrade_observed_generation() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_finalizer_added() {
-    let (_cluster, client) = init_test().await;
+    let cluster = init_test().await;
+    let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-finalizer").await;
+    let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
     let ns_name = test_ns.name().to_string();
+    create_auth_secret(client.clone(), &ns_name).await;
 
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
@@ -306,9 +342,12 @@ async fn test_upgrade_finalizer_added() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_deletion() {
-    let (_cluster, client) = init_test().await;
+    let cluster = init_test().await;
+    let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-delete").await;
+    let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
     let ns_name = test_ns.name().to_string();
+    create_auth_secret(client.clone(), &ns_name).await;
 
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
@@ -345,9 +384,12 @@ async fn test_upgrade_deletion() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_progress_tracking() {
-    let (_cluster, client) = init_test().await;
+    let cluster = init_test().await;
+    let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-progress").await;
+    let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
     let ns_name = test_ns.name().to_string();
+    create_auth_secret(client.clone(), &ns_name).await;
 
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
@@ -395,13 +437,14 @@ async fn test_upgrade_progress_tracking() {
         .get("progress-test")
         .await
         .expect("Should get upgrade");
-    if let Some(status) = upgrade_resource.status {
-        if status.phase != UpgradePhase::Failed && !status.progress.is_empty() {
-            // Progress should be in "X/Y shards" format
-            assert!(
-                status.progress.contains("/"),
-                "Progress should contain shard count"
-            );
-        }
+    if let Some(status) = upgrade_resource.status
+        && status.phase != UpgradePhase::Failed
+        && !status.progress.is_empty()
+    {
+        // Progress should be in "X/Y shards" format
+        assert!(
+            status.progress.contains("/"),
+            "Progress should contain shard count"
+        );
     }
 }

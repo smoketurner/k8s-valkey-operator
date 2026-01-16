@@ -8,6 +8,7 @@ pub mod controller;
 pub mod crd;
 pub mod health;
 pub mod resources;
+pub mod slots;
 pub mod webhooks;
 
 pub use health::HealthState;
@@ -27,8 +28,7 @@ use serde::de::DeserializeOwned;
 use tracing::{debug, error, info};
 
 use controller::{
-    context::Context,
-    cluster_reconciler::reconcile as reconcile_cluster,
+    cluster_reconciler::reconcile as reconcile_cluster, context::Context,
     upgrade_reconciler::reconcile as reconcile_upgrade,
 };
 use crd::{ValkeyCluster, ValkeyUpgrade};
@@ -138,7 +138,11 @@ pub async fn run_controller_scoped(
         .owns(deployments, watcher_config.clone())
         .owns_stream(metadata_watcher(services, watcher_config.clone()).touched_objects())
         .owns_stream(metadata_watcher(configmaps, watcher_config).touched_objects())
-        .run(reconcile_cluster, controller::cluster_reconciler::error_policy, ctx)
+        .run(
+            reconcile_cluster,
+            controller::cluster_reconciler::error_policy,
+            ctx,
+        )
         .for_each(|result| async move {
             match result {
                 Ok((obj, _action)) => {
@@ -201,7 +205,11 @@ pub async fn run_upgrade_controller_scoped(client: Client, namespace: Option<&st
 
     // Create and run the controller
     Controller::for_stream(resource_stream, reader)
-        .run(reconcile_upgrade, controller::upgrade_reconciler::error_policy, ctx)
+        .run(
+            reconcile_upgrade,
+            controller::upgrade_reconciler::error_policy,
+            ctx,
+        )
         .for_each(|result| async move {
             match result {
                 Ok((obj, _action)) => {

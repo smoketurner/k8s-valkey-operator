@@ -15,14 +15,11 @@ use kube::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    client::{ScalingContext, ScalingOps, TlsCertData},
+    client::{ScalingContext, TlsCertData},
     controller::{
-        context::Context,
-        error::Error,
-        cluster_state_machine::ClusterStateMachine,
-        cluster_init,
+        cluster_init, cluster_state_machine::ClusterStateMachine, context::Context, error::Error,
     },
-    crd::{Condition, ValkeyCluster, ValkeyClusterStatus, ClusterPhase, total_pods},
+    crd::{ClusterPhase, Condition, ValkeyCluster, ValkeyClusterStatus, total_pods},
     resources::{certificate, common, pdb, services, statefulset},
 };
 
@@ -79,7 +76,8 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
     }
 
     // Initialize state machine for transition validation
-    let state_machine = ClusterStateMachine::new();
+    // TODO: Use state_machine for validating transitions and preventing invalid state changes
+    let _state_machine = ClusterStateMachine::new();
 
     // Determine next phase based on current state
     let next_phase = match current_phase {
@@ -94,7 +92,15 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     Some(e.to_string()),
                 )
                 .await;
-                update_status(&api, &name, ClusterPhase::Failed, 0, Some(&e.to_string()), None).await?;
+                update_status(
+                    &api,
+                    &name,
+                    ClusterPhase::Failed,
+                    0,
+                    Some(&e.to_string()),
+                    None,
+                )
+                .await?;
                 return Err(e);
             }
             ctx.publish_normal_event(
@@ -231,7 +237,8 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
 
                     if ready_replicas >= desired_replicas {
                         // Check if this update involves scaling (masters count change)
-                        let current_masters = get_current_master_count(&obj, &ctx, &namespace).await?;
+                        let current_masters =
+                            get_current_master_count(&obj, &ctx, &namespace).await?;
                         let target_masters = obj.spec.masters;
 
                         if current_masters != target_masters && current_masters > 0 {
@@ -416,6 +423,19 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                             )),
                         )
                         .await;
+
+                        // Update StatefulSet with new replica count after scaling
+                        // This is especially important for scale down where the
+                        // StatefulSet replicas need to be reduced
+                        if let Err(e) = create_owned_resources(&obj, &ctx, &namespace).await {
+                            warn!(
+                                name = %name,
+                                error = %e,
+                                "Failed to update resources after scaling, will retry"
+                            );
+                            return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                        }
+
                         ClusterPhase::Running
                     } else {
                         warn!(
@@ -459,9 +479,6 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
         }
     };
 
-    // Log state transition (state machine available for advanced validation)
-    let _state_machine = state_machine; // Suppress unused warning, available for enhancement
-
     // Update status
     let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace)
         .await
@@ -485,7 +502,15 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
         None
     };
 
-    update_status(&api, &name, next_phase, ready_replicas, None, health_status.as_ref()).await?;
+    update_status(
+        &api,
+        &name,
+        next_phase,
+        ready_replicas,
+        None,
+        health_status.as_ref(),
+    )
+    .await?;
 
     // Record metrics
     if let Some(ref health_state) = ctx.health_state {
@@ -506,7 +531,9 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
     let requeue_duration = match next_phase {
         ClusterPhase::Running => std::time::Duration::from_secs(60),
         ClusterPhase::Creating | ClusterPhase::Updating => std::time::Duration::from_secs(10),
-        ClusterPhase::Initializing | ClusterPhase::AssigningSlots => std::time::Duration::from_secs(5),
+        ClusterPhase::Initializing | ClusterPhase::AssigningSlots => {
+            std::time::Duration::from_secs(5)
+        }
         ClusterPhase::Resharding => std::time::Duration::from_secs(15),
         ClusterPhase::Degraded => std::time::Duration::from_secs(30),
         ClusterPhase::Failed => std::time::Duration::from_secs(300),
@@ -544,24 +571,34 @@ pub fn error_policy(obj: Arc<ValkeyCluster>, error: &Error, ctx: Arc<Context>) -
 fn validate_spec(obj: &ValkeyCluster) -> Result<(), Error> {
     // Valkey cluster requires minimum 3 masters for proper quorum
     if obj.spec.masters < 3 {
-        return Err(Error::Validation("masters must be at least 3 for cluster quorum".to_string()));
+        return Err(Error::Validation(
+            "masters must be at least 3 for cluster quorum".to_string(),
+        ));
     }
     if obj.spec.masters > 100 {
         return Err(Error::Validation("masters cannot exceed 100".to_string()));
     }
     if obj.spec.replicas_per_master < 0 {
-        return Err(Error::Validation("replicasPerMaster cannot be negative".to_string()));
+        return Err(Error::Validation(
+            "replicasPerMaster cannot be negative".to_string(),
+        ));
     }
     if obj.spec.replicas_per_master > 5 {
-        return Err(Error::Validation("replicasPerMaster cannot exceed 5".to_string()));
+        return Err(Error::Validation(
+            "replicasPerMaster cannot exceed 5".to_string(),
+        ));
     }
     // TLS is required - validate issuer ref
     if obj.spec.tls.issuer_ref.name.is_empty() {
-        return Err(Error::Validation("tls.issuerRef.name is required".to_string()));
+        return Err(Error::Validation(
+            "tls.issuerRef.name is required".to_string(),
+        ));
     }
     // Auth is required - validate secret ref
     if obj.spec.auth.secret_ref.name.is_empty() {
-        return Err(Error::Validation("auth.secretRef.name is required".to_string()));
+        return Err(Error::Validation(
+            "auth.secretRef.name is required".to_string(),
+        ));
     }
     Ok(())
 }
@@ -763,12 +800,12 @@ async fn get_auth_password(
 
     match secret_api.get(secret_name).await {
         Ok(secret) => {
-            if let Some(data) = secret.data {
-                if let Some(password_bytes) = data.get(secret_key) {
-                    let password = String::from_utf8(password_bytes.0.clone())
-                        .map_err(|e| Error::Validation(format!("Invalid password encoding: {}", e)))?;
-                    return Ok(Some(password));
-                }
+            if let Some(data) = secret.data
+                && let Some(password_bytes) = data.get(secret_key)
+            {
+                let password = String::from_utf8(password_bytes.0.clone())
+                    .map_err(|e| Error::Validation(format!("Invalid password encoding: {}", e)))?;
+                return Ok(Some(password));
             }
             // Secret exists but key not found
             warn!(
@@ -852,16 +889,19 @@ async fn execute_cluster_init(
     let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
 
     // Create connection strategy based on environment
-    let strategy = cluster_init::create_connection_strategy(
-        ctx.client.clone(),
-        namespace,
-        &obj.name_any(),
-    );
+    let strategy =
+        cluster_init::create_connection_strategy(ctx.client.clone(), namespace, &obj.name_any());
 
     // Execute cluster meet
-    cluster_init::execute_cluster_meet(&ctx.client, obj, password.as_deref(), tls_certs.as_ref(), &strategy)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    cluster_init::execute_cluster_meet(
+        &ctx.client,
+        obj,
+        password.as_deref(),
+        tls_certs.as_ref(),
+        &strategy,
+    )
+    .await
+    .map_err(|e| Error::Valkey(e.to_string()))?;
 
     Ok(())
 }
@@ -885,11 +925,8 @@ async fn execute_slot_assignment(
     let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
 
     // Create connection strategy based on environment
-    let strategy = cluster_init::create_connection_strategy(
-        ctx.client.clone(),
-        namespace,
-        &obj.name_any(),
-    );
+    let strategy =
+        cluster_init::create_connection_strategy(ctx.client.clone(), namespace, &obj.name_any());
 
     // Assign slots to masters
     cluster_init::assign_slots_to_masters(obj, password.as_deref(), tls_certs.as_ref(), &strategy)
@@ -926,7 +963,6 @@ async fn check_cluster_health(
     ctx: &Context,
     namespace: &str,
 ) -> Result<ClusterHealthStatus, Error> {
-    use crate::client::cluster_ops::ClusterOps;
     use crate::client::valkey_client::ValkeyClient;
     use crate::crd::{ClusterTopology, MasterNode, ReplicaNode};
 
@@ -955,11 +991,8 @@ async fn check_cluster_health(
     let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
 
     // Create connection strategy for port forwarding
-    let strategy = cluster_init::create_connection_strategy(
-        ctx.client.clone(),
-        namespace,
-        &obj.name_any(),
-    );
+    let strategy =
+        cluster_init::create_connection_strategy(ctx.client.clone(), namespace, &obj.name_any());
 
     // Get connection address for first master via port forwarding
     let (connect_host, connect_port) = match strategy.get_connection(0).await {
@@ -976,7 +1009,13 @@ async fn check_cluster_health(
         }
     };
 
-    let client = match ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref()).await
+    let client = match ValkeyClient::connect_single(
+        &connect_host,
+        connect_port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
     {
         Ok(c) => c,
         Err(e) => {
@@ -1069,6 +1108,7 @@ fn extract_pod_name(address: &str) -> String {
         .split(':')
         .next()
         .and_then(|h| h.split('.').next())
+        .filter(|s| !s.is_empty())
         .unwrap_or("unknown")
         .to_string()
 }
@@ -1170,7 +1210,6 @@ async fn get_current_master_count(
     ctx: &Context,
     namespace: &str,
 ) -> Result<i32, Error> {
-    use crate::client::cluster_ops::ClusterOps;
     use crate::client::valkey_client::ValkeyClient;
 
     // Get password from secret
@@ -1192,11 +1231,8 @@ async fn get_current_master_count(
     let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
 
     // Create connection strategy for port forwarding
-    let strategy = cluster_init::create_connection_strategy(
-        ctx.client.clone(),
-        namespace,
-        &obj.name_any(),
-    );
+    let strategy =
+        cluster_init::create_connection_strategy(ctx.client.clone(), namespace, &obj.name_any());
 
     // Get connection address for first master via port forwarding
     let (connect_host, connect_port) = match strategy.get_connection(0).await {
@@ -1207,7 +1243,13 @@ async fn get_current_master_count(
         }
     };
 
-    let client = match ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref()).await
+    let client = match ValkeyClient::connect_single(
+        &connect_host,
+        connect_port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
     {
         Ok(c) => c,
         Err(e) => {
@@ -1238,7 +1280,6 @@ async fn execute_scaling_operation(
     ctx: &Context,
     namespace: &str,
 ) -> Result<crate::client::ScalingResult, Error> {
-    use crate::client::cluster_ops::ClusterOps;
     use crate::client::valkey_client::ValkeyClient;
 
     // Get password from secret
@@ -1260,19 +1301,23 @@ async fn execute_scaling_operation(
     let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
 
     // Create connection strategy for port forwarding
-    let strategy = cluster_init::create_connection_strategy(
-        ctx.client.clone(),
-        namespace,
-        &obj.name_any(),
-    );
+    let strategy =
+        cluster_init::create_connection_strategy(ctx.client.clone(), namespace, &obj.name_any());
 
     // Get connection address for first master via port forwarding
-    let (connect_host, connect_port) = strategy.get_connection(0).await
+    let (connect_host, connect_port) = strategy
+        .get_connection(0)
+        .await
         .map_err(|e| Error::Valkey(format!("Failed to create port forward for scaling: {}", e)))?;
 
-    let client = ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref())
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to connect for scaling: {}", e)))?;
+    let client = ValkeyClient::connect_single(
+        &connect_host,
+        connect_port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
+    .map_err(|e| Error::Valkey(format!("Failed to connect for scaling: {}", e)))?;
 
     // Get current master count
     let cluster_nodes = client
@@ -1324,7 +1369,6 @@ async fn get_nodes_in_cluster_count(
     ctx: &Context,
     namespace: &str,
 ) -> Result<i32, Error> {
-    use crate::client::cluster_ops::ClusterOps;
     use crate::client::valkey_client::ValkeyClient;
 
     // Get password from secret
@@ -1340,11 +1384,8 @@ async fn get_nodes_in_cluster_count(
     let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
 
     // Create connection strategy for port forwarding
-    let strategy = cluster_init::create_connection_strategy(
-        ctx.client.clone(),
-        namespace,
-        &obj.name_any(),
-    );
+    let strategy =
+        cluster_init::create_connection_strategy(ctx.client.clone(), namespace, &obj.name_any());
 
     // Get connection address for first master via port forwarding
     let (connect_host, connect_port) = match strategy.get_connection(0).await {
@@ -1355,7 +1396,14 @@ async fn get_nodes_in_cluster_count(
         }
     };
 
-    let client = match ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref()).await {
+    let client = match ValkeyClient::connect_single(
+        &connect_host,
+        connect_port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
+    {
         Ok(c) => c,
         Err(e) => {
             debug!(error = %e, "Failed to connect to cluster for node count");
@@ -1378,12 +1426,12 @@ async fn get_nodes_in_cluster_count(
 
 /// Add new replica pods to an existing cluster.
 /// Returns the number of replicas added.
+#[allow(clippy::too_many_lines)]
 async fn add_new_replicas_to_cluster(
     obj: &ValkeyCluster,
     ctx: &Context,
     namespace: &str,
 ) -> Result<i32, Error> {
-    use crate::client::cluster_ops::ClusterOps;
     use crate::client::valkey_client::ValkeyClient;
 
     let name = obj.name_any();
@@ -1403,19 +1451,22 @@ async fn add_new_replicas_to_cluster(
     let tls_certs = get_tls_certs(ctx, namespace, &obj.name_any()).await?;
 
     // Create connection strategy for port forwarding
-    let strategy = cluster_init::create_connection_strategy(
-        ctx.client.clone(),
-        namespace,
-        &name,
-    );
+    let strategy = cluster_init::create_connection_strategy(ctx.client.clone(), namespace, &name);
 
     // First, get the current cluster state
-    let (connect_host, connect_port) = strategy.get_connection(0).await
+    let (connect_host, connect_port) = strategy
+        .get_connection(0)
+        .await
         .map_err(|e| Error::Valkey(format!("Failed to create port forward: {}", e)))?;
 
-    let client = ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref())
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
+    let client = ValkeyClient::connect_single(
+        &connect_host,
+        connect_port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
+    .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
 
     let cluster_nodes = client
         .cluster_nodes()
@@ -1437,11 +1488,14 @@ async fn add_new_replicas_to_cluster(
         .map_err(|e| Error::Valkey(format!("Failed to get pod IPs: {}", e)))?;
 
     // Filter to only pods not yet in cluster
-    let existing_ips: std::collections::HashSet<_> = cluster_nodes.nodes.iter()
+    let existing_ips: std::collections::HashSet<_> = cluster_nodes
+        .nodes
+        .iter()
         .map(|n| n.address.split(':').next().unwrap_or(""))
         .collect();
 
-    let new_pods: Vec<_> = pod_ips.iter()
+    let new_pods: Vec<_> = pod_ips
+        .iter()
         .filter(|(_, ip, _)| !existing_ips.contains(ip.as_str()))
         .collect();
 
@@ -1456,12 +1510,19 @@ async fn add_new_replicas_to_cluster(
     );
 
     // Connect to first master and run CLUSTER MEET for each new node
-    let (connect_host, connect_port) = strategy.get_connection(0).await
+    let (connect_host, connect_port) = strategy
+        .get_connection(0)
+        .await
         .map_err(|e| Error::Valkey(format!("Failed to create port forward: {}", e)))?;
 
-    let client = ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref())
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
+    let client = ValkeyClient::connect_single(
+        &connect_host,
+        connect_port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
+    .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
 
     // Execute CLUSTER MEET for each new pod
     for (pod_name, ip, port) in &new_pods {
@@ -1484,12 +1545,19 @@ async fn add_new_replicas_to_cluster(
     //   - pod-6 is replica of pod-0, pod-7 is replica of pod-1, pod-8 is replica of pod-2, etc.
 
     // Get updated cluster nodes to get node IDs
-    let (connect_host, connect_port) = strategy.get_connection(0).await
+    let (connect_host, connect_port) = strategy
+        .get_connection(0)
+        .await
         .map_err(|e| Error::Valkey(format!("Failed to create port forward: {}", e)))?;
 
-    let client = ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref())
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
+    let client = ValkeyClient::connect_single(
+        &connect_host,
+        connect_port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
+    .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
 
     let cluster_nodes = client
         .cluster_nodes()
@@ -1499,17 +1567,21 @@ async fn add_new_replicas_to_cluster(
     let _ = client.close().await;
 
     // Build a mapping of IP to node ID
-    let ip_to_node_id: std::collections::HashMap<String, String> = cluster_nodes.nodes.iter()
+    let ip_to_node_id: std::collections::HashMap<String, String> = cluster_nodes
+        .nodes
+        .iter()
         .map(|n| (n.ip.clone(), n.node_id.clone()))
         .collect();
 
     // Get master node IDs (from pod-0 to pod-(masters-1))
-    let master_ips: Vec<String> = pod_ips.iter()
+    let master_ips: Vec<String> = pod_ips
+        .iter()
         .take(masters as usize)
         .map(|(_, ip, _)| ip.clone())
         .collect();
 
-    let master_node_ids: Vec<String> = master_ips.iter()
+    let master_node_ids: Vec<String> = master_ips
+        .iter()
         .filter_map(|ip| ip_to_node_id.get(ip).cloned())
         .collect();
 
@@ -1530,12 +1602,10 @@ async fn add_new_replicas_to_cluster(
 
         // Determine which master this replica belongs to
         let master_index = ((ordinal - masters) % masters) as usize;
-        if master_index >= master_node_ids.len() {
+        let Some(master_node_id) = master_node_ids.get(master_index) else {
             warn!(pod = %pod_name, "Cannot find master for replica");
             continue;
-        }
-
-        let master_node_id = &master_node_ids[master_index];
+        };
 
         // Get the node ID for this replica
         let replica_node_id = match ip_to_node_id.get(ip.as_str()) {
@@ -1555,12 +1625,18 @@ async fn add_new_replicas_to_cluster(
         );
 
         // Connect to the replica and configure it
-        let (connect_host, connect_port) = strategy.get_connection(ordinal).await
-            .map_err(|e| Error::Valkey(format!("Failed to create port forward for replica: {}", e)))?;
+        let (connect_host, connect_port) = strategy.get_connection(ordinal).await.map_err(|e| {
+            Error::Valkey(format!("Failed to create port forward for replica: {}", e))
+        })?;
 
-        let replica_client = ValkeyClient::connect_single(&connect_host, connect_port, password.as_deref(), tls_certs.as_ref())
-            .await
-            .map_err(|e| Error::Valkey(format!("Failed to connect to replica: {}", e)))?;
+        let replica_client = ValkeyClient::connect_single(
+            &connect_host,
+            connect_port,
+            password.as_deref(),
+            tls_certs.as_ref(),
+        )
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to connect to replica: {}", e)))?;
 
         match replica_client.cluster_replicate(master_node_id).await {
             Ok(()) => {
@@ -1576,4 +1652,325 @@ async fn add_new_replicas_to_cluster(
     }
 
     Ok(added)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
+mod tests {
+    use super::*;
+    use crate::crd::{
+        AuthSpec, ImageSpec, IssuerRef, PersistenceSpec, ResourceRequirementsSpec, SchedulingSpec,
+        SecretKeyRef, TlsSpec, ValkeyClusterSpec,
+    };
+    use std::collections::BTreeMap;
+
+    /// Helper to create a minimal valid ValkeyCluster for testing
+    fn create_test_cluster(name: &str, masters: i32, replicas_per_master: i32) -> ValkeyCluster {
+        ValkeyCluster {
+            metadata: kube::api::ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some("test-ns".to_string()),
+                ..Default::default()
+            },
+            spec: ValkeyClusterSpec {
+                masters,
+                replicas_per_master,
+                image: ImageSpec::default(),
+                auth: AuthSpec {
+                    secret_ref: SecretKeyRef {
+                        name: "test-auth-secret".to_string(),
+                        key: "password".to_string(),
+                    },
+                },
+                tls: TlsSpec {
+                    issuer_ref: IssuerRef {
+                        name: "test-issuer".to_string(),
+                        kind: "ClusterIssuer".to_string(),
+                        group: "cert-manager.io".to_string(),
+                    },
+                    duration: "2160h".to_string(),
+                    renew_before: "360h".to_string(),
+                },
+                persistence: PersistenceSpec::default(),
+                resources: ResourceRequirementsSpec::default(),
+                scheduling: SchedulingSpec::default(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            status: None,
+        }
+    }
+
+    // ==========================================================================
+    // validate_spec() tests
+    // ==========================================================================
+
+    #[test]
+    fn test_validate_spec_valid_minimum_cluster() {
+        let cluster = create_test_cluster("test", 3, 0);
+        assert!(validate_spec(&cluster).is_ok());
+    }
+
+    #[test]
+    fn test_validate_spec_valid_with_replicas() {
+        let cluster = create_test_cluster("test", 3, 1);
+        assert!(validate_spec(&cluster).is_ok());
+    }
+
+    #[test]
+    fn test_validate_spec_valid_max_replicas() {
+        let cluster = create_test_cluster("test", 3, 5);
+        assert!(validate_spec(&cluster).is_ok());
+    }
+
+    #[test]
+    fn test_validate_spec_valid_large_cluster() {
+        let cluster = create_test_cluster("test", 100, 2);
+        assert!(validate_spec(&cluster).is_ok());
+    }
+
+    #[test]
+    fn test_validate_spec_invalid_zero_masters() {
+        let cluster = create_test_cluster("test", 0, 1);
+        let result = validate_spec(&cluster);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(err.to_string().contains("masters must be at least 3"));
+    }
+
+    #[test]
+    fn test_validate_spec_invalid_one_master() {
+        let cluster = create_test_cluster("test", 1, 1);
+        let result = validate_spec(&cluster);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("masters must be at least 3")
+        );
+    }
+
+    #[test]
+    fn test_validate_spec_invalid_two_masters() {
+        let cluster = create_test_cluster("test", 2, 1);
+        let result = validate_spec(&cluster);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("masters must be at least 3")
+        );
+    }
+
+    #[test]
+    fn test_validate_spec_invalid_too_many_masters() {
+        let cluster = create_test_cluster("test", 101, 1);
+        let result = validate_spec(&cluster);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("masters cannot exceed 100")
+        );
+    }
+
+    #[test]
+    fn test_validate_spec_invalid_negative_replicas() {
+        let cluster = create_test_cluster("test", 3, -1);
+        let result = validate_spec(&cluster);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("replicasPerMaster cannot be negative")
+        );
+    }
+
+    #[test]
+    fn test_validate_spec_invalid_too_many_replicas() {
+        let cluster = create_test_cluster("test", 3, 6);
+        let result = validate_spec(&cluster);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("replicasPerMaster cannot exceed 5")
+        );
+    }
+
+    #[test]
+    fn test_validate_spec_invalid_empty_tls_issuer() {
+        let mut cluster = create_test_cluster("test", 3, 1);
+        cluster.spec.tls.issuer_ref.name = String::new();
+        let result = validate_spec(&cluster);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("tls.issuerRef.name is required")
+        );
+    }
+
+    #[test]
+    fn test_validate_spec_invalid_empty_auth_secret() {
+        let mut cluster = create_test_cluster("test", 3, 1);
+        cluster.spec.auth.secret_ref.name = String::new();
+        let result = validate_spec(&cluster);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("auth.secretRef.name is required")
+        );
+    }
+
+    // ==========================================================================
+    // extract_pod_name() tests
+    // ==========================================================================
+
+    #[test]
+    fn test_extract_pod_name_standard_format() {
+        let address = "my-cluster-0.my-cluster-headless.default.svc.cluster.local:6379";
+        assert_eq!(extract_pod_name(address), "my-cluster-0");
+    }
+
+    #[test]
+    fn test_extract_pod_name_short_format() {
+        let address = "my-cluster-0.my-cluster-headless:6379";
+        assert_eq!(extract_pod_name(address), "my-cluster-0");
+    }
+
+    #[test]
+    fn test_extract_pod_name_ip_address() {
+        let address = "10.0.0.1:6379";
+        assert_eq!(extract_pod_name(address), "10");
+    }
+
+    #[test]
+    fn test_extract_pod_name_no_port() {
+        let address = "my-cluster-0.my-cluster-headless";
+        assert_eq!(extract_pod_name(address), "my-cluster-0");
+    }
+
+    #[test]
+    fn test_extract_pod_name_empty_string() {
+        let address = "";
+        assert_eq!(extract_pod_name(address), "unknown");
+    }
+
+    #[test]
+    fn test_extract_pod_name_just_port() {
+        let address = ":6379";
+        assert_eq!(extract_pod_name(address), "unknown");
+    }
+
+    #[test]
+    fn test_extract_pod_name_complex_name() {
+        let address =
+            "my-valkey-cluster-prod-42.my-valkey-cluster-prod-headless.production.svc:6379";
+        assert_eq!(extract_pod_name(address), "my-valkey-cluster-prod-42");
+    }
+
+    #[test]
+    fn test_extract_pod_name_with_numbers() {
+        let address = "cluster123-5.cluster123-headless.ns:6379";
+        assert_eq!(extract_pod_name(address), "cluster123-5");
+    }
+
+    // ==========================================================================
+    // Requeue duration tests
+    // ==========================================================================
+
+    #[test]
+    fn test_requeue_duration_running_phase() {
+        let duration = match ClusterPhase::Running {
+            ClusterPhase::Running => std::time::Duration::from_secs(60),
+            _ => std::time::Duration::from_secs(0),
+        };
+        assert_eq!(duration.as_secs(), 60);
+    }
+
+    #[test]
+    fn test_requeue_duration_creating_phase() {
+        let duration = match ClusterPhase::Creating {
+            ClusterPhase::Creating | ClusterPhase::Updating => std::time::Duration::from_secs(10),
+            _ => std::time::Duration::from_secs(0),
+        };
+        assert_eq!(duration.as_secs(), 10);
+    }
+
+    #[test]
+    fn test_requeue_duration_initializing_phase() {
+        let duration = match ClusterPhase::Initializing {
+            ClusterPhase::Initializing | ClusterPhase::AssigningSlots => {
+                std::time::Duration::from_secs(5)
+            }
+            _ => std::time::Duration::from_secs(0),
+        };
+        assert_eq!(duration.as_secs(), 5);
+    }
+
+    #[test]
+    fn test_requeue_duration_failed_phase() {
+        let duration = match ClusterPhase::Failed {
+            ClusterPhase::Failed => std::time::Duration::from_secs(300),
+            _ => std::time::Duration::from_secs(0),
+        };
+        assert_eq!(duration.as_secs(), 300);
+    }
+
+    // ==========================================================================
+    // ClusterHealthStatus tests
+    // ==========================================================================
+
+    #[test]
+    fn test_cluster_health_status_default_values() {
+        let status = ClusterHealthStatus {
+            is_healthy: false,
+            healthy_masters: 0,
+            healthy_replicas: 0,
+            slots_assigned: 0,
+            topology: None,
+        };
+        assert!(!status.is_healthy);
+        assert_eq!(status.healthy_masters, 0);
+        assert_eq!(status.slots_assigned, 0);
+    }
+
+    #[test]
+    fn test_cluster_health_status_healthy_cluster() {
+        let status = ClusterHealthStatus {
+            is_healthy: true,
+            healthy_masters: 3,
+            healthy_replicas: 3,
+            slots_assigned: 16384,
+            topology: None,
+        };
+        assert!(status.is_healthy);
+        assert_eq!(status.healthy_masters, 3);
+        assert_eq!(status.slots_assigned, 16384);
+    }
+
+    // ==========================================================================
+    // Constants tests
+    // ==========================================================================
+
+    #[test]
+    fn test_field_manager_constant() {
+        assert_eq!(FIELD_MANAGER, "valkey-operator");
+    }
+
+    #[test]
+    fn test_finalizer_constant() {
+        assert_eq!(FINALIZER, "valkey-operator.smoketurner.com/finalizer");
+        assert!(FINALIZER.contains("valkey-operator"));
+    }
 }

@@ -14,7 +14,7 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use valkey_operator::client::{ValkeyClient, ClusterOps};
+//! use valkey_operator::client::ValkeyClient;
 //!
 //! let client = ValkeyClient::connect(&cluster_spec).await?;
 //! let info = client.cluster_info().await?;
@@ -28,8 +28,7 @@ pub mod scaling;
 pub mod types;
 pub mod valkey_client;
 
-pub use cluster_ops::ClusterOps;
-pub use scaling::{ScalingContext, ScalingOps, ScalingResult};
+pub use scaling::{ScalingContext, ScalingResult};
 pub use types::{
     ClusterInfo, ClusterNode, ClusterState, NodeFlags, NodeRole, ParsedClusterNodes, SlotRange,
 };
