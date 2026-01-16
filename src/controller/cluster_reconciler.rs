@@ -559,8 +559,32 @@ pub fn error_policy(obj: Arc<ValkeyCluster>, error: &Error, ctx: Arc<Context>) -
     }
 
     if error.is_retryable() {
-        warn!(name = %name, error = %error, "Retryable error, will retry");
-        Action::requeue(error.requeue_after())
+        // Get retry count from annotations (track retries per object)
+        let retry_count = obj
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|ann| ann.get("valkey-operator.smoketurner.com/retry-count"))
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        // Calculate exponential backoff
+        let backoff = error.requeue_after_with_retry_count(retry_count);
+
+        warn!(
+            name = %name,
+            error = %error,
+            retry_count = retry_count,
+            backoff_secs = backoff.as_secs(),
+            "Retryable error, will retry with exponential backoff"
+        );
+
+        // Note: We can't update annotations here (error policy is read-only)
+        // The retry count will be tracked on the next reconciliation attempt
+        // For now, we use exponential backoff but don't persist retry count
+        // A future enhancement could update annotations in the reconciler on error
+
+        Action::requeue(backoff)
     } else {
         error!(name = %name, error = %error, "Non-retryable error");
         Action::requeue(std::time::Duration::from_secs(300))
@@ -1064,11 +1088,75 @@ async fn check_cluster_health(
 
     let _ = client.close().await;
 
+    // Enhanced health checks according to Valkey cluster specification
+    // 1. Verify cluster_state is "ok" (not "fail")
+    use crate::client::types::ClusterState;
+    let cluster_state_ok = cluster_info.state == ClusterState::Ok;
+    
+    // 2. Verify all 16384 slots are assigned
+    let all_slots_assigned = cluster_info.slots_assigned == 16384;
+    
+    // 3. Verify no slots in migrating/importing state (check cluster nodes)
+    // Note: CLUSTER NODES output shows migrating/importing in slot ranges
+    // Format: "0-1000 [2000-<-abc123] [3000-<-def456 importing-ghi789]"
+    // We check if any node has slots in brackets (indicating migration)
+    let has_migrating_slots = cluster_nodes
+        .nodes
+        .iter()
+        .any(|node| {
+            // Check if node has slots in brackets (migrating/importing state)
+            // This is a simplified check - full parsing would require parsing slot ranges
+            // For now, we rely on cluster_info.slots_fail and slots_pfail
+            node.flags.fail || node.flags.pfail
+        });
+    
+    // 4. Verify cluster size matches expected
+    let expected_masters = obj.spec.masters;
+    let actual_masters = cluster_nodes.masters().len() as i32;
+    let cluster_size_matches = actual_masters == expected_masters;
+    
+    // 5. Verify no failed nodes
+    let failed_nodes = cluster_nodes
+        .nodes
+        .iter()
+        .filter(|n| n.flags.fail)
+        .count();
+    let no_failed_nodes = failed_nodes == 0;
+    
+    // 6. Check for slots in fail state
+    let no_slots_fail = cluster_info.slots_fail == 0;
+    let no_slots_pfail = cluster_info.slots_pfail == 0;
+
     // Build topology from cluster nodes
     let masters = cluster_nodes.masters();
     let healthy_masters = masters.iter().filter(|m| m.is_healthy()).count() as i32;
     let replicas = cluster_nodes.replicas();
     let healthy_replicas = replicas.iter().filter(|r| r.is_healthy()).count() as i32;
+    
+    // Determine overall health based on all conditions
+    let is_healthy = cluster_state_ok
+        && all_slots_assigned
+        && !has_migrating_slots
+        && cluster_size_matches
+        && no_failed_nodes
+        && no_slots_fail
+        && no_slots_pfail
+        && healthy_masters == expected_masters;
+    
+    if !is_healthy {
+        debug!(
+            cluster_state_ok = cluster_state_ok,
+            all_slots_assigned = all_slots_assigned,
+            has_migrating_slots = has_migrating_slots,
+            cluster_size_matches = cluster_size_matches,
+            no_failed_nodes = no_failed_nodes,
+            no_slots_fail = no_slots_fail,
+            no_slots_pfail = no_slots_pfail,
+            healthy_masters = healthy_masters,
+            expected_masters = expected_masters,
+            "Cluster health check failed one or more conditions"
+        );
+    }
 
     // Build topology structure
     let topology = ClusterTopology {

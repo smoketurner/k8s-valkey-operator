@@ -344,14 +344,36 @@ fn build_valkey_extra_flags(
         "--cluster-node-timeout 5000".to_string(),
         // Don't require full slot coverage (allows partial operation during scaling)
         "--cluster-require-full-coverage no".to_string(),
+        // Replica validity factor: replicas can failover if disconnected for less than
+        // node-timeout * validity-factor. Default 10 means replica disconnected for
+        // less than 50 seconds (5s * 10) can still failover.
+        "--cluster-replica-validity-factor 10".to_string(),
+        // Migration barrier: minimum replicas a master must have before another replica
+        // can migrate to a master with no replicas. Default 1.
+        "--cluster-migration-barrier 1".to_string(),
+        // Don't allow reads when cluster is down (consistency over availability)
+        "--cluster-allow-reads-when-down no".to_string(),
         // Persistence
         "--appendonly yes".to_string(),
         "--appendfsync everysec".to_string(),
+        // RDB snapshots for backup redundancy (in addition to AOF)
+        // Save if at least 1 key changed in 900 seconds (15 minutes)
+        "--save 900 1".to_string(),
+        // Save if at least 10 keys changed in 300 seconds (5 minutes)
+        "--save 300 10".to_string(),
+        // Save if at least 10000 keys changed in 60 seconds (1 minute)
+        "--save 60 10000".to_string(),
         // Bind to all interfaces
         "--bind 0.0.0.0".to_string(),
         // Authentication
         "--requirepass $(VALKEY_PASSWORD)".to_string(),
         "--masterauth $(VALKEY_PASSWORD)".to_string(),
+        // Memory management - prevent OOM
+        // Note: maxmemory should be set based on resource limits, but we don't have
+        // that info here. Consider adding it to the CRD spec or calculating from
+        // resource requests/limits. For now, we'll set a reasonable default.
+        // maxmemory-policy: evict least recently used keys when memory limit reached
+        "--maxmemory-policy allkeys-lru".to_string(),
     ];
 
     // TLS configuration

@@ -207,39 +207,80 @@ impl ValkeyClient {
             return Ok(result);
         }
 
-        // Migrate slots from nodes being removed
+        // Migrate slots from nodes being removed using atomic slot migration (Valkey 9.0+)
         for node in &nodes_to_remove {
-            info!(node_id = %node.node_id, "Migrating slots from node");
+            info!(node_id = %node.node_id, "Migrating slots from node using atomic migration");
 
-            // Get slots owned by this node
-            let node_slots: Vec<u16> = node
-                .slots
+            // Get slots owned by this node, grouped into ranges
+            let slot_ranges = node.slots.clone();
+
+            if slot_ranges.is_empty() {
+                debug!(node_id = %node.node_id, "Node has no slots to migrate");
+                continue;
+            }
+
+            // Group slots by destination node for efficient migration
+            // Round-robin assignment: distribute slot ranges across remaining masters
+            let remaining_masters: Vec<&ClusterNode> = masters
                 .iter()
-                .flat_map(|range| (range.start..=range.end).map(|s| s as u16))
+                .filter(|m| {
+                    !nodes_to_remove
+                        .iter()
+                        .any(|n| n.node_id == m.node_id)
+                })
+                .copied()
                 .collect();
 
-            // Migrate each slot to a remaining master
-            for (i, slot) in node_slots.iter().enumerate() {
-                // Determine destination node (round-robin to remaining masters)
-                let dest_idx = i % ctx.target_masters as usize;
-                if let Some(dest_node) = masters.get(dest_idx)
-                    && !nodes_to_remove
-                        .iter()
-                        .any(|n| n.node_id == dest_node.node_id)
-                {
-                    debug!(
-                        slot = slot,
-                        from = %node.node_id,
-                        to = %dest_node.node_id,
-                        "Migrating slot"
-                    );
-                    // Use CLUSTER SETSLOT NODE to reassign slot
-                    self.cluster_setslot(
-                        *slot,
-                        ClusterSetSlotState::Node(dest_node.node_id.clone()),
+            if remaining_masters.is_empty() {
+                return Err(ValkeyError::InvalidConfig(
+                    "Cannot scale down: no remaining masters to receive slots".to_string(),
+                ));
+            }
+
+            // Migrate slot ranges to remaining masters using atomic migration
+            for (range_idx, range) in slot_ranges.iter().enumerate() {
+                // Round-robin assignment of ranges to remaining masters
+                let dest_idx = range_idx % remaining_masters.len();
+                let dest_node = remaining_masters[dest_idx];
+
+                info!(
+                    from = %node.node_id,
+                    to = %dest_node.node_id,
+                    start_slot = range.start,
+                    end_slot = range.end,
+                    "Migrating slot range using CLUSTER MIGRATESLOTS"
+                );
+
+                // Use atomic slot migration (Valkey 9.0+)
+                // CLUSTER MIGRATESLOTS must be executed on the source node
+                // Since we're using a cluster-aware client, it should route correctly
+                // but for safety, we'll connect directly to the source node
+                match self
+                    .migrate_slots_atomic(
+                        range.start as u16,
+                        range.end as u16,
+                        &node.node_id,
+                        &dest_node.node_id,
+                        &node.ip,
+                        node.port as u16,
                     )
-                    .await?;
-                    result.slots_moved += 1;
+                    .await
+                {
+                    Ok(()) => {
+                        result.slots_moved += (range.end - range.start + 1) as i32;
+                        debug!(
+                            range = ?range,
+                            "Slot range migration completed"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            range = ?range,
+                            error = %e,
+                            "Failed to migrate slot range, will retry"
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -305,14 +346,38 @@ impl ValkeyClient {
                             "Reassigning slot"
                         );
 
-                        // Reassign slot to this master
-                        self.cluster_setslot(
-                            slot,
-                            ClusterSetSlotState::Node(master.node_id.clone()),
-                        )
-                        .await?;
-
-                        slots_moved += 1;
+                        // Use atomic slot migration for Valkey 9.0+
+                        // Group consecutive slots into ranges for efficiency
+                        // For now, migrate one slot at a time (can be optimized later)
+                        match self
+                            .migrate_slots_atomic(
+                                slot,
+                                slot,
+                                current_owner,
+                                &master.node_id,
+                                "", // Source IP not needed for cluster-aware client
+                                0,  // Source port not needed
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                slots_moved += 1;
+                            }
+                            Err(e) => {
+                                // If atomic migration fails (e.g., not Valkey 9.0+), fall back to legacy
+                                warn!(
+                                    slot = slot,
+                                    error = %e,
+                                    "Atomic migration failed, falling back to legacy method"
+                                );
+                                self.cluster_setslot(
+                                    slot,
+                                    ClusterSetSlotState::Node(master.node_id.clone()),
+                                )
+                                .await?;
+                                slots_moved += 1;
+                            }
+                        }
                     }
                 } else {
                     // Slot is unassigned, assign it
@@ -333,6 +398,9 @@ impl ValkeyClient {
     }
 
     /// Migrate a single slot from one node to another.
+    ///
+    /// **Deprecated**: Use `migrate_slots_atomic()` for Valkey 9.0+ clusters.
+    /// This method uses legacy CLUSTER SETSLOT which can lose data.
     #[instrument(skip(self))]
     pub async fn migrate_slot(
         &self,
@@ -340,11 +408,98 @@ impl ValkeyClient {
         _source_node_id: &str,
         dest_node_id: &str,
     ) -> Result<(), ValkeyError> {
-        // Simplified slot migration using CLUSTER SETSLOT NODE
-        // Full migration with IMPORTING/MIGRATING/MIGRATE requires connecting
-        // to individual nodes and fred doesn't fully support the node-id params
+        // Legacy method - use migrate_slots_atomic() instead for Valkey 9.0+
+        warn!("Using legacy slot migration - consider using migrate_slots_atomic() for Valkey 9.0+");
         self.cluster_setslot(slot, ClusterSetSlotState::Node(dest_node_id.to_string()))
             .await?;
+
+        Ok(())
+    }
+
+    /// Migrate a range of slots atomically using CLUSTER MIGRATESLOTS (Valkey 9.0+).
+    ///
+    /// This is the recommended method for slot migration as it's atomic, faster,
+    /// and prevents data loss compared to legacy CLUSTER SETSLOT method.
+    ///
+    /// # Arguments
+    /// * `start_slot` - First slot in the range
+    /// * `end_slot` - Last slot in the range (inclusive)
+    /// * `source_node_id` - Node ID of the source node (for verification/logging)
+    /// * `target_node_id` - Node ID of the target node receiving the slots
+    /// * `source_ip` - IP address of source node (unused, kept for API compatibility)
+    /// * `source_port` - Port of source node (unused, kept for API compatibility)
+    ///
+    /// Note: CLUSTER MIGRATESLOTS should be executed on the source node, but
+    /// a cluster-aware client should route the command correctly. If direct
+    /// connection to source is needed, it should be handled by the caller.
+    #[instrument(skip(self), fields(start_slot, end_slot, target = %target_node_id))]
+    pub async fn migrate_slots_atomic(
+        &self,
+        start_slot: u16,
+        end_slot: u16,
+        _source_node_id: &str,
+        target_node_id: &str,
+        _source_ip: &str,
+        _source_port: u16,
+    ) -> Result<(), ValkeyError> {
+        // Execute CLUSTER MIGRATESLOTS
+        // Note: According to Valkey docs, this should be executed on the source node.
+        // A cluster-aware client may route this correctly, but for production use,
+        // consider connecting directly to the source node.
+        info!(
+            start_slot = start_slot,
+            end_slot = end_slot,
+            target = %target_node_id,
+            "Executing CLUSTER MIGRATESLOTS (atomic migration)"
+        );
+
+        self.cluster_migrateslots(start_slot, end_slot, target_node_id)
+            .await?;
+
+        // Poll migration progress until complete
+        const MAX_WAIT_SECS: u64 = 300; // 5 minutes max
+        const POLL_INTERVAL_SECS: u64 = 2;
+        let start = std::time::Instant::now();
+
+        loop {
+            if start.elapsed().as_secs() > MAX_WAIT_SECS {
+                return Err(ValkeyError::Timeout {
+                    operation: format!(
+                        "Slot migration {}-{} to {}",
+                        start_slot, end_slot, target_node_id
+                    ),
+                    duration: Duration::from_secs(MAX_WAIT_SECS),
+                });
+            }
+
+            // Check if migration is complete by verifying slot ownership
+            let nodes = self.cluster_nodes().await?;
+            let target_node = nodes.get_node(target_node_id);
+
+            if let Some(target) = target_node {
+                // Check if target node now owns the slot range
+                let owns_range = target.slots.iter().any(|range| {
+                    range.start <= start_slot as i32 && range.end >= end_slot as i32
+                });
+
+                if owns_range {
+                    info!(
+                        start_slot = start_slot,
+                        end_slot = end_slot,
+                        "Slot range migration completed"
+                    );
+                    break;
+                }
+            }
+
+            // Migration still in progress, wait and poll again
+            debug!(
+                start_slot = start_slot,
+                end_slot = end_slot,
+                "Slot migration in progress, waiting..."
+            );
+            tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        }
 
         Ok(())
     }

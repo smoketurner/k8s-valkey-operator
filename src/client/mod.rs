@@ -24,10 +24,12 @@
 //! ```
 
 pub mod cluster_ops;
+pub mod parsing;
 pub mod scaling;
 pub mod types;
 pub mod valkey_client;
 
+pub use parsing::ReplicationInfo;
 pub use scaling::{ScalingContext, ScalingResult};
 pub use types::{
     ClusterInfo, ClusterNode, ClusterState, NodeFlags, NodeRole, ParsedClusterNodes, SlotRange,

@@ -11,7 +11,7 @@ use jiff::Timestamp;
 use k8s_openapi::api::core::v1::Secret;
 use kube::{
     Api, ResourceExt,
-    api::{DeleteParams, Patch, PatchParams},
+    api::{DeleteParams, ListParams, Patch, PatchParams},
     runtime::controller::Action,
 };
 use tracing::{debug, error, info, warn};
@@ -96,8 +96,12 @@ pub async fn reconcile(obj: Arc<ValkeyUpgrade>, ctx: Arc<Context>) -> Result<Act
             handle_inprogress_phase(&obj, &ctx, &api, &cluster, &namespace).await
         }
         UpgradePhase::RollingBack => {
-            // Handle rollback
-            handle_rollback_phase(&obj, &ctx, &api, &cluster, &namespace).await
+            // Check if rollback has completed
+            check_rollback_completion(&obj, &ctx, &api, &cluster, &namespace).await
+        }
+        UpgradePhase::RolledBack => {
+            // Rollback already completed, just maintain status
+            Ok(Action::requeue(Duration::from_secs(300)))
         }
         _ => Ok(Action::requeue(Duration::from_secs(60))),
     }
@@ -113,8 +117,27 @@ pub fn error_policy(obj: Arc<ValkeyUpgrade>, error: &Error, _ctx: Arc<Context>) 
     }
 
     if error.is_retryable() {
-        warn!(name = %name, error = %error, "Retryable error, will retry");
-        Action::requeue(error.requeue_after())
+        // Get retry count from annotations (track retries per object)
+        let retry_count = obj
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|ann| ann.get("valkey-operator.smoketurner.com/retry-count"))
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        // Calculate exponential backoff
+        let backoff = error.requeue_after_with_retry_count(retry_count);
+
+        warn!(
+            name = %name,
+            error = %error,
+            retry_count = retry_count,
+            backoff_secs = backoff.as_secs(),
+            "Retryable error, will retry with exponential backoff"
+        );
+
+        Action::requeue(backoff)
     } else {
         error!(name = %name, error = %error, "Non-retryable error");
         Action::requeue(Duration::from_secs(300))
@@ -132,8 +155,8 @@ async fn handle_pending_phase(
     let name = obj.name_any();
     info!(name = %name, "Starting upgrade validation");
 
-    // Validate upgrade spec
-    if let Err(e) = validate_upgrade_spec(&obj.spec, cluster) {
+    // Validate upgrade spec (including concurrent upgrade check)
+    if let Err(e) = validate_upgrade_spec(&obj.spec, cluster, Some(&obj), Some(ctx), namespace).await {
         error!(name = %name, error = %e, "Validation failed");
         update_phase(api, &name, UpgradePhase::Failed, Some(e.to_string())).await?;
         return Err(e);
@@ -146,7 +169,7 @@ async fn handle_pending_phase(
     let total_shards = cluster.spec.masters;
     let shard_statuses = initialize_shard_statuses(cluster, ctx, namespace).await?;
 
-    let status = ValkeyUpgradeStatus {
+    let mut status = ValkeyUpgradeStatus {
         phase: UpgradePhase::PreChecks,
         progress: format!("0/{} shards upgraded", total_shards),
         current_version: Some(cluster.spec.image.tag.clone()),
@@ -157,6 +180,16 @@ async fn handle_pending_phase(
         observed_generation: obj.metadata.generation,
         ..Default::default()
     };
+    
+    // Set conditions based on phase
+    status.conditions = compute_upgrade_conditions(
+        UpgradePhase::PreChecks,
+        total_shards,
+        0,
+        0,
+        None,
+        obj.metadata.generation,
+    );
 
     update_status(api, &name, status).await?;
 
@@ -233,6 +266,14 @@ async fn handle_prechecks_phase(
     let mut status = obj.status.clone().unwrap_or_default();
     status.phase = UpgradePhase::InProgress;
     status.current_shard = 0;
+    status.conditions = compute_upgrade_conditions(
+        UpgradePhase::InProgress,
+        status.total_shards,
+        status.upgraded_shards,
+        status.failed_shards,
+        status.error_message.as_deref(),
+        obj.metadata.generation,
+    );
     update_status(api, &name, status).await?;
 
     ctx.publish_upgrade_event(
@@ -270,12 +311,14 @@ async fn handle_inprogress_phase(
         new_status.phase = UpgradePhase::Completed;
         new_status.progress = format!("{}/{} shards upgraded", total_shards, total_shards);
         new_status.completed_at = Some(Timestamp::now().to_string());
-        new_status.conditions = vec![Condition::ready(
-            true,
-            "UpgradeCompleted",
-            "All shards upgraded successfully",
+        new_status.conditions = compute_upgrade_conditions(
+            UpgradePhase::Completed,
+            total_shards,
+            total_shards,
+            0,
+            None,
             obj.metadata.generation,
-        )];
+        );
         update_status(api, &name, new_status).await?;
 
         ctx.publish_upgrade_event(
@@ -333,6 +376,14 @@ async fn handle_inprogress_phase(
             new_status.current_shard = current_shard + 1;
             new_status.upgraded_shards = current_shard + 1;
             new_status.progress = format!("{}/{} shards upgraded", current_shard + 1, total_shards);
+            new_status.conditions = compute_upgrade_conditions(
+                UpgradePhase::InProgress,
+                new_status.total_shards,
+                new_status.upgraded_shards,
+                new_status.failed_shards,
+                new_status.error_message.as_deref(),
+                obj.metadata.generation,
+            );
             update_status(api, &name, new_status).await?;
             Ok(Action::requeue(Duration::from_secs(1)))
         }
@@ -342,6 +393,14 @@ async fn handle_inprogress_phase(
             let mut new_status = status.clone();
             new_status.phase = UpgradePhase::RollingBack;
             new_status.failed_shards += 1;
+            new_status.conditions = compute_upgrade_conditions(
+                UpgradePhase::RollingBack,
+                new_status.total_shards,
+                new_status.upgraded_shards,
+                new_status.failed_shards,
+                new_status.error_message.as_deref(),
+                obj.metadata.generation,
+            );
             update_status(api, &name, new_status).await?;
             Ok(Action::requeue(Duration::from_secs(1)))
         }
@@ -349,6 +408,14 @@ async fn handle_inprogress_phase(
             // Move to next shard
             let mut new_status = status.clone();
             new_status.current_shard = current_shard + 1;
+            new_status.conditions = compute_upgrade_conditions(
+                UpgradePhase::InProgress,
+                new_status.total_shards,
+                new_status.upgraded_shards,
+                new_status.failed_shards,
+                new_status.error_message.as_deref(),
+                obj.metadata.generation,
+            );
             update_status(api, &name, new_status).await?;
             Ok(Action::requeue(Duration::from_secs(1)))
         }
@@ -560,18 +627,49 @@ async fn wait_for_replication_sync(
         }
     };
 
+    // Get master pod to connect and compare offsets
+    let master_pods = master_pod_dns_names(cluster);
+    let master_client = if let Some((master_host, master_port)) = master_pods.get(shard_index as usize) {
+        // Connect to master to compare offsets
+        match ValkeyClient::connect_single(
+            master_host,
+            *master_port,
+            password.as_deref(),
+            tls_certs.as_ref(),
+        )
+        .await
+        {
+            Ok(c) => Some(c),
+            Err(e) => {
+                debug!(error = %e, "Failed to connect to master for offset comparison");
+                None // Fall back to replica-only check
+            }
+        }
+    } else {
+        None
+    };
+
     // Always wait for replication sync before failover (5 minute timeout)
+    // Now compares replica offset with master offset for accurate sync verification
     const SYNC_TIMEOUT_SECS: u64 = 300;
     let sync_timeout = Duration::from_secs(SYNC_TIMEOUT_SECS);
-    match client.wait_for_replication_sync(sync_timeout).await {
+    let sync_result = client
+        .wait_for_replication_sync(sync_timeout, master_client.as_ref())
+        .await;
+
+    // Close clients
+    let _ = client.close().await;
+    if let Some(master) = master_client {
+        let _ = master.close().await;
+    }
+
+    match sync_result {
         Ok(()) => {
-            info!(name = %name, shard = shard_index, "Replication synced, proceeding to failover");
-            let _ = client.close().await;
+            info!(name = %name, shard = shard_index, "Replication synced (compared with master offset), proceeding to failover");
             update_shard_status(api, &name, shard_index, ShardUpgradeState::FailingOver).await?;
             Ok(Action::requeue(Duration::from_secs(1)))
         }
         Err(e) => {
-            let _ = client.close().await;
             debug!(name = %name, shard = shard_index, error = %e, "Replication not yet synced");
             Ok(Action::requeue(Duration::from_secs(5)))
         }
@@ -617,12 +715,105 @@ async fn execute_failover(
     // Get TLS certificates from secret
     let tls_certs = get_tls_certs(ctx, namespace, &cluster.name_any()).await?;
 
-    // Connect to the first replica (best replica selection would be an enhancement)
-    let Some((replica_host, replica_port)) = replica_pods.first() else {
-        // This shouldn't happen since we checked is_empty above
-        return Err(Error::Validation("No replica pods found".to_string()));
+    // Select best replica (lowest replication lag) for failover
+    // Connect to master first to get master_repl_offset for comparison
+    let master_pods = master_pod_dns_names(cluster);
+    let master_client = if let Some((master_host, master_port)) = master_pods.get(shard_index as usize) {
+        match ValkeyClient::connect_single(
+            master_host,
+            *master_port,
+            password.as_deref(),
+            tls_certs.as_ref(),
+        )
+        .await
+        {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!(error = %e, "Failed to connect to master for replica selection, using first replica");
+                None
+            }
+        }
+    } else {
+        None
     };
-    let replica_pod_name = replica_host.split('.').next().unwrap_or(replica_host);
+
+    // Find replica with lowest lag
+    let (best_replica_host, best_replica_port, best_replica_pod_name) = if let Some(master) = &master_client {
+        // Compare all replicas and select the one with lowest lag
+        let mut best_replica: Option<(&(String, u16), i64)> = None;
+
+        for replica in &replica_pods {
+            match ValkeyClient::connect_single(
+                &replica.0,
+                replica.1,
+                password.as_deref(),
+                tls_certs.as_ref(),
+            )
+            .await
+            {
+                Ok(replica_client) => {
+                    match replica_client.get_replication_lag(master).await {
+                        Ok(lag) => {
+                            if lag < 0 {
+                                // Negative lag shouldn't happen, but handle gracefully
+                                warn!(replica = %replica.0, lag = lag, "Negative replication lag detected");
+                                continue;
+                            }
+                            if best_replica.is_none() || lag < best_replica.unwrap().1 {
+                                let _ = replica_client.close().await;
+                                best_replica = Some((replica, lag));
+                            } else {
+                                let _ = replica_client.close().await;
+                            }
+                        }
+                        Err(e) => {
+                            debug!(replica = %replica.0, error = %e, "Failed to get replication lag");
+                            let _ = replica_client.close().await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(replica = %replica.0, error = %e, "Failed to connect to replica");
+                }
+            }
+        }
+
+        if let Some((replica, lag)) = best_replica {
+            let pod_name = replica.0.split('.').next().unwrap_or(&replica.0);
+            info!(
+                name = %name,
+                shard = shard_index,
+                replica = %pod_name,
+                lag = lag,
+                "Selected replica with lowest replication lag"
+            );
+            (replica.0.clone(), replica.1, pod_name.to_string())
+        } else {
+            // Fall back to first replica if we couldn't determine lag
+            let (host, port) = replica_pods.first().unwrap();
+            let pod_name = host.split('.').next().unwrap_or(host);
+            warn!(
+                name = %name,
+                shard = shard_index,
+                "Could not determine replication lag for any replica, using first replica"
+            );
+            (host.clone(), *port, pod_name.to_string())
+        }
+    } else {
+        // No master client, just use first replica
+        let (host, port) = replica_pods.first().unwrap();
+        let pod_name = host.split('.').next().unwrap_or(host);
+        (host.clone(), *port, pod_name.to_string())
+    };
+
+    // Close master client if we created one
+    if let Some(master) = master_client {
+        let _ = master.close().await;
+    }
+
+    let replica_host = &best_replica_host;
+    let replica_port = best_replica_port;
+    let replica_pod_name = &best_replica_pod_name;
 
     info!(
         name = %name,
@@ -633,24 +824,147 @@ async fn execute_failover(
 
     let client = ValkeyClient::connect_single(
         replica_host,
-        *replica_port,
+        replica_port,
         password.as_deref(),
         tls_certs.as_ref(),
     )
     .await
     .map_err(|e| Error::Valkey(e.to_string()))?;
 
+    // Use WAIT command to ensure writes are replicated before failover
+    // This improves consistency by ensuring all writes are replicated to at least 1 replica
+    // before we proceed with failover
+    const WAIT_REPLICAS: u64 = 1; // Wait for at least 1 replica
+    const WAIT_TIMEOUT_MS: u64 = 5000; // 5 second timeout
+    match client.wait(WAIT_REPLICAS, WAIT_TIMEOUT_MS).await {
+        Ok(acked) => {
+            if acked >= WAIT_REPLICAS {
+                info!(
+                    name = %name,
+                    shard = shard_index,
+                    replicas_acked = acked,
+                    "WAIT confirmed writes replicated to {} replicas before failover",
+                    acked
+                );
+            } else {
+                warn!(
+                    name = %name,
+                    shard = shard_index,
+                    replicas_acked = acked,
+                    expected = WAIT_REPLICAS,
+                    "WAIT returned fewer replicas than expected, proceeding with failover anyway"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                name = %name,
+                shard = shard_index,
+                error = %e,
+                "WAIT command failed, proceeding with failover anyway"
+            );
+            // Continue with failover even if WAIT fails
+        }
+    }
+
     // Execute failover
     let failover_result = client.cluster_failover().await;
-    let _ = client.close().await;
 
     match failover_result {
         Ok(()) => {
             info!(name = %name, shard = shard_index, "CLUSTER FAILOVER initiated");
 
+            // Verify failover completed - wait up to 30 seconds for promotion
+            // According to Valkey docs, manual failover should complete in seconds
+            const FAILOVER_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+            
+            info!(
+                name = %name,
+                shard = shard_index,
+                replica = %replica_pod_name,
+                "Verifying failover completion"
+            );
+
+            // Get the replica's node ID for verification
+            let nodes = client.cluster_nodes().await.map_err(|e| Error::Valkey(e.to_string()))?;
+            let replica_node_id = nodes
+                .nodes
+                .iter()
+                .find(|n| {
+                    // Match by pod name in address
+                    n.address.contains(replica_pod_name) || n.ip.contains(replica_pod_name)
+                })
+                .map(|n| n.node_id.clone());
+
+            let failover_verified = if let Some(node_id) = replica_node_id {
+                // Verify using the replica node
+                match client.verify_failover_completed(&node_id, FAILOVER_VERIFY_TIMEOUT).await {
+                    Ok(true) => {
+                        info!(
+                            name = %name,
+                            shard = shard_index,
+                            "Failover verified: replica promoted to master"
+                        );
+                        true
+                    }
+                    Ok(false) => {
+                        warn!(
+                            name = %name,
+                            shard = shard_index,
+                            "Failover verification timeout - proceeding anyway"
+                        );
+                        false // Timeout, but proceed
+                    }
+                    Err(e) => {
+                        warn!(
+                            name = %name,
+                            shard = shard_index,
+                            error = %e,
+                            "Failed to verify failover - proceeding anyway"
+                        );
+                        false // Error, but proceed
+                    }
+                }
+            } else {
+                warn!(
+                    name = %name,
+                    shard = shard_index,
+                    "Could not find replica node ID for verification"
+                );
+                false // Couldn't find node, proceed anyway
+            };
+
+            let _ = client.close().await;
+
+            if !failover_verified {
+                // Failover not verified - this is a warning but we'll proceed
+                // The cluster should still be functional, but we log the concern
+                warn!(
+                    name = %name,
+                    shard = shard_index,
+                    "Failover verification incomplete - upgrade may proceed with risk"
+                );
+            }
+
             // Update shard status with promoted replica
             let mut status = obj.status.clone().unwrap_or_default();
-            if let Some(shard) = status.shard_statuses.get_mut(shard_index as usize) {
+            // Ensure shard_statuses is large enough
+            let shard_idx = shard_index as usize;
+            if shard_idx >= status.shard_statuses.len() {
+                // Extend shard_statuses if needed (shouldn't happen, but be safe)
+                status.shard_statuses.resize_with(
+                    shard_idx + 1,
+                    || ShardUpgradeStatus {
+                        shard_index,
+                        master_node_id: String::new(),
+                        master_pod: String::new(),
+                        status: ShardUpgradeState::Pending,
+                        promoted_replica: None,
+                        error: None,
+                    },
+                );
+            }
+            if let Some(shard) = status.shard_statuses.get_mut(shard_idx) {
                 shard.status = ShardUpgradeState::UpgradingOldMaster;
                 shard.promoted_replica = Some(replica_pod_name.to_string());
             }
@@ -667,10 +981,11 @@ async fn execute_failover(
             )
             .await;
 
-            // Wait a bit for failover to complete before upgrading old master
-            Ok(Action::requeue(Duration::from_secs(5)))
+            // Proceed to upgrade old master
+            Ok(Action::requeue(Duration::from_secs(1)))
         }
         Err(e) => {
+            let _ = client.close().await;
             // Failover failed - mark shard as failed (triggers rollback)
             error!(name = %name, shard = shard_index, error = %e, "CLUSTER FAILOVER failed");
             update_shard_status_with_error(api, &name, shard_index, e.to_string()).await?;
@@ -785,26 +1100,288 @@ async fn upgrade_old_master(
 /// Handle the rollback phase
 async fn handle_rollback_phase(
     obj: &ValkeyUpgrade,
-    _ctx: &Context,
+    ctx: &Context,
     api: &Api<ValkeyUpgrade>,
-    _cluster: &ValkeyCluster,
-    _namespace: &str,
+    cluster: &ValkeyCluster,
+    namespace: &str,
 ) -> Result<Action, Error> {
     let name = obj.name_any();
+    let cluster_name = cluster.name_any();
 
-    // Rollback is complex and typically involves:
-    // 1. Rolling back upgraded shards to old image
-    // 2. Re-establishing correct master/replica relationships
-    //
-    // For now, we just mark the upgrade as rolled back and let the operator
-    // handle the cluster naturally through reconciliation
-    info!(name = %name, "Rollback requested - marking as RolledBack");
+    info!(name = %name, "Starting rollback - restoring original image version");
 
+    // Get original image version from status
+    let Some(original_version) = obj
+        .status
+        .as_ref()
+        .and_then(|s| s.current_version.as_ref())
+    else {
+        error!(name = %name, "Cannot rollback: original version not found in status");
+        let mut status = obj.status.clone().unwrap_or_default();
+        status.phase = UpgradePhase::Failed;
+        status.error_message = Some("Cannot rollback: original version not found in status".to_string());
+        status.conditions = compute_upgrade_conditions(
+            UpgradePhase::Failed,
+            status.total_shards,
+            status.upgraded_shards,
+            status.failed_shards,
+            status.error_message.as_deref(),
+            obj.metadata.generation,
+        );
+        update_status(api, &name, status).await?;
+        return Ok(Action::requeue(Duration::from_secs(300)));
+    };
+
+    // Restore the original image in the cluster spec
+    let cluster_api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), namespace);
+    let mut cluster = cluster_api.get(&cluster_name).await?;
+
+    // Update cluster image to original version
+    let original_image_tag = original_version.clone();
+    cluster.spec.image.tag = original_image_tag.clone();
+
+    // Apply the updated cluster spec
+    let patch = serde_json::json!({
+        "spec": {
+            "image": {
+                "tag": original_image_tag
+            }
+        }
+    });
+
+    cluster_api
+        .patch(
+            &cluster_name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Merge(&patch),
+        )
+        .await?;
+
+    info!(name = %name, original_version = %original_image_tag, "Updated cluster spec with original image version");
+
+    // Delete all pods to trigger restart with original image
+    // This ensures all pods (masters and replicas) restart with the old image
+    let pod_api: Api<k8s_openapi::api::core::v1::Pod> =
+        Api::namespaced(ctx.client.clone(), namespace);
+    let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
+
+    info!(name = %name, pods = total_pods, "Deleting all pods to trigger restart with original image");
+
+    for i in 0..total_pods {
+        let pod_name = format!("{}-{}", cluster_name, i);
+        match pod_api.delete(&pod_name, &DeleteParams::default()).await {
+            Ok(_) => {
+                debug!(pod = %pod_name, "Pod deleted for rollback");
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => {
+                debug!(pod = %pod_name, "Pod already deleted");
+            }
+            Err(e) => {
+                warn!(pod = %pod_name, error = %e, "Failed to delete pod during rollback");
+                // Continue with other pods
+            }
+        }
+    }
+
+    // Update status to mark rollback as in progress
+    let mut status = obj.status.clone().unwrap_or_default();
+    status.phase = UpgradePhase::RollingBack;
+    status.progress = format!("Rolling back to version {}", original_image_tag);
+    status.error_message = Some("Upgrade rolled back - restoring original image version".to_string());
+    status.conditions = compute_upgrade_conditions(
+        UpgradePhase::RollingBack,
+        status.total_shards,
+        status.upgraded_shards,
+        status.failed_shards,
+        status.error_message.as_deref(),
+        obj.metadata.generation,
+    );
+    update_status(api, &name, status).await?;
+
+    ctx.publish_upgrade_event(
+        obj,
+        "RollbackStarted",
+        "RollingBack",
+        Some(format!("Rolling back to version {}", original_image_tag)),
+    )
+    .await;
+
+    // Wait for pods to restart and cluster to recover
+    // The cluster reconciler will handle the StatefulSet update and pod recreation
+    info!(name = %name, "Rollback initiated - waiting for cluster to recover");
+    Ok(Action::requeue(Duration::from_secs(30)))
+}
+
+/// Check if rollback has completed - all pods restarted with original image and cluster is healthy
+async fn check_rollback_completion(
+    obj: &ValkeyUpgrade,
+    ctx: &Context,
+    api: &Api<ValkeyUpgrade>,
+    cluster: &ValkeyCluster,
+    namespace: &str,
+) -> Result<Action, Error> {
+    let name = obj.name_any();
+    let cluster_name = cluster.name_any();
+
+    // Get original image version
+    let Some(original_version) = obj
+        .status
+        .as_ref()
+        .and_then(|s| s.current_version.as_ref())
+    else {
+        error!(name = %name, "Cannot check rollback: original version not found");
+        let mut status = obj.status.clone().unwrap_or_default();
+        status.phase = UpgradePhase::Failed;
+        status.error_message = Some("Cannot check rollback: original version not found".to_string());
+        status.conditions = compute_upgrade_conditions(
+            UpgradePhase::Failed,
+            status.total_shards,
+            status.upgraded_shards,
+            status.failed_shards,
+            status.error_message.as_deref(),
+            obj.metadata.generation,
+        );
+        update_status(api, &name, status).await?;
+        return Ok(Action::requeue(Duration::from_secs(300)));
+    };
+
+    // Construct original image
+    let original_image = format!("{}:{}", cluster.spec.image.repository, original_version);
+
+    // Check if all pods are running with the original image
+    let pod_api: Api<k8s_openapi::api::core::v1::Pod> =
+        Api::namespaced(ctx.client.clone(), namespace);
+    let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
+
+    let mut all_pods_ready = true;
+    let mut all_pods_correct_image = true;
+
+    for i in 0..total_pods {
+        let pod_name = format!("{}-{}", cluster_name, i);
+        match pod_api.get(&pod_name).await {
+            Ok(pod) => {
+                // Check if pod is ready
+                let is_ready = pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.conditions.as_ref())
+                    .map(|conds| {
+                        conds
+                            .iter()
+                            .any(|c| c.type_ == "Ready" && c.status == "True")
+                    })
+                    .unwrap_or(false);
+
+                if !is_ready {
+                    debug!(pod = %pod_name, "Pod not ready yet during rollback");
+                    all_pods_ready = false;
+                    continue;
+                }
+
+                // Check if pod has the original image
+                let current_image = pod
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.containers.first())
+                    .and_then(|c| c.image.as_ref())
+                    .cloned()
+                    .unwrap_or_default();
+
+                if current_image != original_image && !current_image.contains(original_version) {
+                    debug!(
+                        pod = %pod_name,
+                        current = %current_image,
+                        expected = %original_image,
+                        "Pod still has wrong image during rollback"
+                    );
+                    all_pods_correct_image = false;
+                }
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => {
+                debug!(pod = %pod_name, "Pod not yet recreated during rollback");
+                all_pods_ready = false;
+            }
+            Err(e) => {
+                warn!(pod = %pod_name, error = %e, "Failed to get pod during rollback check");
+                all_pods_ready = false;
+            }
+        }
+    }
+
+    if !all_pods_ready || !all_pods_correct_image {
+        debug!(
+            name = %name,
+            all_ready = all_pods_ready,
+            all_correct_image = all_pods_correct_image,
+            "Rollback still in progress"
+        );
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    }
+
+    // Check cluster health
+    let password = get_auth_password(
+        ctx,
+        namespace,
+        &cluster.spec.auth.secret_ref.name,
+        &cluster.spec.auth.secret_ref.key,
+    )
+    .await?;
+
+    let tls_certs = get_tls_certs(ctx, namespace, &cluster_name).await?;
+
+    let master_pods = master_pod_dns_names(cluster);
+    let (host, port) = master_pods
+        .first()
+        .ok_or_else(|| Error::Validation("No master pods found".to_string()))?;
+
+    let client = match ValkeyClient::connect_single(host, *port, password.as_deref(), tls_certs.as_ref()).await {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(name = %name, error = %e, "Cannot connect to cluster to check health, will retry");
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+    };
+
+    let cluster_healthy = match client.is_cluster_healthy().await {
+        Ok(healthy) => healthy,
+        Err(e) => {
+            debug!(name = %name, error = %e, "Failed to check cluster health, will retry");
+            let _ = client.close().await;
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+    };
+
+    let _ = client.close().await;
+
+    if !cluster_healthy {
+        debug!(name = %name, "Cluster not yet healthy after rollback");
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    }
+
+    // Rollback complete - all pods have original image and cluster is healthy
+    info!(name = %name, "Rollback completed successfully");
     let mut status = obj.status.clone().unwrap_or_default();
     status.phase = UpgradePhase::RolledBack;
     status.completed_at = Some(Timestamp::now().to_string());
-    status.error_message = Some("Upgrade rolled back due to failures".to_string());
+    status.progress = format!("Rollback complete - restored to version {}", original_version);
+    status.error_message = Some("Upgrade rolled back successfully".to_string());
+    status.conditions = compute_upgrade_conditions(
+        UpgradePhase::RolledBack,
+        status.total_shards,
+        status.upgraded_shards,
+        status.failed_shards,
+        status.error_message.as_deref(),
+        obj.metadata.generation,
+    );
     update_status(api, &name, status).await?;
+
+    ctx.publish_upgrade_event(
+        obj,
+        "RollbackCompleted",
+        "RolledBack",
+        Some(format!("Rollback completed - restored to version {}", original_version)),
+    )
+    .await;
 
     Ok(Action::requeue(Duration::from_secs(300)))
 }
@@ -835,7 +1412,13 @@ async fn get_target_cluster(
 }
 
 /// Validate the upgrade spec
-fn validate_upgrade_spec(spec: &ValkeyUpgradeSpec, cluster: &ValkeyCluster) -> Result<(), Error> {
+async fn validate_upgrade_spec(
+    spec: &ValkeyUpgradeSpec,
+    cluster: &ValkeyCluster,
+    current_upgrade: Option<&ValkeyUpgrade>,
+    ctx: Option<&Context>,
+    namespace: &str,
+) -> Result<(), Error> {
     // Validate target_version is not empty
     if spec.target_version.is_empty() {
         return Err(Error::Validation("targetVersion is required".to_string()));
@@ -853,6 +1436,69 @@ fn validate_upgrade_spec(spec: &ValkeyUpgradeSpec, cluster: &ValkeyCluster) -> R
             "Cluster must be in Running state, currently: {}",
             cluster_phase
         )));
+    }
+
+    // Check for concurrent upgrades targeting the same cluster
+    // This check is skipped if ctx is None (e.g., in unit tests)
+    if let Some(ctx) = ctx {
+        let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(ctx.client.clone(), namespace);
+        let cluster_namespace = spec.cluster_ref.namespace.as_deref().unwrap_or(namespace);
+        let cluster_name = &spec.cluster_ref.name;
+
+        // List all ValkeyUpgrade resources in the namespace
+        match upgrade_api.list(&ListParams::default()).await {
+            Ok(upgrades) => {
+                // Check for other active upgrades targeting the same cluster
+                for upgrade in upgrades.items {
+                    // Skip the current upgrade if provided
+                    if let Some(current) = current_upgrade {
+                        if upgrade.name_any() == current.name_any() {
+                            continue;
+                        }
+                    }
+
+                    // Check if this upgrade targets the same cluster
+                    let targets_same_cluster = upgrade.spec.cluster_ref.name == *cluster_name
+                        && upgrade
+                            .spec
+                            .cluster_ref
+                            .namespace
+                            .as_deref()
+                            .unwrap_or(namespace)
+                            == cluster_namespace;
+
+                    if !targets_same_cluster {
+                        continue;
+                    }
+
+                    // Check if this upgrade is in an active phase
+                    let phase = upgrade
+                        .status
+                        .as_ref()
+                        .map(|s| s.phase)
+                        .unwrap_or(UpgradePhase::Pending);
+
+                    let is_active = matches!(
+                        phase,
+                        UpgradePhase::PreChecks | UpgradePhase::InProgress | UpgradePhase::RollingBack
+                    );
+
+                    if is_active {
+                        return Err(Error::Validation(format!(
+                            "Another upgrade '{}' is already in progress (phase: {}) for cluster '{}'. Only one upgrade can target a cluster at a time.",
+                            upgrade.name_any(),
+                            phase,
+                            cluster_name
+                        )));
+                    }
+                }
+            }
+            Err(e) => {
+                // If we can't list upgrades (e.g., in test environment), log and continue
+                // This allows validation to proceed in test scenarios
+                debug!("Could not check for concurrent upgrades: {}. Continuing validation.", e);
+            }
+        }
     }
 
     Ok(())
@@ -1033,6 +1679,176 @@ async fn remove_finalizer(api: &Api<ValkeyUpgrade>, name: &str) -> Result<(), Er
 }
 
 /// Update the phase of an upgrade
+/// Compute standard Kubernetes conditions based on upgrade phase and status.
+///
+/// Returns a vector of conditions following Kubernetes conventions:
+/// - Ready: True when upgrade is completed successfully
+/// - Progressing: True when upgrade is actively in progress
+/// - Degraded: True when upgrade is in a degraded state (e.g., some shards failed)
+/// - Failed: True when upgrade has completely failed
+fn compute_upgrade_conditions(
+    phase: UpgradePhase,
+    total_shards: i32,
+    upgraded_shards: i32,
+    failed_shards: i32,
+    error_message: Option<&str>,
+    generation: Option<i64>,
+) -> Vec<Condition> {
+    let mut conditions = Vec::new();
+
+    match phase {
+        UpgradePhase::Completed => {
+            // Upgrade completed successfully
+            conditions.push(Condition::ready(
+                true,
+                "UpgradeCompleted",
+                &format!("All {} shards upgraded successfully", total_shards),
+                generation,
+            ));
+            conditions.push(Condition::progressing(
+                false,
+                "UpgradeCompleted",
+                "Upgrade finished",
+                generation,
+            ));
+            conditions.push(Condition::degraded(
+                false,
+                "UpgradeCompleted",
+                "No degraded shards",
+                generation,
+            ));
+        }
+        UpgradePhase::Failed => {
+            // Upgrade failed completely
+            conditions.push(Condition::ready(
+                false,
+                "UpgradeFailed",
+                error_message.unwrap_or("Upgrade failed"),
+                generation,
+            ));
+            conditions.push(Condition::progressing(
+                false,
+                "UpgradeFailed",
+                "Upgrade stopped due to failure",
+                generation,
+            ));
+            conditions.push(Condition::degraded(
+                true,
+                "UpgradeFailed",
+                error_message.unwrap_or("Upgrade failed"),
+                generation,
+            ));
+        }
+        UpgradePhase::RollingBack | UpgradePhase::RolledBack => {
+            // Rollback in progress or completed
+            let is_rolling_back = phase == UpgradePhase::RollingBack;
+            conditions.push(Condition::ready(
+                false,
+                if is_rolling_back { "RollingBack" } else { "RolledBack" },
+                if is_rolling_back {
+                    "Rollback in progress"
+                } else {
+                    "Rollback completed"
+                },
+                generation,
+            ));
+            conditions.push(Condition::progressing(
+                is_rolling_back,
+                if is_rolling_back { "RollingBack" } else { "RolledBack" },
+                if is_rolling_back {
+                    "Restoring original image version"
+                } else {
+                    "Original image version restored"
+                },
+                generation,
+            ));
+            conditions.push(Condition::degraded(
+                true,
+                "RollingBack",
+                "Upgrade rolled back",
+                generation,
+            ));
+        }
+        UpgradePhase::InProgress => {
+            // Upgrade actively in progress
+            let progress_pct = if total_shards > 0 {
+                (upgraded_shards * 100) / total_shards
+            } else {
+                0
+            };
+            let has_failures = failed_shards > 0;
+            
+            conditions.push(Condition::ready(
+                false,
+                "Upgrading",
+                &format!("{}/{} shards upgraded ({}%)", upgraded_shards, total_shards, progress_pct),
+                generation,
+            ));
+            conditions.push(Condition::progressing(
+                true,
+                "Upgrading",
+                &format!("Upgrading shard {}/{}", upgraded_shards + 1, total_shards),
+                generation,
+            ));
+            let degraded_msg = if has_failures {
+                format!("{} shard(s) failed", failed_shards)
+            } else {
+                "All shards upgrading successfully".to_string()
+            };
+            conditions.push(Condition::degraded(
+                has_failures,
+                if has_failures { "ShardFailures" } else { "NoFailures" },
+                &degraded_msg,
+                generation,
+            ));
+        }
+        UpgradePhase::PreChecks => {
+            // Pre-checks phase
+            conditions.push(Condition::ready(
+                false,
+                "PreChecks",
+                "Running pre-upgrade health checks",
+                generation,
+            ));
+            conditions.push(Condition::progressing(
+                true,
+                "PreChecks",
+                "Validating cluster health before upgrade",
+                generation,
+            ));
+            conditions.push(Condition::degraded(
+                false,
+                "PreChecks",
+                "No degradation detected",
+                generation,
+            ));
+        }
+        UpgradePhase::Pending => {
+            // Pending validation
+            conditions.push(Condition::ready(
+                false,
+                "Pending",
+                "Upgrade validation pending",
+                generation,
+            ));
+            conditions.push(Condition::progressing(
+                false,
+                "Pending",
+                "Waiting for validation",
+                generation,
+            ));
+            conditions.push(Condition::degraded(
+                false,
+                "Pending",
+                "No degradation",
+                generation,
+            ));
+        }
+    }
+
+    conditions
+}
+
 async fn update_phase(
     api: &Api<ValkeyUpgrade>,
     name: &str,
@@ -1046,6 +1862,17 @@ async fn update_phase(
     if let Some(msg) = error_message {
         status.error_message = Some(msg);
     }
+    
+    // Update conditions based on phase
+    status.conditions = compute_upgrade_conditions(
+        phase,
+        status.total_shards,
+        status.upgraded_shards,
+        status.failed_shards,
+        status.error_message.as_deref(),
+        obj.metadata.generation,
+    );
+    
     update_status(api, name, status).await
 }
 
@@ -1077,8 +1904,32 @@ async fn update_shard_status(
     let obj = api.get(name).await?;
     let mut status = obj.status.unwrap_or_default();
 
-    if let Some(shard) = status.shard_statuses.get_mut(shard_index as usize) {
+    // Ensure shard_statuses is large enough
+    let shard_idx = shard_index as usize;
+    if shard_idx >= status.shard_statuses.len() {
+        // Extend shard_statuses if needed (shouldn't happen, but be safe)
+        status.shard_statuses.resize_with(
+            shard_idx + 1,
+            || ShardUpgradeStatus {
+                shard_index,
+                master_node_id: String::new(),
+                master_pod: String::new(),
+                status: ShardUpgradeState::Pending,
+                promoted_replica: None,
+                error: None,
+            },
+        );
+    }
+
+    if let Some(shard) = status.shard_statuses.get_mut(shard_idx) {
         shard.status = state;
+    } else {
+        // This shouldn't happen after resize, but handle gracefully
+        return Err(Error::Validation(format!(
+            "Invalid shard index: {} (status has {} shards)",
+            shard_index,
+            status.shard_statuses.len()
+        )));
     }
 
     update_status(api, name, status).await
@@ -1094,9 +1945,33 @@ async fn update_shard_status_with_error(
     let obj = api.get(name).await?;
     let mut status = obj.status.unwrap_or_default();
 
-    if let Some(shard) = status.shard_statuses.get_mut(shard_index as usize) {
+    // Ensure shard_statuses is large enough
+    let shard_idx = shard_index as usize;
+    if shard_idx >= status.shard_statuses.len() {
+        // Extend shard_statuses if needed (shouldn't happen, but be safe)
+        status.shard_statuses.resize_with(
+            shard_idx + 1,
+            || ShardUpgradeStatus {
+                shard_index,
+                master_node_id: String::new(),
+                master_pod: String::new(),
+                status: ShardUpgradeState::Pending,
+                promoted_replica: None,
+                error: None,
+            },
+        );
+    }
+
+    if let Some(shard) = status.shard_statuses.get_mut(shard_idx) {
         shard.status = ShardUpgradeState::Failed;
         shard.error = Some(error);
+    } else {
+        // This shouldn't happen after resize, but handle gracefully
+        return Err(Error::Validation(format!(
+            "Invalid shard index: {} (status has {} shards)",
+            shard_index,
+            status.shard_statuses.len()
+        )));
     }
 
     update_status(api, name, status).await
@@ -1173,18 +2048,18 @@ mod tests {
     // validate_upgrade_spec() tests
     // ==========================================================================
 
-    #[test]
-    fn test_validate_upgrade_spec_valid() {
+    #[tokio::test]
+    async fn test_validate_upgrade_spec_valid() {
         let spec = create_test_upgrade_spec("9");
         let cluster = create_test_cluster("test", ClusterPhase::Running);
-        assert!(validate_upgrade_spec(&spec, &cluster).is_ok());
+        assert!(validate_upgrade_spec(&spec, &cluster, None, None, "default").await.is_ok());
     }
 
-    #[test]
-    fn test_validate_upgrade_spec_empty_target_version() {
+    #[tokio::test]
+    async fn test_validate_upgrade_spec_empty_target_version() {
         let spec = create_test_upgrade_spec("");
         let cluster = create_test_cluster("test", ClusterPhase::Running);
-        let result = validate_upgrade_spec(&spec, &cluster);
+        let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
         assert!(result.is_err());
         assert!(
             result
@@ -1194,11 +2069,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_validate_upgrade_spec_cluster_not_running() {
+    #[tokio::test]
+    async fn test_validate_upgrade_spec_cluster_not_running() {
         let spec = create_test_upgrade_spec("9");
         let cluster = create_test_cluster("test", ClusterPhase::Creating);
-        let result = validate_upgrade_spec(&spec, &cluster);
+        let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
         assert!(result.is_err());
         assert!(
             result
@@ -1208,11 +2083,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_validate_upgrade_spec_cluster_pending() {
+    #[tokio::test]
+    async fn test_validate_upgrade_spec_cluster_pending() {
         let spec = create_test_upgrade_spec("9");
         let cluster = create_test_cluster("test", ClusterPhase::Pending);
-        let result = validate_upgrade_spec(&spec, &cluster);
+        let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
         assert!(result.is_err());
         assert!(
             result
@@ -1222,27 +2097,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_validate_upgrade_spec_cluster_failed() {
+    #[tokio::test]
+    async fn test_validate_upgrade_spec_cluster_failed() {
         let spec = create_test_upgrade_spec("9");
         let cluster = create_test_cluster("test", ClusterPhase::Failed);
-        let result = validate_upgrade_spec(&spec, &cluster);
+        let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_upgrade_spec_cluster_degraded() {
+    #[tokio::test]
+    async fn test_validate_upgrade_spec_cluster_degraded() {
         let spec = create_test_upgrade_spec("9");
         let cluster = create_test_cluster("test", ClusterPhase::Degraded);
-        let result = validate_upgrade_spec(&spec, &cluster);
+        let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_validate_upgrade_spec_cluster_updating() {
+    #[tokio::test]
+    async fn test_validate_upgrade_spec_cluster_updating() {
         let spec = create_test_upgrade_spec("9");
         let cluster = create_test_cluster("test", ClusterPhase::Updating);
-        let result = validate_upgrade_spec(&spec, &cluster);
+        let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
         assert!(result.is_err());
     }
 

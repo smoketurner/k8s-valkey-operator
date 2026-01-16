@@ -51,6 +51,8 @@ mod scaling_tests;
 mod slot_tests;
 mod tls_tests;
 mod upgrade_tests;
+mod upgrade_failure_tests;
+mod upgrade_rollback_tests;
 
 // Re-export test modules for convenience
 pub use assertions::*;

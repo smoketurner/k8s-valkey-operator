@@ -9,9 +9,10 @@ use fred::prelude::*;
 use fred::types::InfoKind;
 use fred::types::cluster::{ClusterFailoverFlag, ClusterResetFlag};
 use fred::types::config::ClusterDiscoveryPolicy;
+use fred::types::CustomCommand;
 use rustls::pki_types::CertificateDer;
 use thiserror::Error;
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument};
 
 use crate::crd::ValkeyClusterSpec;
 
@@ -479,6 +480,120 @@ impl ValkeyClient {
         Ok(id)
     }
 
+    /// Execute ROLE command to get the role of this node.
+    ///
+    /// Returns the role as a string: "master" or "slave" (replica).
+    /// Used to verify failover completion.
+    #[instrument(skip(self))]
+    pub async fn role(&self) -> Result<String, ValkeyError> {
+        // ROLE command returns an array: [role, ...]
+        // For master: ["master", offset, [replicas...]]
+        // For replica: ["slave", master_ip, master_port, state, offset]
+        let cmd = CustomCommand::new("ROLE", None, false);
+        let response: Value = self.client.custom(cmd, Vec::<&str>::new()).await?;
+        
+        // Parse the response - ROLE returns an array with role as first element
+        // ROLE returns: ["master", offset, [replicas...]] or ["slave", master_ip, master_port, state, offset]
+        let role_vec: Vec<Value> = response.convert()?;
+        if let Some(first) = role_vec.first() {
+            // Try to convert first element to string (clone since we can't move from reference)
+            let first_clone = first.clone();
+            let role: String = first_clone.convert()?;
+            Ok(role)
+        } else {
+            Err(ValkeyError::InvalidConfig(
+                "ROLE command returned empty array".to_string(),
+            ))
+        }
+    }
+
+    /// Execute WAIT command for synchronous replication.
+    ///
+    /// WAIT blocks until the specified number of replicas have acknowledged
+    /// all previous write commands, or until the timeout is reached.
+    ///
+    /// This improves consistency guarantees by ensuring writes are replicated
+    /// before proceeding with critical operations like failover.
+    ///
+    /// # Arguments
+    /// * `numreplicas` - Number of replicas to wait for
+    /// * `timeout_ms` - Timeout in milliseconds (0 = wait forever)
+    ///
+    /// # Returns
+    /// Number of replicas that acknowledged the writes (may be less than numreplicas if timeout)
+    #[instrument(skip(self), fields(numreplicas, timeout_ms))]
+    pub async fn wait(&self, numreplicas: u64, timeout_ms: u64) -> Result<u64, ValkeyError> {
+        // WAIT numreplicas timeout
+        let numreplicas_str = numreplicas.to_string();
+        let timeout_ms_str = timeout_ms.to_string();
+        let args: Vec<String> = vec![numreplicas_str, timeout_ms_str];
+        let cmd = CustomCommand::new("WAIT", None, false);
+        let response: i64 = self.client.custom(cmd, args).await?;
+        Ok(response as u64)
+    }
+
+    /// Verify that a failover has completed by checking the node's role.
+    ///
+    /// Polls the node until it shows as "master" or timeout is reached.
+    /// Used after CLUSTER FAILOVER to ensure the replica was promoted.
+    #[instrument(skip(self), fields(node = %node_id))]
+    pub async fn verify_failover_completed(
+        &self,
+        node_id: &str,
+        timeout: Duration,
+    ) -> Result<bool, ValkeyError> {
+        let start = std::time::Instant::now();
+        let poll_interval = Duration::from_millis(500);
+
+        loop {
+            if start.elapsed() > timeout {
+                return Ok(false);
+            }
+
+            // Check role using ROLE command
+            match self.role().await {
+                Ok(role) => {
+                    if role.to_lowercase() == "master" {
+                        info!(node = %node_id, "Failover verified: node is now master");
+                        return Ok(true);
+                    }
+                    debug!(
+                        node = %node_id,
+                        role = %role,
+                        "Waiting for failover to complete, current role: {}",
+                        role
+                    );
+                }
+                Err(e) => {
+                    debug!(
+                        node = %node_id,
+                        error = %e,
+                        "Failed to get role, will retry"
+                    );
+                }
+            }
+
+            // Also check INFO REPLICATION as a secondary verification
+            match self.info(Some(InfoKind::Replication)).await {
+                Ok(info) => {
+                    if info.contains("role:master") {
+                        info!(node = %node_id, "Failover verified via INFO REPLICATION: role is master");
+                        return Ok(true);
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        node = %node_id,
+                        error = %e,
+                        "Failed to get replication info, will retry"
+                    );
+                }
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
     /// Execute MIGRATE to move keys to another node.
     /// This is used during slot migration.
     #[instrument(skip(self, keys), fields(key_count = keys.len()))]
@@ -511,6 +626,64 @@ impl ValkeyClient {
         // For now, slot migration will rely on Redis Cluster's CLUSTER SETSLOT
         // which handles key migration automatically in newer versions
 
+        Ok(())
+    }
+
+    /// Execute CLUSTER MIGRATESLOTS (Valkey 9.0+ atomic slot migration).
+    ///
+    /// Atomically migrates a range of slots from this node to the target node.
+    /// This is the recommended method for slot migration as it's faster, more reliable,
+    /// and prevents data loss compared to legacy CLUSTER SETSLOT method.
+    ///
+    /// # Arguments
+    /// * `start_slot` - First slot in the range to migrate
+    /// * `end_slot` - Last slot in the range to migrate (inclusive)
+    /// * `target_node_id` - Node ID of the target node receiving the slots
+    #[instrument(skip(self), fields(start_slot, end_slot, target_node = %target_node_id))]
+    pub async fn cluster_migrateslots(
+        &self,
+        start_slot: u16,
+        end_slot: u16,
+        target_node_id: &str,
+    ) -> Result<(), ValkeyError> {
+        // CLUSTER MIGRATESLOTS SLOTSRANGE <start> <end> NODE <target-node-id>
+        let start_slot_str = start_slot.to_string();
+        let end_slot_str = end_slot.to_string();
+        let target_node_id_str = target_node_id.to_string();
+        let cmd_args: Vec<String> = vec![
+            "MIGRATESLOTS".to_string(),
+            "SLOTSRANGE".to_string(),
+            start_slot_str,
+            end_slot_str,
+            "NODE".to_string(),
+            target_node_id_str,
+        ];
+        let cmd = CustomCommand::new("CLUSTER", None, false);
+        let _: String = self.client.custom(cmd, cmd_args).await?;
+        Ok(())
+    }
+
+    /// Get status of slot migrations using CLUSTER GETSLOTMIGRATIONS.
+    ///
+    /// Returns information about in-progress and recently completed slot migrations.
+    /// Can be called on either source or target node.
+    #[instrument(skip(self))]
+    pub async fn cluster_getslotmigrations(&self) -> Result<String, ValkeyError> {
+        // CLUSTER GETSLOTMIGRATIONS
+        let cmd = CustomCommand::new("CLUSTER", None, false);
+        let response: String = self.client.custom(cmd, vec!["GETSLOTMIGRATIONS"]).await?;
+        Ok(response)
+    }
+
+    /// Cancel all active slot migrations using CLUSTER CANCELSLOTMIGRATIONS.
+    ///
+    /// Cancels all active atomic slot migrations for which this node is the source.
+    /// Can be sent to the whole cluster to cancel all migrations.
+    #[instrument(skip(self))]
+    pub async fn cluster_cancelslotmigrations(&self) -> Result<(), ValkeyError> {
+        // CLUSTER CANCELSLOTMIGRATIONS
+        let cmd = CustomCommand::new("CLUSTER", None, false);
+        let _: String = self.client.custom(cmd, vec!["CANCELSLOTMIGRATIONS"]).await?;
         Ok(())
     }
 

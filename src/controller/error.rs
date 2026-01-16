@@ -65,14 +65,38 @@ impl Error {
     }
 
     /// Get the recommended requeue duration for this error
+    ///
+    /// Uses simple fixed backoff. For exponential backoff, use `requeue_after_with_retry_count()`.
     pub fn requeue_after(&self) -> Duration {
         if self.is_retryable() {
-            // Exponential backoff would be better, but use a simple default for now
             Duration::from_secs(30)
         } else {
             // Don't requeue for non-retryable errors
             Duration::from_secs(3600)
         }
+    }
+
+    /// Get the recommended requeue duration with exponential backoff based on retry count.
+    ///
+    /// # Arguments
+    /// * `retry_count` - Number of times this error has been retried (0 = first retry)
+    ///
+    /// # Returns
+    /// Duration with exponential backoff: base * 2^retry_count, capped at max_backoff
+    pub fn requeue_after_with_retry_count(&self, retry_count: u32) -> Duration {
+        if !self.is_retryable() {
+            // Non-retryable errors: long delay (1 hour)
+            return Duration::from_secs(3600);
+        }
+
+        // Exponential backoff: base * 2^retry_count
+        const BASE_BACKOFF_SECS: u64 = 5; // Start with 5 seconds
+        const MAX_BACKOFF_SECS: u64 = 300; // Cap at 5 minutes
+
+        let backoff_secs = BASE_BACKOFF_SECS.saturating_mul(1 << retry_count.min(6)); // Limit exponent to prevent overflow
+        let backoff_secs = backoff_secs.min(MAX_BACKOFF_SECS);
+
+        Duration::from_secs(backoff_secs)
     }
 }
 

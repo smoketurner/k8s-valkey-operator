@@ -19,8 +19,8 @@ pub use webhooks::{
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
-use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ConfigMap, Service};
+use k8s_openapi::api::apps::v1::StatefulSet;
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, Service};
 use kube::runtime::watcher::Config as WatcherConfig;
 use kube::runtime::{Controller, WatchStreamExt, metadata_watcher, predicates, reflector, watcher};
 use kube::{Api, Client, Resource};
@@ -119,7 +119,8 @@ pub async fn run_controller_scoped(
 
     // Set up APIs for the controller (namespaced or cluster-wide)
     let valkeyclusters: Api<ValkeyCluster> = scoped_api(client.clone(), namespace);
-    let deployments: Api<Deployment> = scoped_api(client.clone(), namespace);
+    let statefulsets: Api<StatefulSet> = scoped_api(client.clone(), namespace);
+    let pods: Api<Pod> = scoped_api(client.clone(), namespace);
     let services: Api<Service> = scoped_api(client.clone(), namespace);
     let configmaps: Api<ConfigMap> = scoped_api(client.clone(), namespace);
 
@@ -131,11 +132,13 @@ pub async fn run_controller_scoped(
 
     // Create and run the controller using for_stream with the pre-filtered stream
     // Memory optimization: Use metadata_watcher for owned resources where we only need to know
-    // they exist/changed (Services, ConfigMaps). Keep full watcher for Deployment
-    // since we read .status.readyReplicas. metadata_watcher returns PartialObjectMeta which only
-    // contains TypeMeta + ObjectMeta, reducing memory and IO.
+    // they exist/changed (Services, ConfigMaps). Use full watcher for StatefulSet and Pods
+    // since we may read their status (e.g., StatefulSet .status.readyReplicas, Pod .status.phase).
+    // metadata_watcher returns PartialObjectMeta which only contains TypeMeta + ObjectMeta,
+    // reducing memory and IO for resources where we only need metadata changes.
     Controller::for_stream(resource_stream, reader)
-        .owns(deployments, watcher_config.clone())
+        .owns(statefulsets, watcher_config.clone()) // Watch StatefulSets (operator creates these)
+        .owns_stream(metadata_watcher(pods, watcher_config.clone()).touched_objects()) // Watch Pods for status changes
         .owns_stream(metadata_watcher(services, watcher_config.clone()).touched_objects())
         .owns_stream(metadata_watcher(configmaps, watcher_config).touched_objects())
         .run(
