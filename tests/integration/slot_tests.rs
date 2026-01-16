@@ -324,11 +324,26 @@ async fn test_slot_stability_during_multiple_scales() {
         .await
         .expect("Should be operational after scale back to 3");
 
-    // Verify final state
-    let final_resource = api
-        .get("multi-scale-test")
-        .await
-        .expect("Should get resource");
+    // Wait for the final state to be stable with exact replica count
+    // This ensures the scale-down has fully completed
+    let final_resource = wait_for_condition(
+        &api,
+        "multi-scale-test",
+        |r| {
+            r.status
+                .as_ref()
+                .map(|s| {
+                    s.phase == ClusterPhase::Running
+                        && s.ready_replicas == total_pods(3, 0)
+                        && s.assigned_slots.contains("16384/16384")
+                })
+                .unwrap_or(false)
+        },
+        EXTENDED_TIMEOUT,
+    )
+    .await
+    .expect("Cluster should stabilize in Running phase with correct replica count");
+
     let status = final_resource.status.expect("Should have status");
 
     assert_eq!(status.phase, ClusterPhase::Running, "Should be Running");

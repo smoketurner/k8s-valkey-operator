@@ -210,11 +210,26 @@ async fn test_concurrent_upgrade_prevention() {
     if let Some(status) = upgrade2_resource.status
         && status.phase == UpgradePhase::Failed
     {
-        // Progress or shard statuses should indicate the validation failure
+        // Error information should be present in one of these fields:
+        // - error_message (for validation failures)
+        // - progress (for in-progress failures)
+        // - shard_statuses errors (for per-shard failures)
+        let has_error_info = status.error_message.is_some()
+            || !status.progress.is_empty()
+            || status.shard_statuses.iter().any(|s| s.error.is_some());
         assert!(
-            !status.progress.is_empty() || status.shard_statuses.iter().any(|s| s.error.is_some()),
+            has_error_info,
             "Failed upgrade should have error information about concurrent upgrade"
         );
+
+        // Verify the error message mentions concurrent upgrade
+        if let Some(ref msg) = status.error_message {
+            assert!(
+                msg.contains("another upgrade") || msg.contains("in progress"),
+                "Error message should mention concurrent upgrade: {}",
+                msg
+            );
+        }
     }
 }
 

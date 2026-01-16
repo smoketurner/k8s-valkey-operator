@@ -14,11 +14,21 @@ use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 
 use valkey_operator::crd::{ClusterPhase, ValkeyCluster, total_pods};
 
+use crate::common::fixtures::ValkeyClusterBuilder;
 use crate::{
     EXTENDED_TIMEOUT, LONG_TIMEOUT, SHORT_TIMEOUT, ScopedOperator, TestNamespace,
     create_auth_secret, init_test, test_cluster_with_config, wait_for_condition,
     wait_for_operational,
 };
+
+/// Helper to create a test ValkeyCluster with persistence enabled.
+fn test_resource_with_persistence(name: &str, masters: i32, replicas: i32) -> ValkeyCluster {
+    ValkeyClusterBuilder::new(name)
+        .masters(masters)
+        .replicas_per_master(replicas)
+        .persistence(true, Some("1Gi"))
+        .build()
+}
 
 /// Test that a single pod failure is detected and recovered.
 #[tokio::test(flavor = "multi_thread")]
@@ -235,7 +245,8 @@ async fn test_degraded_phase_detection() {
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
 
     // Create cluster with 3 masters and 0 replicas = 3 total pods
-    let resource = test_cluster_with_config("degraded-detect-test", 3, 0);
+    // Must use persistence for recovery - without it, new pods can't rejoin the cluster
+    let resource = test_resource_with_persistence("degraded-detect-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");

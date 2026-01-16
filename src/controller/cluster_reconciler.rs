@@ -239,7 +239,18 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     // All pods are in cluster, check ready status
                     let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
 
-                    if ready_replicas >= desired_replicas {
+                    // Check if we have the exact number of ready replicas
+                    // For scale-down, we need to wait for extra pods to terminate
+                    if ready_replicas > desired_replicas {
+                        // Scale-down in progress, wait for StatefulSet to terminate extra pods
+                        debug!(
+                            name = %name,
+                            ready = ready_replicas,
+                            desired = desired_replicas,
+                            "Waiting for scale-down to complete (too many ready pods)"
+                        );
+                        ClusterPhase::Updating
+                    } else if ready_replicas >= desired_replicas {
                         // Check if this update involves scaling (masters count change)
                         let current_masters =
                             get_current_master_count(&obj, &ctx, &namespace).await?;
@@ -295,6 +306,9 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                                 ClusterPhase::Resharding
                             }
                         } else {
+                            // No scaling needed, ready_replicas >= desired_replicas
+                            // Readiness probe verifies cluster_state:ok, so we can
+                            // transition to Running
                             ctx.publish_normal_event(
                                 &obj,
                                 "Updated",
@@ -318,7 +332,14 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             }
         }
         ClusterPhase::Degraded => {
+            // Ensure resources are in sync (may have been modified externally)
+            // This is important for recovery when StatefulSet replicas were manually reduced
+            create_owned_resources(&obj, &ctx, &namespace).await?;
+
             // Check if recovered
+            // For Degraded recovery, we trust the readiness probe (cluster_state:ok)
+            // rather than the full health check, since recovering nodes may be
+            // temporarily marked as pfail/fail while rejoining the cluster
             let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
             let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
             if ready_replicas >= desired_replicas {
@@ -452,14 +473,40 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     )
                     .await;
 
-                    ctx.publish_normal_event(
-                        &obj,
-                        "SlotsAssigned",
-                        "Initializing",
-                        Some("All 16384 hash slots assigned, cluster ready".to_string()),
-                    )
-                    .await;
-                    ClusterPhase::Running
+                    // Verify cluster is healthy before transitioning to Running
+                    // The cluster needs time to propagate slot information to all nodes
+                    match check_cluster_health(&obj, &ctx, &namespace).await {
+                        Ok(health) if health.is_healthy => {
+                            ctx.publish_normal_event(
+                                &obj,
+                                "SlotsAssigned",
+                                "Initializing",
+                                Some("All 16384 hash slots assigned, cluster ready".to_string()),
+                            )
+                            .await;
+                            ClusterPhase::Running
+                        }
+                        Ok(health) => {
+                            // Slots assigned but cluster not yet healthy - wait for propagation
+                            debug!(
+                                name = %name,
+                                slots_assigned = health.slots_assigned,
+                                healthy_masters = health.healthy_masters,
+                                "Slots assigned, waiting for cluster to stabilize"
+                            );
+                            // Stay in AssigningSlots to wait for cluster_state:ok
+                            ClusterPhase::AssigningSlots
+                        }
+                        Err(e) => {
+                            // Health check failed - wait and retry
+                            debug!(
+                                name = %name,
+                                error = %e,
+                                "Health check failed after slot assignment, waiting"
+                            );
+                            ClusterPhase::AssigningSlots
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(name = %name, error = %e, "Slot assignment failed, will retry");
@@ -533,7 +580,38 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                             return Ok(Action::requeue(std::time::Duration::from_secs(5)));
                         }
 
-                        ClusterPhase::Running
+                        // For scale-down, verify the StatefulSet has the correct number
+                        // of ready replicas before transitioning to Running
+                        let desired_replicas =
+                            total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+                        let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace)
+                            .await
+                            .unwrap_or(0);
+
+                        if ready_replicas > desired_replicas {
+                            // Scale-down not complete yet, stay in Updating to wait
+                            info!(
+                                name = %name,
+                                ready = ready_replicas,
+                                desired = desired_replicas,
+                                "Waiting for StatefulSet to scale down"
+                            );
+                            ClusterPhase::Updating
+                        } else if ready_replicas == desired_replicas {
+                            // All pods at desired count and ready (readiness probe passed)
+                            // Readiness probe verifies cluster_state:ok, so we can
+                            // transition to Running without additional health check
+                            ClusterPhase::Running
+                        } else {
+                            // Fewer ready than desired - pods still coming up after scale
+                            debug!(
+                                name = %name,
+                                ready = ready_replicas,
+                                desired = desired_replicas,
+                                "Waiting for pods to become ready after scaling"
+                            );
+                            ClusterPhase::Updating
+                        }
                     } else {
                         warn!(
                             name = %name,
@@ -1139,6 +1217,13 @@ async fn update_status(
     let current_operation = existing_status.and_then(|s| s.current_operation.clone());
     let operation_started_at = existing_status.and_then(|s| s.operation_started_at.clone());
 
+    // Set connection secret to auth secret name when running
+    let connection_secret = if phase == ClusterPhase::Running {
+        Some(obj.spec.auth.secret_ref.name.clone())
+    } else {
+        None
+    };
+
     let status = ValkeyClusterStatus {
         phase,
         ready_nodes: format!("{}/{}", ready_replicas, desired_replicas),
@@ -1150,7 +1235,7 @@ async fn update_status(
         topology,
         valkey_version: Some("9".to_string()),
         connection_endpoint,
-        connection_secret: None,
+        connection_secret,
         tls_secret: Some(tls_secret_name),
         current_operation,
         operation_started_at,
