@@ -104,7 +104,12 @@ impl Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::get_unwrap
+)]
 mod tests {
     use super::*;
 

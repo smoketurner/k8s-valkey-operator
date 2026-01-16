@@ -6,10 +6,10 @@
 use std::time::Duration;
 
 use fred::prelude::*;
+use fred::types::CustomCommand;
 use fred::types::InfoKind;
 use fred::types::cluster::{ClusterFailoverFlag, ClusterResetFlag};
 use fred::types::config::ClusterDiscoveryPolicy;
-use fred::types::CustomCommand;
 use rustls::pki_types::CertificateDer;
 use thiserror::Error;
 use tracing::{debug, info, instrument};
@@ -491,7 +491,7 @@ impl ValkeyClient {
         // For replica: ["slave", master_ip, master_port, state, offset]
         let cmd = CustomCommand::new("ROLE", None, false);
         let response: Value = self.client.custom(cmd, Vec::<&str>::new()).await?;
-        
+
         // Parse the response - ROLE returns an array with role as first element
         // ROLE returns: ["master", offset, [replicas...]] or ["slave", master_ip, master_port, state, offset]
         let role_vec: Vec<Value> = response.convert()?;
@@ -633,7 +633,7 @@ impl ValkeyClient {
     ///
     /// Atomically migrates a range of slots from this node to the target node.
     /// This is the recommended method for slot migration as it's faster, more reliable,
-    /// and prevents data loss compared to legacy CLUSTER SETSLOT method.
+    /// and prevents data loss compared to CLUSTER SETSLOT method.
     ///
     /// # Arguments
     /// * `start_slot` - First slot in the range to migrate
@@ -683,7 +683,10 @@ impl ValkeyClient {
     pub async fn cluster_cancelslotmigrations(&self) -> Result<(), ValkeyError> {
         // CLUSTER CANCELSLOTMIGRATIONS
         let cmd = CustomCommand::new("CLUSTER", None, false);
-        let _: String = self.client.custom(cmd, vec!["CANCELSLOTMIGRATIONS"]).await?;
+        let _: String = self
+            .client
+            .custom(cmd, vec!["CANCELSLOTMIGRATIONS"])
+            .await?;
         Ok(())
     }
 
@@ -824,7 +827,12 @@ fn build_tls_connector(certs: &TlsCertData) -> Result<TlsConnector, ValkeyError>
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::get_unwrap
+)]
 mod tests {
     use super::*;
 

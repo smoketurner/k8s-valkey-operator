@@ -25,20 +25,20 @@ pub enum ParseError {
 
 /// State of the Valkey cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClusterState {
+pub enum ClusterHealthState {
     /// Cluster is healthy and serving requests.
     Ok,
     /// Cluster is in a failed state.
     Fail,
 }
 
-impl FromStr for ClusterState {
+impl FromStr for ClusterHealthState {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_lowercase().as_str() {
-            "ok" => Ok(ClusterState::Ok),
-            "fail" => Ok(ClusterState::Fail),
+            "ok" => Ok(ClusterHealthState::Ok),
+            "fail" => Ok(ClusterHealthState::Fail),
             _ => Err(ParseError::InvalidClusterInfo(format!(
                 "Unknown cluster state: {}",
                 s
@@ -47,11 +47,11 @@ impl FromStr for ClusterState {
     }
 }
 
-impl std::fmt::Display for ClusterState {
+impl std::fmt::Display for ClusterHealthState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClusterState::Ok => write!(f, "ok"),
-            ClusterState::Fail => write!(f, "fail"),
+            ClusterHealthState::Ok => write!(f, "ok"),
+            ClusterHealthState::Fail => write!(f, "fail"),
         }
     }
 }
@@ -60,7 +60,7 @@ impl std::fmt::Display for ClusterState {
 #[derive(Debug, Clone)]
 pub struct ClusterInfo {
     /// Current state of the cluster.
-    pub state: ClusterState,
+    pub state: ClusterHealthState,
     /// Number of hash slots assigned to this node.
     pub slots_assigned: i32,
     /// Number of hash slots that are OK (served by nodes).
@@ -143,7 +143,7 @@ impl ClusterInfo {
 
     /// Check if the cluster is healthy.
     pub fn is_healthy(&self) -> bool {
-        self.state == ClusterState::Ok && self.slots_fail == 0 && self.slots_pfail == 0
+        self.state == ClusterHealthState::Ok && self.slots_fail == 0 && self.slots_pfail == 0
     }
 }
 
@@ -392,7 +392,13 @@ impl ClusterNode {
 
         let cluster_bus_port = addr_parts
             .get(1)
-            .map(|s| s.split(',').next().unwrap_or("").parse().unwrap_or(port + 10000))
+            .map(|s| {
+                s.split(',')
+                    .next()
+                    .unwrap_or("")
+                    .parse()
+                    .unwrap_or(port + 10000)
+            })
             .unwrap_or(port + 10000);
 
         let flags_str = parts
@@ -506,7 +512,12 @@ impl ParsedClusterNodes {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::get_unwrap
+)]
 mod tests {
     use super::*;
 
@@ -525,7 +536,7 @@ cluster_my_epoch:2
 "#;
 
         let parsed = ClusterInfo::parse(info).expect("should parse");
-        assert_eq!(parsed.state, ClusterState::Ok);
+        assert_eq!(parsed.state, ClusterHealthState::Ok);
         assert_eq!(parsed.slots_assigned, 16384);
         assert_eq!(parsed.slots_ok, 16384);
         assert_eq!(parsed.slots_pfail, 0);
@@ -551,7 +562,7 @@ cluster_my_epoch:2
 "#;
 
         let parsed = ClusterInfo::parse(info).expect("should parse");
-        assert_eq!(parsed.state, ClusterState::Fail);
+        assert_eq!(parsed.state, ClusterHealthState::Fail);
         assert!(!parsed.all_slots_assigned());
         assert!(!parsed.is_healthy());
     }

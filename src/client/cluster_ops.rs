@@ -77,36 +77,6 @@ impl ValkeyClient {
         }
     }
 
-    /// Initialize cluster by connecting all nodes via CLUSTER MEET.
-    #[instrument(skip(self))]
-    pub async fn initialize_cluster(
-        &self,
-        node_addresses: &[(String, u16)],
-    ) -> Result<(), ValkeyError> {
-        if node_addresses.is_empty() {
-            return Err(ValkeyError::InvalidConfig(
-                "No node addresses provided".to_string(),
-            ));
-        }
-
-        // Connect first node to all other nodes using CLUSTER MEET
-        info!(
-            nodes = node_addresses.len(),
-            "Initializing cluster with CLUSTER MEET"
-        );
-
-        for (ip, port) in node_addresses.iter().skip(1) {
-            debug!(ip = %ip, port = %port, "Executing CLUSTER MEET");
-            self.cluster_meet(ip, *port).await?;
-        }
-
-        // Give the cluster a moment to stabilize
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        info!("Cluster initialization complete");
-        Ok(())
-    }
-
     /// Get the replication lag for a replica by comparing with master offset.
     ///
     /// Returns the difference between master's `master_repl_offset` and replica's `slave_repl_offset`.
@@ -121,14 +91,20 @@ impl ValkeyClient {
     ) -> Result<i64, ValkeyError> {
         // Get replica's replication info using standardized parser
         let replica_info = self.info(Some(InfoKind::Replication)).await?;
-        let replica_repl_info = ReplicationInfo::parse(&replica_info)
-            .map_err(|e| ValkeyError::Parse(crate::client::types::ParseError::InvalidClusterInfo(e.to_string())))?;
+        let replica_repl_info = ReplicationInfo::parse(&replica_info).map_err(|e| {
+            ValkeyError::Parse(crate::client::types::ParseError::InvalidClusterInfo(
+                e.to_string(),
+            ))
+        })?;
         let replica_offset = replica_repl_info.slave_repl_offset;
 
         // Get master's replication info using standardized parser
         let master_info = master_client.info(Some(InfoKind::Replication)).await?;
-        let master_repl_info = ReplicationInfo::parse(&master_info)
-            .map_err(|e| ValkeyError::Parse(crate::client::types::ParseError::InvalidClusterInfo(e.to_string())))?;
+        let master_repl_info = ReplicationInfo::parse(&master_info).map_err(|e| {
+            ValkeyError::Parse(crate::client::types::ParseError::InvalidClusterInfo(
+                e.to_string(),
+            ))
+        })?;
         let master_offset = master_repl_info.master_repl_offset;
 
         match (replica_offset, master_offset) {
@@ -178,16 +154,22 @@ impl ValkeyClient {
             }
 
             // Parse replica replication info using standardized parser
-            let replica_repl_info = ReplicationInfo::parse(&replica_info)
-                .map_err(|e| ValkeyError::Parse(crate::client::types::ParseError::InvalidClusterInfo(e.to_string())))?;
+            let replica_repl_info = ReplicationInfo::parse(&replica_info).map_err(|e| {
+                ValkeyError::Parse(crate::client::types::ParseError::InvalidClusterInfo(
+                    e.to_string(),
+                ))
+            })?;
             let replica_offset = replica_repl_info.slave_repl_offset;
 
             // Get master's master_repl_offset
             let master_offset: Option<i64> = if let Some(master) = master_client {
                 // Use provided master client
                 let master_info = master.info(Some(InfoKind::Replication)).await?;
-                let master_repl_info = ReplicationInfo::parse(&master_info)
-                    .map_err(|e| ValkeyError::Parse(crate::client::types::ParseError::InvalidClusterInfo(e.to_string())))?;
+                let master_repl_info = ReplicationInfo::parse(&master_info).map_err(|e| {
+                    ValkeyError::Parse(crate::client::types::ParseError::InvalidClusterInfo(
+                        e.to_string(),
+                    ))
+                })?;
                 master_repl_info.master_repl_offset
             } else {
                 // Try to find master from cluster nodes and connect
@@ -217,23 +199,21 @@ impl ValkeyClient {
                 (Some(repl), None) => {
                     // Can't get master offset, fall back to checking replica offsets match
                     // This is less reliable but better than nothing
-                    let read_offset: Option<i64> = replica_info
-                        .lines()
-                        .find_map(|line| {
-                            if line.starts_with("slave_read_repl_offset:") {
-                                line.split(':').nth(1).and_then(|v| v.trim().parse().ok())
-                            } else {
-                                None
-                            }
-                        });
-
-                    if let Some(read) = read_offset {
-                        if read == repl {
-                            info!(
-                                "Replication appears in sync (replica offsets match, master offset unavailable)"
-                            );
-                            return Ok(());
+                    let read_offset: Option<i64> = replica_info.lines().find_map(|line| {
+                        if line.starts_with("slave_read_repl_offset:") {
+                            line.split(':').nth(1).and_then(|v| v.trim().parse().ok())
+                        } else {
+                            None
                         }
+                    });
+
+                    if let Some(read) = read_offset
+                        && read == repl
+                    {
+                        info!(
+                            "Replication appears in sync (replica offsets match, master offset unavailable)"
+                        );
+                        return Ok(());
                     }
 
                     debug!(

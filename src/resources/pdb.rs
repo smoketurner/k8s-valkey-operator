@@ -52,7 +52,12 @@ pub fn generate_pod_disruption_budget(resource: &ValkeyCluster) -> PodDisruption
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::get_unwrap
+)]
 mod tests {
     use super::*;
     use crate::crd::{AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyClusterSpec};

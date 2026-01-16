@@ -129,7 +129,11 @@ async fn test_rollback_restores_original_image() {
         .await
         .expect("Should get cluster");
     let original_version = cluster_resource.spec.image.tag.clone();
-    let target_version = if original_version == "9.0.0" { "9.0.1" } else { "9.0.0" };
+    let target_version = if original_version == "9.0.0" {
+        "9.0.1"
+    } else {
+        "9.0.0"
+    };
 
     // Create upgrade
     let upgrade = test_upgrade("rollback-test", "rollback-target", target_version);
@@ -146,8 +150,7 @@ async fn test_rollback_restores_original_image() {
             r.status
                 .as_ref()
                 .map(|s| {
-                    s.phase == UpgradePhase::InProgress
-                        && s.current_shard > 0
+                    s.phase == UpgradePhase::InProgress && s.current_shard > 0
                         || s.phase.is_terminal()
                 })
                 .unwrap_or(false)
@@ -241,10 +244,18 @@ async fn test_rollback_state_transitions() {
         .await
         .expect("Should get cluster");
     let original_version = cluster_resource.spec.image.tag.clone();
-    let target_version = if original_version == "9.0.0" { "9.0.1" } else { "9.0.0" };
+    let target_version = if original_version == "9.0.0" {
+        "9.0.1"
+    } else {
+        "9.0.0"
+    };
 
     // Create upgrade
-    let upgrade = test_upgrade("rollback-states-test", "rollback-states-target", target_version);
+    let upgrade = test_upgrade(
+        "rollback-states-test",
+        "rollback-states-target",
+        target_version,
+    );
     upgrade_api
         .create(&PostParams::default(), &upgrade)
         .await
@@ -300,8 +311,7 @@ async fn test_rollback_state_transitions() {
                     r.status
                         .as_ref()
                         .map(|s| {
-                            s.phase == UpgradePhase::RolledBack
-                                || s.phase == UpgradePhase::Failed
+                            s.phase == UpgradePhase::RolledBack || s.phase == UpgradePhase::Failed
                         })
                         .unwrap_or(false)
                 },

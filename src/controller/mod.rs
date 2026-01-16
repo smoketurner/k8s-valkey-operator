@@ -8,6 +8,7 @@
 //! - ValkeyUpgrade controller (upgrade_* modules)
 
 // Shared modules
+pub mod common;
 pub mod context;
 pub mod error;
 pub mod status;
@@ -17,6 +18,7 @@ pub mod cluster_init;
 pub mod cluster_reconciler;
 pub mod cluster_state_machine;
 pub mod cluster_validation;
+pub mod operation_coordination;
 
 // ValkeyUpgrade controller
 pub mod upgrade_reconciler;

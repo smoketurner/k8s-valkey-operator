@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jiff::Timestamp;
-use k8s_openapi::api::core::v1::Secret;
 use kube::{
     Api, ResourceExt,
     api::{DeleteParams, ListParams, Patch, PatchParams},
@@ -17,12 +16,13 @@ use kube::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    client::valkey_client::{TlsCertData, ValkeyClient},
     controller::{
         cluster_init::{master_pod_dns_names, replica_pod_dns_names_for_master},
         cluster_reconciler::FIELD_MANAGER,
+        common::{add_finalizer, extract_pod_name, remove_finalizer},
         context::Context,
         error::Error,
+        operation_coordination::{self, OperationType},
     },
     crd::{
         Condition, ShardUpgradeState, ShardUpgradeStatus, UpgradePhase, ValkeyCluster,
@@ -54,7 +54,7 @@ pub async fn reconcile(obj: Arc<ValkeyUpgrade>, ctx: Arc<Context>) -> Result<Act
     // Ensure finalizer is present
     if !obj.finalizers().iter().any(|f| f == UPGRADE_FINALIZER) {
         info!(name = %name, "Adding finalizer");
-        add_finalizer(&api, &name).await?;
+        add_finalizer(&api, &name, UPGRADE_FINALIZER).await?;
         return Ok(Action::requeue(Duration::from_secs(1)));
     }
 
@@ -76,7 +76,12 @@ pub async fn reconcile(obj: Arc<ValkeyUpgrade>, ctx: Arc<Context>) -> Result<Act
         Ok(c) => c,
         Err(e) => {
             let cluster_name = &obj.spec.cluster_ref.name;
-            let cluster_namespace = obj.spec.cluster_ref.namespace.as_deref().unwrap_or(namespace.as_str());
+            let cluster_namespace = obj
+                .spec
+                .cluster_ref
+                .namespace
+                .as_deref()
+                .unwrap_or(namespace.as_str());
             let error_msg = format!(
                 "Failed to get target ValkeyCluster '{}/{}': {}. Verify the cluster exists and the operator has read permissions.",
                 cluster_namespace, cluster_name, e
@@ -162,8 +167,33 @@ async fn handle_pending_phase(
     info!(name = %name, "Starting upgrade validation");
 
     // Validate upgrade spec (including concurrent upgrade check)
-    if let Err(e) = validate_upgrade_spec(&obj.spec, cluster, Some(&obj), Some(ctx), namespace).await {
+    if let Err(e) = validate_upgrade_spec(&obj.spec, cluster, Some(obj), Some(ctx), namespace).await
+    {
         error!(name = %name, error = %e, "Validation failed");
+        update_phase(api, &name, UpgradePhase::Failed, Some(e.to_string())).await?;
+        return Err(e);
+    }
+
+    // Check if cluster allows upgrade operation (no other operations in progress)
+    let cluster_namespace = obj
+        .spec
+        .cluster_ref
+        .namespace
+        .as_deref()
+        .unwrap_or(namespace);
+    let cluster_api: Api<ValkeyCluster> = if cluster_namespace != namespace {
+        Api::namespaced(ctx.client.clone(), cluster_namespace)
+    } else {
+        Api::namespaced(ctx.client.clone(), namespace)
+    };
+    if let Err(e) = operation_coordination::check_operation_allowed(
+        &cluster_api,
+        &obj.spec.cluster_ref.name,
+        OperationType::Upgrading,
+    )
+    .await
+    {
+        error!(name = %name, error = %e, "Operation coordination check failed");
         update_phase(api, &name, UpgradePhase::Failed, Some(e.to_string())).await?;
         return Err(e);
     }
@@ -186,7 +216,7 @@ async fn handle_pending_phase(
         observed_generation: obj.metadata.generation,
         ..Default::default()
     };
-    
+
     // Set conditions based on phase
     status.conditions = compute_upgrade_conditions(
         UpgradePhase::PreChecks,
@@ -221,26 +251,33 @@ async fn handle_prechecks_phase(
     let name = obj.name_any();
     info!(name = %name, "Running pre-upgrade health checks");
 
-    // Get password from secret
-    let password = get_auth_password(
-        ctx,
-        namespace,
-        &cluster.spec.auth.secret_ref.name,
-        &cluster.spec.auth.secret_ref.key,
+    // Acquire operation lock for upgrade
+    let cluster_api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), namespace);
+    let cluster_namespace = obj
+        .spec
+        .cluster_ref
+        .namespace
+        .as_deref()
+        .unwrap_or(namespace);
+    let cluster_api: Api<ValkeyCluster> = if cluster_namespace != namespace {
+        Api::namespaced(ctx.client.clone(), cluster_namespace)
+    } else {
+        cluster_api
+    };
+
+    if let Err(e) = operation_coordination::start_operation(
+        &cluster_api,
+        &obj.spec.cluster_ref.name,
+        OperationType::Upgrading,
     )
-    .await?;
+    .await
+    {
+        error!(name = %name, error = %e, "Failed to acquire operation lock for upgrade");
+        update_phase(api, &name, UpgradePhase::Failed, Some(e.to_string())).await?;
+        return Err(e);
+    }
 
-    // Get TLS certificates from secret
-    let tls_certs = get_tls_certs(ctx, namespace, &cluster.name_any()).await?;
-
-    // Connect to cluster and check health
-    let master_pods = master_pod_dns_names(cluster);
-    let (host, port) = master_pods
-        .first()
-        .ok_or_else(|| Error::Validation("No master pods found".to_string()))?;
-    let client = ValkeyClient::connect_single(host, *port, password.as_deref(), tls_certs.as_ref())
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let client = ctx.connect_to_cluster(cluster, namespace, 0).await?;
 
     // Check cluster health - always required before upgrade
     let cluster_info = client
@@ -313,6 +350,27 @@ async fn handle_inprogress_phase(
     // Check if all shards are done
     if current_shard >= total_shards {
         info!(name = %name, "All shards upgraded");
+
+        // Release operation lock when upgrade completes
+        let cluster_api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), namespace);
+        let cluster_namespace = obj
+            .spec
+            .cluster_ref
+            .namespace
+            .as_deref()
+            .unwrap_or(namespace);
+        let cluster_api: Api<ValkeyCluster> = if cluster_namespace != namespace {
+            Api::namespaced(ctx.client.clone(), cluster_namespace)
+        } else {
+            cluster_api
+        };
+        let _ = operation_coordination::complete_operation(
+            &cluster_api,
+            &obj.spec.cluster_ref.name,
+            OperationType::Upgrading,
+        )
+        .await;
+
         let mut new_status = status.clone();
         new_status.phase = UpgradePhase::Completed;
         new_status.progress = format!("{}/{} shards upgraded", total_shards, total_shards);
@@ -382,6 +440,9 @@ async fn handle_inprogress_phase(
             new_status.current_shard = current_shard + 1;
             new_status.upgraded_shards = current_shard + 1;
             new_status.progress = format!("{}/{} shards upgraded", current_shard + 1, total_shards);
+            // Clear sync tracking when moving to next shard
+            new_status.sync_started_at = None;
+            new_status.sync_elapsed_seconds = None;
             new_status.conditions = compute_upgrade_conditions(
                 UpgradePhase::InProgress,
                 new_status.total_shards,
@@ -394,6 +455,25 @@ async fn handle_inprogress_phase(
             Ok(Action::requeue(Duration::from_secs(1)))
         }
         ShardUpgradeState::Failed => {
+            // Release operation lock when upgrade fails
+            let cluster_api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), namespace);
+            let cluster_namespace = obj
+                .spec
+                .cluster_ref
+                .namespace
+                .as_deref()
+                .unwrap_or(namespace);
+            let cluster_api: Api<ValkeyCluster> = if cluster_namespace != namespace {
+                Api::namespaced(ctx.client.clone(), cluster_namespace)
+            } else {
+                cluster_api
+            };
+            let _ = operation_coordination::complete_operation(
+                &cluster_api,
+                &obj.spec.cluster_ref.name,
+                OperationType::Upgrading,
+            )
+            .await;
             // Any shard failure triggers immediate rollback
             info!(name = %name, shard = current_shard, "Shard upgrade failed, initiating rollback");
             let mut new_status = status.clone();
@@ -458,11 +538,11 @@ async fn upgrade_shard_replicas(
 
     for (dns_name, _) in &replica_pods {
         // Extract pod name from DNS name (e.g., "cluster-3.cluster-headless.ns.svc..." -> "cluster-3")
-        let pod_name = dns_name.split('.').next().unwrap_or(dns_name);
+        let pod_name = extract_pod_name(dns_name);
 
         info!(name = %name, pod = %pod_name, "Deleting replica pod to trigger upgrade");
 
-        match pod_api.delete(pod_name, &DeleteParams::default()).await {
+        match pod_api.delete(&pod_name, &DeleteParams::default()).await {
             Ok(_) => {
                 debug!(pod = %pod_name, "Replica pod deleted");
             }
@@ -524,9 +604,9 @@ async fn check_replicas_upgraded(
     let target_image = resolve_target_image(&obj.spec, cluster);
 
     for (dns_name, _) in &replica_pods {
-        let pod_name = dns_name.split('.').next().unwrap_or(dns_name);
+        let pod_name = extract_pod_name(dns_name);
 
-        match pod_api.get(pod_name).await {
+        match pod_api.get(&pod_name).await {
             Ok(pod) => {
                 // Check if pod is ready and has the correct image
                 let is_ready = pod
@@ -572,6 +652,16 @@ async fn check_replicas_upgraded(
     info!(name = %name, shard = shard_index, "All replicas upgraded and ready");
     update_shard_status(api, &name, shard_index, ShardUpgradeState::WaitingForSync).await?;
 
+    // Clear sync tracking from previous shard if any
+    let obj = api.get(&name).await?;
+    if let Some(mut status) = obj.status
+        && status.sync_started_at.is_some()
+    {
+        status.sync_started_at = None;
+        status.sync_elapsed_seconds = None;
+        update_status(api, &name, status).await?;
+    }
+
     Ok(Action::requeue(Duration::from_secs(1)))
 }
 
@@ -601,18 +691,6 @@ async fn wait_for_replication_sync(
         return Ok(Action::requeue(Duration::from_secs(1)));
     }
 
-    // Get password
-    let password = get_auth_password(
-        ctx,
-        namespace,
-        &cluster.spec.auth.secret_ref.name,
-        &cluster.spec.auth.secret_ref.key,
-    )
-    .await?;
-
-    // Get TLS certificates from secret
-    let tls_certs = get_tls_certs(ctx, namespace, &cluster.name_any()).await?;
-
     // Connect to the first replica and check replication status
     let Some((replica_host, replica_port)) = replica_pods.first() else {
         // This shouldn't happen since we checked is_empty above
@@ -622,13 +700,9 @@ async fn wait_for_replication_sync(
             shard_index, master_pod_name
         )));
     };
-    let client = match ValkeyClient::connect_single(
-        replica_host,
-        *replica_port,
-        password.as_deref(),
-        tls_certs.as_ref(),
-    )
-    .await
+    let client = match ctx
+        .connect_to_host(cluster, namespace, replica_host, *replica_port)
+        .await
     {
         Ok(c) => c,
         Err(e) => {
@@ -639,30 +713,72 @@ async fn wait_for_replication_sync(
 
     // Get master pod to connect and compare offsets
     let master_pods = master_pod_dns_names(cluster);
-    let master_client = if let Some((master_host, master_port)) = master_pods.get(shard_index as usize) {
-        // Connect to master to compare offsets
-        match ValkeyClient::connect_single(
-            master_host,
-            *master_port,
-            password.as_deref(),
-            tls_certs.as_ref(),
-        )
-        .await
-        {
-            Ok(c) => Some(c),
-            Err(e) => {
-                debug!(error = %e, "Failed to connect to master for offset comparison");
-                None // Fall back to replica-only check
+    let master_client =
+        if let Some((master_host, master_port)) = master_pods.get(shard_index as usize) {
+            match ctx
+                .connect_to_host(cluster, namespace, master_host, *master_port)
+                .await
+            {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    debug!(error = %e, "Failed to connect to master for offset comparison");
+                    None // Fall back to replica-only check
+                }
             }
-        }
+        } else {
+            None
+        };
+
+    // Get timeout from spec (defaults to 300 seconds if not specified)
+    let sync_timeout_secs = obj.spec.replication_sync_timeout_seconds;
+    let sync_timeout = Duration::from_secs(sync_timeout_secs);
+
+    // Track sync start time if not already set
+    let status = obj
+        .status
+        .as_ref()
+        .ok_or_else(|| Error::MissingField("status".to_string()))?;
+    let sync_started_at = if status.sync_started_at.is_none() {
+        let now = Timestamp::now().to_string();
+        let mut new_status = status.clone();
+        new_status.sync_started_at = Some(now.clone());
+        new_status.sync_elapsed_seconds = Some(0);
+        update_status(api, &name, new_status).await?;
+        Some(now)
     } else {
-        None
+        status.sync_started_at.clone()
     };
 
-    // Always wait for replication sync before failover (5 minute timeout)
+    // Calculate elapsed time if sync started
+    let elapsed_secs = if let Some(started) = sync_started_at.as_ref() {
+        if let Ok(start_time) = started.parse::<Timestamp>() {
+            let now = Timestamp::now();
+            let duration = now.duration_since(start_time);
+            let elapsed = duration.as_secs() as u64;
+            // Update elapsed time in status
+            let mut new_status = status.clone();
+            new_status.sync_elapsed_seconds = Some(elapsed);
+            update_status(api, &name, new_status).await?;
+
+            // Check if timeout exceeded
+            if elapsed >= sync_timeout_secs {
+                let error_msg = format!(
+                    "Replication sync timeout exceeded for shard {}: {} seconds elapsed (timeout: {} seconds). Check replica connectivity and replication lag.",
+                    shard_index, elapsed, sync_timeout_secs
+                );
+                error!(name = %name, shard = shard_index, elapsed = elapsed, timeout = sync_timeout_secs, "Replication sync timeout exceeded");
+                update_shard_status_with_error(api, &name, shard_index, error_msg).await?;
+                return Ok(Action::requeue(Duration::from_secs(1)));
+            }
+            elapsed
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
     // Now compares replica offset with master offset for accurate sync verification
-    const SYNC_TIMEOUT_SECS: u64 = 300;
-    let sync_timeout = Duration::from_secs(SYNC_TIMEOUT_SECS);
     let sync_result = client
         .wait_for_replication_sync(sync_timeout, master_client.as_ref())
         .await;
@@ -675,12 +791,43 @@ async fn wait_for_replication_sync(
 
     match sync_result {
         Ok(()) => {
-            info!(name = %name, shard = shard_index, "Replication synced (compared with master offset), proceeding to failover");
+            info!(name = %name, shard = shard_index, elapsed = elapsed_secs, "Replication synced (compared with master offset), proceeding to failover");
+            // Clear sync tracking when sync completes
+            let mut new_status = status.clone();
+            new_status.sync_started_at = None;
+            new_status.sync_elapsed_seconds = None;
+            update_status(api, &name, new_status).await?;
             update_shard_status(api, &name, shard_index, ShardUpgradeState::FailingOver).await?;
             Ok(Action::requeue(Duration::from_secs(1)))
         }
         Err(e) => {
-            debug!(name = %name, shard = shard_index, error = %e, "Replication not yet synced");
+            let remaining = sync_timeout_secs.saturating_sub(elapsed_secs);
+            let progress_msg = if elapsed_secs > 0 {
+                format!(
+                    "Waiting for replication sync (shard {}): {}s elapsed, {}s remaining (timeout: {}s)",
+                    shard_index, elapsed_secs, remaining, sync_timeout_secs
+                )
+            } else {
+                format!(
+                    "Waiting for replication sync (shard {}): timeout {}s",
+                    shard_index, sync_timeout_secs
+                )
+            };
+            debug!(
+                name = %name,
+                shard = shard_index,
+                error = %e,
+                elapsed = elapsed_secs,
+                remaining = remaining,
+                "Replication not yet synced, will retry"
+            );
+            // Update progress message in status to show timeout progress
+            let mut new_status = status.clone();
+            if !progress_msg.is_empty() {
+                new_status.progress = progress_msg;
+            }
+            update_status(api, &name, new_status).await?;
+            // Requeue with shorter interval to update elapsed time more frequently
             Ok(Action::requeue(Duration::from_secs(5)))
         }
     }
@@ -713,29 +860,15 @@ async fn execute_failover(
         return Ok(Action::requeue(Duration::from_secs(1)));
     }
 
-    // Get password
-    let password = get_auth_password(
-        ctx,
-        namespace,
-        &cluster.spec.auth.secret_ref.name,
-        &cluster.spec.auth.secret_ref.key,
-    )
-    .await?;
-
-    // Get TLS certificates from secret
-    let tls_certs = get_tls_certs(ctx, namespace, &cluster.name_any()).await?;
-
     // Select best replica (lowest replication lag) for failover
     // Connect to master first to get master_repl_offset for comparison
     let master_pods = master_pod_dns_names(cluster);
-    let master_client = if let Some((master_host, master_port)) = master_pods.get(shard_index as usize) {
-        match ValkeyClient::connect_single(
-            master_host,
-            *master_port,
-            password.as_deref(),
-            tls_certs.as_ref(),
-        )
-        .await
+    let master_client = if let Some((master_host, master_port)) =
+        master_pods.get(shard_index as usize)
+    {
+        match ctx
+            .connect_to_host(cluster, namespace, master_host, *master_port)
+            .await
         {
             Ok(c) => Some(c),
             Err(e) => {
@@ -748,18 +881,16 @@ async fn execute_failover(
     };
 
     // Find replica with lowest lag
-    let (best_replica_host, best_replica_port, best_replica_pod_name) = if let Some(master) = &master_client {
+    let (best_replica_host, best_replica_port, best_replica_pod_name) = if let Some(master) =
+        &master_client
+    {
         // Compare all replicas and select the one with lowest lag
         let mut best_replica: Option<(&(String, u16), i64)> = None;
 
         for replica in &replica_pods {
-            match ValkeyClient::connect_single(
-                &replica.0,
-                replica.1,
-                password.as_deref(),
-                tls_certs.as_ref(),
-            )
-            .await
+            match ctx
+                .connect_to_host(cluster, namespace, &replica.0, replica.1)
+                .await
             {
                 Ok(replica_client) => {
                     match replica_client.get_replication_lag(master).await {
@@ -769,11 +900,16 @@ async fn execute_failover(
                                 warn!(replica = %replica.0, lag = lag, "Negative replication lag detected");
                                 continue;
                             }
-                            if best_replica.is_none() || lag < best_replica.unwrap().1 {
-                                let _ = replica_client.close().await;
-                                best_replica = Some((replica, lag));
+                            if let Some((_, best_lag)) = best_replica {
+                                if lag < best_lag {
+                                    let _ = replica_client.close().await;
+                                    best_replica = Some((replica, lag));
+                                } else {
+                                    let _ = replica_client.close().await;
+                                }
                             } else {
                                 let _ = replica_client.close().await;
+                                best_replica = Some((replica, lag));
                             }
                         }
                         Err(e) => {
@@ -789,7 +925,7 @@ async fn execute_failover(
         }
 
         if let Some((replica, lag)) = best_replica {
-            let pod_name = replica.0.split('.').next().unwrap_or(&replica.0);
+            let pod_name = extract_pod_name(&replica.0);
             info!(
                 name = %name,
                 shard = shard_index,
@@ -797,11 +933,13 @@ async fn execute_failover(
                 lag = lag,
                 "Selected replica with lowest replication lag"
             );
-            (replica.0.clone(), replica.1, pod_name.to_string())
+            (replica.0.clone(), replica.1, pod_name)
         } else {
             // Fall back to first replica if we couldn't determine lag
-            let (host, port) = replica_pods.first().unwrap();
-            let pod_name = host.split('.').next().unwrap_or(host);
+            let (host, port) = replica_pods.first().ok_or_else(|| {
+                Error::Validation("No replica pods available for failover".to_string())
+            })?;
+            let pod_name = extract_pod_name(host);
             warn!(
                 name = %name,
                 shard = shard_index,
@@ -811,8 +949,10 @@ async fn execute_failover(
         }
     } else {
         // No master client, just use first replica
-        let (host, port) = replica_pods.first().unwrap();
-        let pod_name = host.split('.').next().unwrap_or(host);
+        let (host, port) = replica_pods.first().ok_or_else(|| {
+            Error::Validation("No replica pods available for failover".to_string())
+        })?;
+        let pod_name = extract_pod_name(host);
         (host.clone(), *port, pod_name.to_string())
     };
 
@@ -832,14 +972,9 @@ async fn execute_failover(
         "Executing CLUSTER FAILOVER"
     );
 
-    let client = ValkeyClient::connect_single(
-        replica_host,
-        replica_port,
-        password.as_deref(),
-        tls_certs.as_ref(),
-    )
-    .await
-    .map_err(|e| Error::Valkey(e.to_string()))?;
+    let client = ctx
+        .connect_to_host(cluster, namespace, replica_host, replica_port)
+        .await?;
 
     // Use WAIT command to ensure writes are replicated before failover
     // This improves consistency by ensuring all writes are replicated to at least 1 replica
@@ -887,7 +1022,7 @@ async fn execute_failover(
             // Verify failover completed - wait up to 30 seconds for promotion
             // According to Valkey docs, manual failover should complete in seconds
             const FAILOVER_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
-            
+
             info!(
                 name = %name,
                 shard = shard_index,
@@ -896,7 +1031,10 @@ async fn execute_failover(
             );
 
             // Get the replica's node ID for verification
-            let nodes = client.cluster_nodes().await.map_err(|e| Error::Valkey(e.to_string()))?;
+            let nodes = client
+                .cluster_nodes()
+                .await
+                .map_err(|e| Error::Valkey(e.to_string()))?;
             let replica_node_id = nodes
                 .nodes
                 .iter()
@@ -908,7 +1046,10 @@ async fn execute_failover(
 
             let failover_verified = if let Some(node_id) = replica_node_id {
                 // Verify using the replica node
-                match client.verify_failover_completed(&node_id, FAILOVER_VERIFY_TIMEOUT).await {
+                match client
+                    .verify_failover_completed(&node_id, FAILOVER_VERIFY_TIMEOUT)
+                    .await
+                {
                     Ok(true) => {
                         info!(
                             name = %name,
@@ -962,17 +1103,16 @@ async fn execute_failover(
             let shard_idx = shard_index as usize;
             if shard_idx >= status.shard_statuses.len() {
                 // Extend shard_statuses if needed (shouldn't happen, but be safe)
-                status.shard_statuses.resize_with(
-                    shard_idx + 1,
-                    || ShardUpgradeStatus {
+                status
+                    .shard_statuses
+                    .resize_with(shard_idx + 1, || ShardUpgradeStatus {
                         shard_index,
                         master_node_id: String::new(),
                         master_pod: String::new(),
                         status: ShardUpgradeState::Pending,
                         promoted_replica: None,
                         error: None,
-                    },
-                );
+                    });
             }
             if let Some(shard) = status.shard_statuses.get_mut(shard_idx) {
                 shard.status = ShardUpgradeState::UpgradingOldMaster;
@@ -1113,123 +1253,6 @@ async fn upgrade_old_master(
     }
 }
 
-/// Handle the rollback phase
-async fn handle_rollback_phase(
-    obj: &ValkeyUpgrade,
-    ctx: &Context,
-    api: &Api<ValkeyUpgrade>,
-    cluster: &ValkeyCluster,
-    namespace: &str,
-) -> Result<Action, Error> {
-    let name = obj.name_any();
-    let cluster_name = cluster.name_any();
-
-    info!(name = %name, "Starting rollback - restoring original image version");
-
-    // Get original image version from status
-    let Some(original_version) = obj
-        .status
-        .as_ref()
-        .and_then(|s| s.current_version.as_ref())
-    else {
-        error!(name = %name, "Cannot rollback: original version not found in status");
-        let mut status = obj.status.clone().unwrap_or_default();
-        status.phase = UpgradePhase::Failed;
-        status.error_message = Some(
-            "Cannot rollback: original image version not found in upgrade status. This may indicate the upgrade status was corrupted. Manual intervention may be required to restore the cluster.".to_string()
-        );
-        status.conditions = compute_upgrade_conditions(
-            UpgradePhase::Failed,
-            status.total_shards,
-            status.upgraded_shards,
-            status.failed_shards,
-            status.error_message.as_deref(),
-            obj.metadata.generation,
-        );
-        update_status(api, &name, status).await?;
-        return Ok(Action::requeue(Duration::from_secs(300)));
-    };
-
-    // Restore the original image in the cluster spec
-    let cluster_api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), namespace);
-    let mut cluster = cluster_api.get(&cluster_name).await?;
-
-    // Update cluster image to original version
-    let original_image_tag = original_version.clone();
-    cluster.spec.image.tag = original_image_tag.clone();
-
-    // Apply the updated cluster spec
-    let patch = serde_json::json!({
-        "spec": {
-            "image": {
-                "tag": original_image_tag
-            }
-        }
-    });
-
-    cluster_api
-        .patch(
-            &cluster_name,
-            &PatchParams::apply(FIELD_MANAGER).force(),
-            &Patch::Merge(&patch),
-        )
-        .await?;
-
-    info!(name = %name, original_version = %original_image_tag, "Updated cluster spec with original image version");
-
-    // Delete all pods to trigger restart with original image
-    // This ensures all pods (masters and replicas) restart with the old image
-    let pod_api: Api<k8s_openapi::api::core::v1::Pod> =
-        Api::namespaced(ctx.client.clone(), namespace);
-    let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
-
-    info!(name = %name, pods = total_pods, "Deleting all pods to trigger restart with original image");
-
-    for i in 0..total_pods {
-        let pod_name = format!("{}-{}", cluster_name, i);
-        match pod_api.delete(&pod_name, &DeleteParams::default()).await {
-            Ok(_) => {
-                debug!(pod = %pod_name, "Pod deleted for rollback");
-            }
-            Err(kube::Error::Api(e)) if e.code == 404 => {
-                debug!(pod = %pod_name, "Pod already deleted");
-            }
-            Err(e) => {
-                warn!(pod = %pod_name, error = %e, "Failed to delete pod during rollback");
-                // Continue with other pods
-            }
-        }
-    }
-
-    // Update status to mark rollback as in progress
-    let mut status = obj.status.clone().unwrap_or_default();
-    status.phase = UpgradePhase::RollingBack;
-    status.progress = format!("Rolling back to version {}", original_image_tag);
-    status.error_message = Some("Upgrade rolled back - restoring original image version".to_string());
-    status.conditions = compute_upgrade_conditions(
-        UpgradePhase::RollingBack,
-        status.total_shards,
-        status.upgraded_shards,
-        status.failed_shards,
-        status.error_message.as_deref(),
-        obj.metadata.generation,
-    );
-    update_status(api, &name, status).await?;
-
-    ctx.publish_upgrade_event(
-        obj,
-        "RollbackStarted",
-        "RollingBack",
-        Some(format!("Rolling back to version {}", original_image_tag)),
-    )
-    .await;
-
-    // Wait for pods to restart and cluster to recover
-    // The cluster reconciler will handle the StatefulSet update and pod recreation
-    info!(name = %name, "Rollback initiated - waiting for cluster to recover");
-    Ok(Action::requeue(Duration::from_secs(30)))
-}
-
 /// Check if rollback has completed - all pods restarted with original image and cluster is healthy
 async fn check_rollback_completion(
     obj: &ValkeyUpgrade,
@@ -1242,10 +1265,7 @@ async fn check_rollback_completion(
     let cluster_name = cluster.name_any();
 
     // Get original image version
-    let Some(original_version) = obj
-        .status
-        .as_ref()
-        .and_then(|s| s.current_version.as_ref())
+    let Some(original_version) = obj.status.as_ref().and_then(|s| s.current_version.as_ref())
     else {
         error!(name = %name, "Cannot check rollback: original version not found");
         let mut status = obj.status.clone().unwrap_or_default();
@@ -1339,22 +1359,7 @@ async fn check_rollback_completion(
     }
 
     // Check cluster health
-    let password = get_auth_password(
-        ctx,
-        namespace,
-        &cluster.spec.auth.secret_ref.name,
-        &cluster.spec.auth.secret_ref.key,
-    )
-    .await?;
-
-    let tls_certs = get_tls_certs(ctx, namespace, &cluster_name).await?;
-
-    let master_pods = master_pod_dns_names(cluster);
-    let (host, port) = master_pods
-        .first()
-        .ok_or_else(|| Error::Validation("No master pods found".to_string()))?;
-
-    let client = match ValkeyClient::connect_single(host, *port, password.as_deref(), tls_certs.as_ref()).await {
+    let client = match ctx.connect_to_cluster(cluster, namespace, 0).await {
         Ok(c) => c,
         Err(e) => {
             debug!(name = %name, error = %e, "Cannot connect to cluster to check health, will retry");
@@ -1383,7 +1388,10 @@ async fn check_rollback_completion(
     let mut status = obj.status.clone().unwrap_or_default();
     status.phase = UpgradePhase::RolledBack;
     status.completed_at = Some(Timestamp::now().to_string());
-    status.progress = format!("Rollback complete - restored to version {}", original_version);
+    status.progress = format!(
+        "Rollback complete - restored to version {}",
+        original_version
+    );
     status.error_message = Some("Upgrade rolled back successfully".to_string());
     status.conditions = compute_upgrade_conditions(
         UpgradePhase::RolledBack,
@@ -1399,7 +1407,10 @@ async fn check_rollback_completion(
         obj,
         "RollbackCompleted",
         "RolledBack",
-        Some(format!("Rollback completed - restored to version {}", original_version)),
+        Some(format!(
+            "Rollback completed - restored to version {}",
+            original_version
+        )),
     )
     .await;
 
@@ -1456,7 +1467,8 @@ async fn validate_upgrade_spec(
     if cluster_phase != crate::crd::ClusterPhase::Running {
         return Err(Error::Validation(format!(
             "Cluster '{}' must be in Running state before upgrade can proceed, but it is currently in {} phase. Wait for the cluster to become healthy or check cluster status for issues.",
-            cluster.name_any(), cluster_phase
+            cluster.name_any(),
+            cluster_phase
         )));
     }
 
@@ -1473,10 +1485,10 @@ async fn validate_upgrade_spec(
                 // Check for other active upgrades targeting the same cluster
                 for upgrade in upgrades.items {
                     // Skip the current upgrade if provided
-                    if let Some(current) = current_upgrade {
-                        if upgrade.name_any() == current.name_any() {
-                            continue;
-                        }
+                    if let Some(current) = current_upgrade
+                        && upgrade.name_any() == current.name_any()
+                    {
+                        continue;
                     }
 
                     // Check if this upgrade targets the same cluster
@@ -1502,7 +1514,9 @@ async fn validate_upgrade_spec(
 
                     let is_active = matches!(
                         phase,
-                        UpgradePhase::PreChecks | UpgradePhase::InProgress | UpgradePhase::RollingBack
+                        UpgradePhase::PreChecks
+                            | UpgradePhase::InProgress
+                            | UpgradePhase::RollingBack
                     );
 
                     if is_active {
@@ -1518,7 +1532,10 @@ async fn validate_upgrade_spec(
             Err(e) => {
                 // If we can't list upgrades (e.g., in test environment), log and continue
                 // This allows validation to proceed in test scenarios
-                debug!("Could not check for concurrent upgrades: {}. Continuing validation.", e);
+                debug!(
+                    "Could not check for concurrent upgrades: {}. Continuing validation.",
+                    e
+                );
             }
         }
     }
@@ -1534,33 +1551,13 @@ fn resolve_target_image(spec: &ValkeyUpgradeSpec, cluster: &ValkeyCluster) -> St
     format!("{}:{}-alpine", repository, spec.target_version)
 }
 
-
 /// Initialize shard statuses from cluster topology
 async fn initialize_shard_statuses(
     cluster: &ValkeyCluster,
     ctx: &Context,
     namespace: &str,
 ) -> Result<Vec<ShardUpgradeStatus>, Error> {
-    let password = get_auth_password(
-        ctx,
-        namespace,
-        &cluster.spec.auth.secret_ref.name,
-        &cluster.spec.auth.secret_ref.key,
-    )
-    .await?;
-
-    // Get TLS certificates from secret
-    let tls_certs = get_tls_certs(ctx, namespace, &cluster.name_any()).await?;
-
-    let master_pods = master_pod_dns_names(cluster);
-    let (host, port) = master_pods
-        .first()
-        .ok_or_else(|| Error::Validation("No master pods found".to_string()))?;
-
-    // Connect to cluster to get topology
-    let client = ValkeyClient::connect_single(host, *port, password.as_deref(), tls_certs.as_ref())
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let client = ctx.connect_to_cluster(cluster, namespace, 0).await?;
 
     let cluster_nodes = client
         .cluster_nodes()
@@ -1586,74 +1583,6 @@ async fn initialize_shard_statuses(
     Ok(shard_statuses)
 }
 
-/// Get password from auth secret
-async fn get_auth_password(
-    ctx: &Context,
-    namespace: &str,
-    secret_name: &str,
-    secret_key: &str,
-) -> Result<Option<String>, Error> {
-    let secret_api: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
-
-    match secret_api.get(secret_name).await {
-        Ok(secret) => {
-            if let Some(data) = secret.data
-                && let Some(password_bytes) = data.get(secret_key)
-            {
-                let password = String::from_utf8(password_bytes.0.clone()).map_err(|e| {
-                    Error::Validation(format!("Invalid password encoding: {}", e))
-                })?;
-                return Ok(Some(password));
-            }
-            Ok(None)
-        }
-        Err(kube::Error::Api(e)) if e.code == 404 => Ok(None),
-        Err(e) => Err(Error::Kube(e)),
-    }
-}
-
-/// Retrieve TLS certificates from the TLS secret created by cert-manager.
-async fn get_tls_certs(
-    ctx: &Context,
-    namespace: &str,
-    cluster_name: &str,
-) -> Result<Option<TlsCertData>, Error> {
-    let secret_name = format!("{}-tls", cluster_name);
-    let secret_api: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
-
-    match secret_api.get(&secret_name).await {
-        Ok(secret) => {
-            if let Some(data) = secret.data {
-                // Get CA certificate - required for verification
-                let ca_cert = match data.get("ca.crt") {
-                    Some(bytes) => bytes.0.clone(),
-                    None => {
-                        warn!(secret = %secret_name, "ca.crt not found in TLS secret");
-                        return Ok(None);
-                    }
-                };
-
-                // Client cert and key are optional (used for mTLS if provided)
-                let client_cert = data.get("tls.crt").map(|b| b.0.clone());
-                let client_key = data.get("tls.key").map(|b| b.0.clone());
-
-                return Ok(Some(TlsCertData {
-                    ca_cert_pem: ca_cert,
-                    client_cert_pem: client_cert,
-                    client_key_pem: client_key,
-                }));
-            }
-            warn!(secret = %secret_name, "TLS secret has no data");
-            Ok(None)
-        }
-        Err(kube::Error::Api(e)) if e.code == 404 => {
-            warn!(secret = %secret_name, "TLS secret not found");
-            Ok(None)
-        }
-        Err(e) => Err(Error::Kube(e)),
-    }
-}
-
 /// Handle deletion of a ValkeyUpgrade
 async fn handle_deletion(
     obj: &ValkeyUpgrade,
@@ -1667,38 +1596,6 @@ async fn handle_deletion(
     remove_finalizer(&api, &name).await?;
 
     Ok(Action::await_change())
-}
-
-/// Add finalizer to upgrade resource
-async fn add_finalizer(api: &Api<ValkeyUpgrade>, name: &str) -> Result<(), Error> {
-    let patch = serde_json::json!({
-        "metadata": {
-            "finalizers": [UPGRADE_FINALIZER]
-        }
-    });
-    api.patch(
-        name,
-        &PatchParams::apply(FIELD_MANAGER),
-        &Patch::Merge(&patch),
-    )
-    .await?;
-    Ok(())
-}
-
-/// Remove finalizer from upgrade resource
-async fn remove_finalizer(api: &Api<ValkeyUpgrade>, name: &str) -> Result<(), Error> {
-    let patch = serde_json::json!({
-        "metadata": {
-            "finalizers": null
-        }
-    });
-    api.patch(
-        name,
-        &PatchParams::apply(FIELD_MANAGER),
-        &Patch::Merge(&patch),
-    )
-    .await?;
-    Ok(())
 }
 
 /// Update the phase of an upgrade
@@ -1767,7 +1664,11 @@ fn compute_upgrade_conditions(
             let is_rolling_back = phase == UpgradePhase::RollingBack;
             conditions.push(Condition::ready(
                 false,
-                if is_rolling_back { "RollingBack" } else { "RolledBack" },
+                if is_rolling_back {
+                    "RollingBack"
+                } else {
+                    "RolledBack"
+                },
                 if is_rolling_back {
                     "Rollback in progress"
                 } else {
@@ -1777,7 +1678,11 @@ fn compute_upgrade_conditions(
             ));
             conditions.push(Condition::progressing(
                 is_rolling_back,
-                if is_rolling_back { "RollingBack" } else { "RolledBack" },
+                if is_rolling_back {
+                    "RollingBack"
+                } else {
+                    "RolledBack"
+                },
                 if is_rolling_back {
                     "Restoring original image version"
                 } else {
@@ -1800,11 +1705,17 @@ fn compute_upgrade_conditions(
                 0
             };
             let has_failures = failed_shards > 0;
-            
+
+            // Note: sync_elapsed_seconds and sync_started_at are not available here
+            // They're tracked in status but we'd need to pass them to this function
+            // For now, just show basic progress
             conditions.push(Condition::ready(
                 false,
                 "Upgrading",
-                &format!("{}/{} shards upgraded ({}%)", upgraded_shards, total_shards, progress_pct),
+                &format!(
+                    "{}/{} shards upgraded ({}%)",
+                    upgraded_shards, total_shards, progress_pct
+                ),
                 generation,
             ));
             conditions.push(Condition::progressing(
@@ -1820,7 +1731,11 @@ fn compute_upgrade_conditions(
             };
             conditions.push(Condition::degraded(
                 has_failures,
-                if has_failures { "ShardFailures" } else { "NoFailures" },
+                if has_failures {
+                    "ShardFailures"
+                } else {
+                    "NoFailures"
+                },
                 &degraded_msg,
                 generation,
             ));
@@ -1885,7 +1800,7 @@ async fn update_phase(
     if let Some(msg) = error_message {
         status.error_message = Some(msg);
     }
-    
+
     // Update conditions based on phase
     status.conditions = compute_upgrade_conditions(
         phase,
@@ -1895,7 +1810,7 @@ async fn update_phase(
         status.error_message.as_deref(),
         obj.metadata.generation,
     );
-    
+
     update_status(api, name, status).await
 }
 
@@ -1931,17 +1846,16 @@ async fn update_shard_status(
     let shard_idx = shard_index as usize;
     if shard_idx >= status.shard_statuses.len() {
         // Extend shard_statuses if needed (shouldn't happen, but be safe)
-        status.shard_statuses.resize_with(
-            shard_idx + 1,
-            || ShardUpgradeStatus {
+        status
+            .shard_statuses
+            .resize_with(shard_idx + 1, || ShardUpgradeStatus {
                 shard_index,
                 master_node_id: String::new(),
                 master_pod: String::new(),
                 status: ShardUpgradeState::Pending,
                 promoted_replica: None,
                 error: None,
-            },
-        );
+            });
     }
 
     if let Some(shard) = status.shard_statuses.get_mut(shard_idx) {
@@ -1972,17 +1886,16 @@ async fn update_shard_status_with_error(
     let shard_idx = shard_index as usize;
     if shard_idx >= status.shard_statuses.len() {
         // Extend shard_statuses if needed (shouldn't happen, but be safe)
-        status.shard_statuses.resize_with(
-            shard_idx + 1,
-            || ShardUpgradeStatus {
+        status
+            .shard_statuses
+            .resize_with(shard_idx + 1, || ShardUpgradeStatus {
                 shard_index,
                 master_node_id: String::new(),
                 master_pod: String::new(),
                 status: ShardUpgradeState::Pending,
                 promoted_replica: None,
                 error: None,
-            },
-        );
+            });
     }
 
     if let Some(shard) = status.shard_statuses.get_mut(shard_idx) {
@@ -2001,7 +1914,12 @@ async fn update_shard_status_with_error(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::get_unwrap
+)]
 mod tests {
     use super::*;
     use crate::crd::{
@@ -2064,6 +1982,7 @@ mod tests {
                 namespace: None,
             },
             target_version: target_version.to_string(),
+            replication_sync_timeout_seconds: 300,
         }
     }
 
@@ -2075,7 +1994,11 @@ mod tests {
     async fn test_validate_upgrade_spec_valid() {
         let spec = create_test_upgrade_spec("9");
         let cluster = create_test_cluster("test", ClusterPhase::Running);
-        assert!(validate_upgrade_spec(&spec, &cluster, None, None, "default").await.is_ok());
+        assert!(
+            validate_upgrade_spec(&spec, &cluster, None, None, "default")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -2239,14 +2162,14 @@ mod tests {
 #[cfg(test)]
 mod upgrade_reconciler_function_tests {
     use super::{compute_upgrade_conditions, resolve_target_image};
-    use crate::crd::{UpgradePhase, ValkeyCluster, ValkeyUpgradeSpec, ClusterReference};
+    use crate::crd::{ClusterReference, UpgradePhase, ValkeyCluster, ValkeyUpgradeSpec};
 
     /// Test resolve_target_image function
     #[test]
     fn test_resolve_target_image() {
         let cluster = create_test_cluster("test-cluster", "valkeyio/valkey", "9.0.0");
         let spec = create_test_upgrade_spec("test-upgrade", "test-cluster", "9.0.1");
-        
+
         let image = resolve_target_image(&spec, &cluster);
         assert_eq!(image, "valkeyio/valkey:9.0.1-alpine");
     }
@@ -2256,7 +2179,7 @@ mod upgrade_reconciler_function_tests {
     fn test_resolve_target_image_custom_repository() {
         let cluster = create_test_cluster("test-cluster", "my-registry/valkey", "9.0.0");
         let spec = create_test_upgrade_spec("test-upgrade", "test-cluster", "9.0.2");
-        
+
         let image = resolve_target_image(&spec, &cluster);
         assert_eq!(image, "my-registry/valkey:9.0.2-alpine");
     }
@@ -2264,25 +2187,37 @@ mod upgrade_reconciler_function_tests {
     /// Test compute_upgrade_conditions for Completed phase
     #[test]
     fn test_compute_conditions_completed() {
-        let conditions = compute_upgrade_conditions(
-            UpgradePhase::Completed,
-            3,
-            3,
-            0,
-            None,
-            Some(1),
-        );
-        
+        let conditions =
+            compute_upgrade_conditions(UpgradePhase::Completed, 3, 3, 0, None, Some(1));
+
         assert_eq!(conditions.len(), 3);
-        
-        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+
+        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Ready"),
+                "Missing Ready condition"
+            );
+            return;
+        };
         assert_eq!(ready.status, "True");
         assert_eq!(ready.reason, "UpgradeCompleted");
-        
-        let progressing = conditions.iter().find(|c| c.r#type == "Progressing").unwrap();
+
+        let Some(progressing) = conditions.iter().find(|c| c.r#type == "Progressing") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Progressing"),
+                "Missing Progressing condition"
+            );
+            return;
+        };
         assert_eq!(progressing.status, "False");
-        
-        let degraded = conditions.iter().find(|c| c.r#type == "Degraded").unwrap();
+
+        let Some(degraded) = conditions.iter().find(|c| c.r#type == "Degraded") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Degraded"),
+                "Missing Degraded condition"
+            );
+            return;
+        };
         assert_eq!(degraded.status, "False");
     }
 
@@ -2290,65 +2225,83 @@ mod upgrade_reconciler_function_tests {
     #[test]
     fn test_compute_conditions_failed() {
         let error_msg = "Cluster health check failed";
-        let conditions = compute_upgrade_conditions(
-            UpgradePhase::Failed,
-            3,
-            1,
-            0,
-            Some(error_msg),
-            Some(1),
-        );
-        
+        let conditions =
+            compute_upgrade_conditions(UpgradePhase::Failed, 3, 1, 0, Some(error_msg), Some(1));
+
         assert_eq!(conditions.len(), 3);
-        
-        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+
+        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Ready"),
+                "Missing Ready condition"
+            );
+            return;
+        };
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "UpgradeFailed");
         assert_eq!(ready.message, error_msg);
-        
-        let degraded = conditions.iter().find(|c| c.r#type == "Degraded").unwrap();
+
+        let Some(degraded) = conditions.iter().find(|c| c.r#type == "Degraded") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Degraded"),
+                "Missing Degraded condition"
+            );
+            return;
+        };
         assert_eq!(degraded.status, "True");
     }
 
     /// Test compute_upgrade_conditions for InProgress phase
     #[test]
     fn test_compute_conditions_in_progress() {
-        let conditions = compute_upgrade_conditions(
-            UpgradePhase::InProgress,
-            6,
-            2,
-            0,
-            None,
-            Some(1),
-        );
-        
+        let conditions =
+            compute_upgrade_conditions(UpgradePhase::InProgress, 6, 2, 0, None, Some(1));
+
         assert_eq!(conditions.len(), 3);
-        
-        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+
+        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Ready"),
+                "Missing Ready condition"
+            );
+            return;
+        };
         assert_eq!(ready.status, "False");
         assert!(ready.message.contains("2/6"));
-        
-        let progressing = conditions.iter().find(|c| c.r#type == "Progressing").unwrap();
+
+        let Some(progressing) = conditions.iter().find(|c| c.r#type == "Progressing") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Progressing"),
+                "Missing Progressing condition"
+            );
+            return;
+        };
         assert_eq!(progressing.status, "True");
         assert!(progressing.message.contains("Upgrading shard"));
-        
-        let degraded = conditions.iter().find(|c| c.r#type == "Degraded").unwrap();
+
+        let Some(degraded) = conditions.iter().find(|c| c.r#type == "Degraded") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Degraded"),
+                "Missing Degraded condition"
+            );
+            return;
+        };
         assert_eq!(degraded.status, "False");
     }
 
     /// Test compute_upgrade_conditions for InProgress with failures
     #[test]
     fn test_compute_conditions_in_progress_with_failures() {
-        let conditions = compute_upgrade_conditions(
-            UpgradePhase::InProgress,
-            6,
-            2,
-            1,
-            None,
-            Some(1),
-        );
-        
-        let degraded = conditions.iter().find(|c| c.r#type == "Degraded").unwrap();
+        let conditions =
+            compute_upgrade_conditions(UpgradePhase::InProgress, 6, 2, 1, None, Some(1));
+
+        let Some(degraded) = conditions.iter().find(|c| c.r#type == "Degraded") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Degraded"),
+                "Missing Degraded condition"
+            );
+            return;
+        };
         assert_eq!(degraded.status, "True");
         assert_eq!(degraded.reason, "ShardFailures");
         assert!(degraded.message.contains("1 shard(s) failed"));
@@ -2357,106 +2310,137 @@ mod upgrade_reconciler_function_tests {
     /// Test compute_upgrade_conditions for RollingBack phase
     #[test]
     fn test_compute_conditions_rolling_back() {
-        let conditions = compute_upgrade_conditions(
-            UpgradePhase::RollingBack,
-            3,
-            1,
-            0,
-            None,
-            Some(1),
-        );
-        
+        let conditions =
+            compute_upgrade_conditions(UpgradePhase::RollingBack, 3, 1, 0, None, Some(1));
+
         assert_eq!(conditions.len(), 3);
-        
-        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+
+        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Ready"),
+                "Missing Ready condition"
+            );
+            return;
+        };
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "RollingBack");
-        
-        let progressing = conditions.iter().find(|c| c.r#type == "Progressing").unwrap();
+
+        let Some(progressing) = conditions.iter().find(|c| c.r#type == "Progressing") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Progressing"),
+                "Missing Progressing condition"
+            );
+            return;
+        };
         assert_eq!(progressing.status, "True");
-        
-        let degraded = conditions.iter().find(|c| c.r#type == "Degraded").unwrap();
+
+        let Some(degraded) = conditions.iter().find(|c| c.r#type == "Degraded") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Degraded"),
+                "Missing Degraded condition"
+            );
+            return;
+        };
         assert_eq!(degraded.status, "True");
     }
 
     /// Test compute_upgrade_conditions for RolledBack phase
     #[test]
     fn test_compute_conditions_rolled_back() {
-        let conditions = compute_upgrade_conditions(
-            UpgradePhase::RolledBack,
-            3,
-            1,
-            0,
-            None,
-            Some(1),
-        );
-        
-        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        let conditions =
+            compute_upgrade_conditions(UpgradePhase::RolledBack, 3, 1, 0, None, Some(1));
+
+        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Ready"),
+                "Missing Ready condition"
+            );
+            return;
+        };
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "RolledBack");
-        
-        let progressing = conditions.iter().find(|c| c.r#type == "Progressing").unwrap();
+
+        let Some(progressing) = conditions.iter().find(|c| c.r#type == "Progressing") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Progressing"),
+                "Missing Progressing condition"
+            );
+            return;
+        };
         assert_eq!(progressing.status, "False");
     }
 
     /// Test compute_upgrade_conditions for PreChecks phase
     #[test]
     fn test_compute_conditions_prechecks() {
-        let conditions = compute_upgrade_conditions(
-            UpgradePhase::PreChecks,
-            3,
-            0,
-            0,
-            None,
-            Some(1),
-        );
-        
+        let conditions =
+            compute_upgrade_conditions(UpgradePhase::PreChecks, 3, 0, 0, None, Some(1));
+
         assert_eq!(conditions.len(), 3);
-        
-        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+
+        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Ready"),
+                "Missing Ready condition"
+            );
+            return;
+        };
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "PreChecks");
-        
-        let progressing = conditions.iter().find(|c| c.r#type == "Progressing").unwrap();
+
+        let Some(progressing) = conditions.iter().find(|c| c.r#type == "Progressing") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Progressing"),
+                "Missing Progressing condition"
+            );
+            return;
+        };
         assert_eq!(progressing.status, "True");
-        assert!(progressing.message.contains("health") || progressing.message.contains("PreChecks"));
+        assert!(
+            progressing.message.contains("health") || progressing.message.contains("PreChecks")
+        );
     }
 
     /// Test compute_upgrade_conditions for Pending phase
     #[test]
     fn test_compute_conditions_pending() {
-        let conditions = compute_upgrade_conditions(
-            UpgradePhase::Pending,
-            3,
-            0,
-            0,
-            None,
-            Some(1),
-        );
-        
+        let conditions = compute_upgrade_conditions(UpgradePhase::Pending, 3, 0, 0, None, Some(1));
+
         assert_eq!(conditions.len(), 3);
-        
-        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+
+        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Ready"),
+                "Missing Ready condition"
+            );
+            return;
+        };
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "Pending");
-        
-        let progressing = conditions.iter().find(|c| c.r#type == "Progressing").unwrap();
+
+        let Some(progressing) = conditions.iter().find(|c| c.r#type == "Progressing") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Progressing"),
+                "Missing Progressing condition"
+            );
+            return;
+        };
         assert_eq!(progressing.status, "False");
     }
 
     /// Test compute_upgrade_conditions with zero shards
     #[test]
     fn test_compute_conditions_zero_shards() {
-        let conditions = compute_upgrade_conditions(
-            UpgradePhase::InProgress,
-            0,
-            0,
-            0,
-            None,
-            Some(1),
-        );
-        
-        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        let conditions =
+            compute_upgrade_conditions(UpgradePhase::InProgress, 0, 0, 0, None, Some(1));
+
+        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+            assert!(
+                conditions.iter().any(|c| c.r#type == "Ready"),
+                "Missing Ready condition"
+            );
+            return;
+        };
         // Should handle zero division gracefully
         assert!(ready.message.contains("0/0"));
     }
@@ -2464,7 +2448,7 @@ mod upgrade_reconciler_function_tests {
     // Helper functions to create test resources
 
     fn create_test_cluster(name: &str, repository: &str, tag: &str) -> ValkeyCluster {
-        serde_json::from_value(serde_json::json!({
+        let cluster_result = serde_json::from_value(serde_json::json!({
             "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
             "kind": "ValkeyCluster",
             "metadata": {
@@ -2491,17 +2475,26 @@ mod upgrade_reconciler_function_tests {
             "status": {
                 "phase": "Running"
             }
-        }))
-        .expect("Failed to create test cluster")
+        }));
+        let Ok(cluster) = cluster_result else {
+            assert!(cluster_result.is_ok(), "Failed to create test cluster");
+            return ValkeyCluster::new(name, crate::crd::ValkeyClusterSpec::default());
+        };
+        cluster
     }
 
-    fn create_test_upgrade_spec(_name: &str, cluster_name: &str, target_version: &str) -> ValkeyUpgradeSpec {
+    fn create_test_upgrade_spec(
+        _name: &str,
+        cluster_name: &str,
+        target_version: &str,
+    ) -> ValkeyUpgradeSpec {
         ValkeyUpgradeSpec {
             cluster_ref: ClusterReference {
                 name: cluster_name.to_string(),
                 namespace: None,
             },
             target_version: target_version.to_string(),
+            replication_sync_timeout_seconds: 300,
         }
     }
 }

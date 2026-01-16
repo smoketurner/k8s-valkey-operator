@@ -35,26 +35,28 @@ pub enum ParseError {
 /// let parsed = parse_info_output(info)?;
 /// assert_eq!(parsed.get("master_repl_offset"), Some("12345"));
 /// ```
-pub fn parse_info_output(info: &str) -> Result<std::collections::HashMap<String, String>, ParseError> {
+pub fn parse_info_output(
+    info: &str,
+) -> Result<std::collections::HashMap<String, String>, ParseError> {
     // Regex for key:value pairs
     // Matches: key:value (where key is word chars, value is anything after colon)
-    let kv_regex = Regex::new(r"^([\w-]+):(.+)$")
-        .map_err(|e| ParseError::RegexCompilation(e.to_string()))?;
+    let kv_regex =
+        Regex::new(r"^([\w-]+):(.+)$").map_err(|e| ParseError::RegexCompilation(e.to_string()))?;
 
     let mut result = std::collections::HashMap::new();
 
     for line in info.lines() {
         let line = line.trim();
-        
+
         // Skip empty lines and section headers
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
-        if let Some(caps) = kv_regex.captures(line) {
-            if let (Some(key), Some(value)) = (caps.get(1), caps.get(2)) {
-                result.insert(key.as_str().to_string(), value.as_str().to_string());
-            }
+        if let Some(caps) = kv_regex.captures(line)
+            && let (Some(key), Some(value)) = (caps.get(1), caps.get(2))
+        {
+            result.insert(key.as_str().to_string(), value.as_str().to_string());
         }
     }
 
@@ -74,8 +76,7 @@ pub fn parse_info_value(info: &str, key: &str) -> Option<String> {
 ///
 /// Returns the parsed integer, or None if not found or invalid.
 pub fn parse_info_int(info: &str, key: &str) -> Option<i64> {
-    parse_info_value(info, key)
-        .and_then(|v| v.trim().parse().ok())
+    parse_info_value(info, key).and_then(|v| v.trim().parse().ok())
 }
 
 /// Parse replication information from INFO REPLICATION output.
@@ -162,7 +163,10 @@ mod tests {
     #[test]
     fn test_parse_info_value() {
         let info = "master_repl_offset:12345\n";
-        assert_eq!(parse_info_value(info, "master_repl_offset"), Some("12345".to_string()));
+        assert_eq!(
+            parse_info_value(info, "master_repl_offset"),
+            Some("12345".to_string())
+        );
         assert_eq!(parse_info_value(info, "nonexistent"), None);
     }
 

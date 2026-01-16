@@ -222,7 +222,12 @@ pub fn extract_ordinal_from_address(address: &str) -> Option<u16> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::get_unwrap
+)]
 mod tests {
     use super::*;
 
@@ -317,7 +322,11 @@ mod tests {
 
         let dist = calculate_distribution(3);
         for (idx, range) in dist.iter().enumerate() {
-            current.add_master(old_nodes.get(idx).unwrap().clone(), idx as u16, range.iter());
+            current.add_master(
+                old_nodes.get(idx).unwrap().clone(),
+                idx as u16,
+                range.iter(),
+            );
         }
 
         // Scale to 6 nodes
@@ -338,7 +347,11 @@ mod tests {
 
         let dist = calculate_distribution(6);
         for (idx, range) in dist.iter().enumerate() {
-            current.add_master(old_nodes.get(idx).unwrap().clone(), idx as u16, range.iter());
+            current.add_master(
+                old_nodes.get(idx).unwrap().clone(),
+                idx as u16,
+                range.iter(),
+            );
         }
 
         // Scale to 3 nodes

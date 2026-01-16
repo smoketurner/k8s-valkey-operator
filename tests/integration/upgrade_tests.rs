@@ -495,7 +495,11 @@ async fn test_upgrade_execution_with_replicas() {
     // Create upgrade to a different version (use a version that exists)
     // Note: In real scenarios, this would be a valid Valkey version
     // For testing, we'll use a version that should trigger the upgrade flow
-    let target_version = if current_version == "9.0.0" { "9.0.1" } else { "9.0.0" };
+    let target_version = if current_version == "9.0.0" {
+        "9.0.1"
+    } else {
+        "9.0.0"
+    };
     let upgrade = test_upgrade("upgrade-exec-test", "upgrade-exec-target", target_version);
     upgrade_api
         .create(&PostParams::default(), &upgrade)

@@ -125,7 +125,11 @@ async fn test_upgrade_fails_on_cluster_health_issue() {
         .await
         .expect("Should get cluster");
     let current_version = cluster_resource.spec.image.tag.clone();
-    let target_version = if current_version == "9.0.0" { "9.0.1" } else { "9.0.0" };
+    let target_version = if current_version == "9.0.0" {
+        "9.0.1"
+    } else {
+        "9.0.0"
+    };
 
     // Create upgrade
     let upgrade = test_upgrade("health-fail-test", "health-fail-target", target_version);
@@ -217,7 +221,11 @@ async fn test_concurrent_upgrade_prevention() {
         .await
         .expect("Should get cluster");
     let current_version = cluster_resource.spec.image.tag.clone();
-    let target_version = if current_version == "9.0.0" { "9.0.1" } else { "9.0.0" };
+    let target_version = if current_version == "9.0.0" {
+        "9.0.1"
+    } else {
+        "9.0.0"
+    };
 
     // Create first upgrade
     let upgrade1 = test_upgrade("concurrent-test-1", "concurrent-target", target_version);
@@ -273,14 +281,14 @@ async fn test_concurrent_upgrade_prevention() {
         .await
         .expect("Should get second upgrade");
 
-    if let Some(status) = upgrade2_resource.status {
-        if status.phase == UpgradePhase::Failed {
-            // Progress or shard statuses should indicate the validation failure
-            assert!(
-                !status.progress.is_empty() || status.shard_statuses.iter().any(|s| s.error.is_some()),
-                "Failed upgrade should have error information about concurrent upgrade"
-            );
-        }
+    if let Some(status) = upgrade2_resource.status
+        && status.phase == UpgradePhase::Failed
+    {
+        // Progress or shard statuses should indicate the validation failure
+        assert!(
+            !status.progress.is_empty() || status.shard_statuses.iter().any(|s| s.error.is_some()),
+            "Failed upgrade should have error information about concurrent upgrade"
+        );
     }
 }
 

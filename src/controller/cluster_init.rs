@@ -261,14 +261,48 @@ pub async fn execute_cluster_meet(
     let client =
         ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
 
+    // Check if nodes are already connected by querying CLUSTER NODES
+    // This makes the operation idempotent - if nodes are already connected, skip MEET
+    let known_ips: std::collections::HashSet<String> = match client.cluster_nodes().await {
+        Ok(nodes) => {
+            // Build set of already-known node IPs from cluster nodes
+            nodes
+                .nodes
+                .iter()
+                .filter_map(|n| {
+                    // Extract IP from address (format: "ip:port@bus-port")
+                    n.address.split(':').next().map(|s| s.to_string())
+                })
+                .collect()
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to get cluster nodes, proceeding with CLUSTER MEET");
+            // If we can't get cluster nodes, proceed with MEET (may be first initialization)
+            std::collections::HashSet::new()
+        }
+    };
+
     // Execute CLUSTER MEET for all other nodes using their IP addresses
+    // Skip nodes that are already known (idempotent operation)
     for (_pod_name, ip, port) in pod_ips.iter().skip(1) {
+        if known_ips.contains(ip) {
+            debug!(ip = %ip, port = %port, "Node already in cluster, skipping CLUSTER MEET");
+            continue;
+        }
+
         debug!(ip = %ip, port = %port, "Executing CLUSTER MEET");
         match client.cluster_meet(ip, *port).await {
             Ok(()) => {
                 debug!(ip = %ip, port = %port, "CLUSTER MEET successful");
             }
             Err(e) => {
+                // CLUSTER MEET may fail if node is already known (idempotent)
+                // Check if error indicates node already connected
+                let error_str = e.to_string().to_lowercase();
+                if error_str.contains("already") || error_str.contains("known") {
+                    debug!(ip = %ip, port = %port, "Node already connected, continuing");
+                    continue;
+                }
                 warn!(ip = %ip, port = %port, error = %e, "CLUSTER MEET failed");
                 return Err(e);
             }
@@ -487,8 +521,58 @@ pub async fn setup_replicas(
                 ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs)
                     .await?;
 
+            // Check if replica is already replicating this master (idempotent operation)
+            let cluster_nodes_replica = replica_client.cluster_nodes().await?;
+            let replica_node = cluster_nodes_replica.nodes.iter().find(|n| {
+                // Match by ordinal - replica pod name matches node
+                let pod_name = pod_name(&cluster.name_any(), replica_ordinal);
+                n.address.contains(&pod_name)
+            });
+
+            let already_replicating = if let Some(node) = replica_node {
+                node.master_id
+                    .as_ref()
+                    .map(|mid| mid == master_node_id)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            if already_replicating {
+                debug!(
+                    master_index = master_index,
+                    replica_index = replica_index,
+                    "Replica already replicating master, skipping CLUSTER REPLICATE"
+                );
+                replica_client.close().await?;
+                continue;
+            }
+
             // Execute CLUSTER REPLICATE to make this node replicate the master
-            replica_client.cluster_replicate(master_node_id).await?;
+            // CLUSTER REPLICATE is idempotent - if already replicating, it returns OK
+            match replica_client.cluster_replicate(master_node_id).await {
+                Ok(()) => {
+                    info!(
+                        master_index = master_index,
+                        replica_index = replica_index,
+                        "Replica configured to replicate master"
+                    );
+                }
+                Err(e) => {
+                    // Check if error indicates already replicating (idempotent)
+                    let error_str = e.to_string().to_lowercase();
+                    if error_str.contains("already") || error_str.contains("replicating") {
+                        debug!(
+                            master_index = master_index,
+                            replica_index = replica_index,
+                            "Replica already replicating, continuing"
+                        );
+                    } else {
+                        replica_client.close().await?;
+                        return Err(e);
+                    }
+                }
+            }
             replica_client.close().await?;
 
             info!(
@@ -638,7 +722,12 @@ pub fn create_connection_strategy(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::get_unwrap
+)]
 mod tests {
     use super::*;
     use crate::crd::{AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyClusterSpec};

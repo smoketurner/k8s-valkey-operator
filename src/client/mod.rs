@@ -18,20 +18,23 @@
 //!
 //! let client = ValkeyClient::connect(&cluster_spec).await?;
 //! let info = client.cluster_info().await?;
-//! if info.state == ClusterState::Ok {
+//! if info.state == ClusterHealthState::Ok {
 //!     println!("Cluster is healthy");
 //! }
 //! ```
 
 pub mod cluster_ops;
+pub mod cluster_state;
 pub mod parsing;
 pub mod scaling;
 pub mod types;
 pub mod valkey_client;
 
+pub use cluster_state::ClusterState;
 pub use parsing::ReplicationInfo;
 pub use scaling::{ScalingContext, ScalingResult};
 pub use types::{
-    ClusterInfo, ClusterNode, ClusterState, NodeFlags, NodeRole, ParsedClusterNodes, SlotRange,
+    ClusterHealthState, ClusterInfo, ClusterNode, NodeFlags, NodeRole, ParsedClusterNodes,
+    SlotRange,
 };
 pub use valkey_client::{TlsCertData, ValkeyClient, ValkeyClientConfig};

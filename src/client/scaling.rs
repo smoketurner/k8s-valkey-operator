@@ -223,11 +223,7 @@ impl ValkeyClient {
             // Round-robin assignment: distribute slot ranges across remaining masters
             let remaining_masters: Vec<&ClusterNode> = masters
                 .iter()
-                .filter(|m| {
-                    !nodes_to_remove
-                        .iter()
-                        .any(|n| n.node_id == m.node_id)
-                })
+                .filter(|m| !nodes_to_remove.iter().any(|n| n.node_id == m.node_id))
                 .copied()
                 .collect();
 
@@ -241,7 +237,11 @@ impl ValkeyClient {
             for (range_idx, range) in slot_ranges.iter().enumerate() {
                 // Round-robin assignment of ranges to remaining masters
                 let dest_idx = range_idx % remaining_masters.len();
-                let dest_node = remaining_masters[dest_idx];
+                let Some(dest_node) = remaining_masters.get(dest_idx) else {
+                    return Err(ValkeyError::InvalidConfig(
+                        "Cannot determine destination master for slot migration".to_string(),
+                    ));
+                };
 
                 info!(
                     from = %node.node_id,
@@ -267,7 +267,7 @@ impl ValkeyClient {
                     .await
                 {
                     Ok(()) => {
-                        result.slots_moved += (range.end - range.start + 1) as i32;
+                        result.slots_moved += range.end - range.start + 1;
                         debug!(
                             range = ?range,
                             "Slot range migration completed"
@@ -364,11 +364,11 @@ impl ValkeyClient {
                                 slots_moved += 1;
                             }
                             Err(e) => {
-                                // If atomic migration fails (e.g., not Valkey 9.0+), fall back to legacy
+                                // If atomic migration fails, fall back to CLUSTER SETSLOT
                                 warn!(
                                     slot = slot,
                                     error = %e,
-                                    "Atomic migration failed, falling back to legacy method"
+                                    "Atomic migration failed, falling back to CLUSTER SETSLOT"
                                 );
                                 self.cluster_setslot(
                                     slot,
@@ -399,8 +399,8 @@ impl ValkeyClient {
 
     /// Migrate a single slot from one node to another.
     ///
-    /// **Deprecated**: Use `migrate_slots_atomic()` for Valkey 9.0+ clusters.
-    /// This method uses legacy CLUSTER SETSLOT which can lose data.
+    /// Use `migrate_slots_atomic()` for Valkey 9.0+ clusters.
+    /// This method uses CLUSTER SETSLOT which can lose data.
     #[instrument(skip(self))]
     pub async fn migrate_slot(
         &self,
@@ -408,8 +408,10 @@ impl ValkeyClient {
         _source_node_id: &str,
         dest_node_id: &str,
     ) -> Result<(), ValkeyError> {
-        // Legacy method - use migrate_slots_atomic() instead for Valkey 9.0+
-        warn!("Using legacy slot migration - consider using migrate_slots_atomic() for Valkey 9.0+");
+        // Use migrate_slots_atomic() instead for Valkey 9.0+
+        warn!(
+            "Using CLUSTER SETSLOT slot migration - consider using migrate_slots_atomic() for Valkey 9.0+"
+        );
         self.cluster_setslot(slot, ClusterSetSlotState::Node(dest_node_id.to_string()))
             .await?;
 
@@ -419,7 +421,7 @@ impl ValkeyClient {
     /// Migrate a range of slots atomically using CLUSTER MIGRATESLOTS (Valkey 9.0+).
     ///
     /// This is the recommended method for slot migration as it's atomic, faster,
-    /// and prevents data loss compared to legacy CLUSTER SETSLOT method.
+    /// and prevents data loss compared to CLUSTER SETSLOT method.
     ///
     /// # Arguments
     /// * `start_slot` - First slot in the range
@@ -478,9 +480,10 @@ impl ValkeyClient {
 
             if let Some(target) = target_node {
                 // Check if target node now owns the slot range
-                let owns_range = target.slots.iter().any(|range| {
-                    range.start <= start_slot as i32 && range.end >= end_slot as i32
-                });
+                let owns_range = target
+                    .slots
+                    .iter()
+                    .any(|range| range.start <= start_slot as i32 && range.end >= end_slot as i32);
 
                 if owns_range {
                     info!(
@@ -506,7 +509,12 @@ impl ValkeyClient {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::get_unwrap
+)]
 mod tests {
     use super::*;
 

@@ -47,6 +47,16 @@ pub struct ValkeyUpgradeSpec {
     /// Target Valkey version (e.g., "9.0.1").
     /// The operator appends "-alpine" and constructs the full image reference.
     pub target_version: String,
+
+    /// Timeout in seconds for waiting for replication sync before failover.
+    /// Defaults to 300 seconds (5 minutes) if not specified.
+    /// This timeout applies per shard during the upgrade process.
+    #[serde(default = "default_replication_sync_timeout")]
+    pub replication_sync_timeout_seconds: u64,
+}
+
+fn default_replication_sync_timeout() -> u64 {
+    300 // 5 minutes default
 }
 
 /// Reference to a ValkeyCluster resource.
@@ -124,6 +134,16 @@ pub struct ValkeyUpgradeStatus {
     /// Error message if upgrade failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+
+    /// Timestamp when replication sync check started for the current shard.
+    /// Used to track timeout progress during WaitingForSync phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_started_at: Option<String>,
+
+    /// Elapsed time in seconds since sync check started.
+    /// Updated during WaitingForSync phase to show timeout progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_elapsed_seconds: Option<u64>,
 }
 
 fn default_current_shard() -> i32 {
@@ -256,7 +276,12 @@ impl UpgradePhase {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::get_unwrap
+)]
 mod tests {
     use super::*;
 
@@ -268,6 +293,7 @@ mod tests {
                 namespace: None,
             },
             target_version: "9.0.1".to_string(),
+            replication_sync_timeout_seconds: 300,
         };
 
         assert_eq!(spec.cluster_ref.name, "my-cluster");

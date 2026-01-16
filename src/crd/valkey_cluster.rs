@@ -545,6 +545,16 @@ pub struct ValkeyClusterStatus {
     /// Name of the Secret containing TLS CA certificate for clients.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_secret: Option<String>,
+
+    /// Current operation in progress (if any).
+    /// Used to coordinate between scaling, upgrade, and initialization operations.
+    /// Values: "initializing", "scaling", "upgrading", or empty if no operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_operation: Option<String>,
+
+    /// Timestamp when current operation started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_started_at: Option<String>,
 }
 
 /// ClusterPhase represents the current lifecycle phase of a ValkeyCluster.
@@ -741,7 +751,12 @@ pub fn total_pods(masters: i32, replicas_per_master: i32) -> i32 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::get_unwrap)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::get_unwrap
+)]
 mod tests {
     use super::*;
 
