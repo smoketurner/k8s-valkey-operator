@@ -6,90 +6,16 @@
 //! - Pod restart verification
 //! - Rollback completion
 
-use std::time::Duration;
-
 use k8s_openapi::api::apps::v1::StatefulSet;
 use kube::api::{Api, PostParams};
 
 use valkey_operator::crd::{UpgradePhase, ValkeyCluster, ValkeyUpgrade};
 
-use crate::fixtures::create_auth_secret;
 use crate::{
-    ScopedOperator, SharedTestCluster, TestNamespace, ensure_cluster_crd_installed,
-    ensure_upgrade_crd_installed, wait_for_condition, wait_for_operational,
+    DEFAULT_TIMEOUT, LONG_TIMEOUT, ScopedOperator, TestNamespace, UPGRADE_TIMEOUT,
+    create_auth_secret, init_test_with_upgrade, test_cluster_with_replicas, test_upgrade,
+    wait_for_condition, wait_for_operational,
 };
-
-/// Long timeout for upgrade and rollback operations.
-const LONG_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Default timeout for most operations.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Initialize tracing and ensure CRD is installed
-async fn init_test() -> std::sync::Arc<SharedTestCluster> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,kube=warn,valkey_operator=debug")
-        .with_test_writer()
-        .try_init();
-
-    let cluster = SharedTestCluster::get()
-        .await
-        .expect("Failed to get cluster");
-
-    ensure_cluster_crd_installed(&cluster)
-        .await
-        .expect("Failed to install ValkeyCluster CRD");
-
-    ensure_upgrade_crd_installed(&cluster)
-        .await
-        .expect("Failed to install ValkeyUpgrade CRD");
-
-    cluster
-}
-
-/// Helper to create a test ValkeyCluster with replicas.
-fn test_cluster_with_replicas(name: &str, replicas_per_master: i32) -> ValkeyCluster {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
-        "kind": "ValkeyCluster",
-        "metadata": {
-            "name": name
-        },
-        "spec": {
-            "masters": 3,
-            "replicasPerMaster": replicas_per_master,
-            "tls": {
-                "issuerRef": {
-                    "name": "selfsigned-issuer"
-                }
-            },
-            "auth": {
-                "secretRef": {
-                    "name": "valkey-auth"
-                }
-            }
-        }
-    }))
-    .expect("Failed to create test cluster")
-}
-
-/// Helper to create a ValkeyUpgrade resource.
-fn test_upgrade(name: &str, cluster_name: &str, target_version: &str) -> ValkeyUpgrade {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
-        "kind": "ValkeyUpgrade",
-        "metadata": {
-            "name": name
-        },
-        "spec": {
-            "clusterRef": {
-                "name": cluster_name
-            },
-            "targetVersion": target_version
-        }
-    }))
-    .expect("Failed to create test upgrade")
-}
 
 /// Test that rollback restores the original image version.
 ///
@@ -100,7 +26,7 @@ fn test_upgrade(name: &str, cluster_name: &str, target_version: &str) -> ValkeyU
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_rollback_restores_original_image() {
-    let cluster = init_test().await;
+    let cluster = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-rollback").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -216,7 +142,7 @@ async fn test_rollback_restores_original_image() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_rollback_state_transitions() {
-    let cluster = init_test().await;
+    let cluster = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-rollback-states").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -315,7 +241,7 @@ async fn test_rollback_state_transitions() {
                         })
                         .unwrap_or(false)
                 },
-                LONG_TIMEOUT,
+                UPGRADE_TIMEOUT,
             )
             .await;
 

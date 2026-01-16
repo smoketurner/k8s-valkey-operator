@@ -5,8 +5,6 @@
 //! - Spec updates and reconciliation
 //! - Resource deletion and cleanup
 
-use std::time::Duration;
-
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
@@ -18,64 +16,11 @@ use crate::assertions::{
     assert_has_owner_reference, assert_headless_service_exists, assert_service_exists,
     assert_statefulset_replicas, assert_valkeycluster_phase,
 };
-use crate::fixtures::create_auth_secret;
 use crate::{
-    ScopedOperator, SharedTestCluster, TestNamespace, ensure_cluster_crd_installed, wait,
-    wait_for_condition, wait_for_operational, wait_for_phase,
+    DEFAULT_TIMEOUT, LONG_TIMEOUT, SHORT_TIMEOUT, ScopedOperator, TestNamespace,
+    create_auth_secret, init_test, test_cluster_with_config, wait, wait_for_condition,
+    wait_for_operational, wait_for_phase,
 };
-
-/// Short timeout for quick operations.
-pub const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Default timeout for most operations.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Long timeout for cluster initialization.
-pub const LONG_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// Initialize tracing and ensure CRD is installed
-async fn init_test() -> std::sync::Arc<SharedTestCluster> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,kube=warn,valkey_operator=debug")
-        .with_test_writer()
-        .try_init();
-
-    let cluster = SharedTestCluster::get()
-        .await
-        .expect("Failed to get cluster");
-
-    ensure_cluster_crd_installed(&cluster)
-        .await
-        .expect("Failed to install ValkeyCluster CRD");
-
-    cluster
-}
-
-/// Helper to create a test ValkeyCluster with the spec structure.
-fn test_resource(name: &str, masters: i32, replicas_per_master: i32) -> ValkeyCluster {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
-        "kind": "ValkeyCluster",
-        "metadata": {
-            "name": name
-        },
-        "spec": {
-            "masters": masters,
-            "replicasPerMaster": replicas_per_master,
-            "tls": {
-                "issuerRef": {
-                    "name": "selfsigned-issuer"
-                }
-            },
-            "auth": {
-                "secretRef": {
-                    "name": "valkey-auth"
-                }
-            }
-        }
-    }))
-    .expect("Failed to create test resource")
-}
 
 /// Test that creating a ValkeyCluster creates the expected StatefulSet.
 #[tokio::test(flavor = "multi_thread")]
@@ -92,7 +37,7 @@ async fn test_creates_statefulset() {
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource with 3 masters and 0 replicas per master = 3 total pods
-    let resource = test_resource("test-sts", 3, 0);
+    let resource = test_cluster_with_config("test-sts", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -130,7 +75,7 @@ async fn test_creates_services() {
     let svc_api: Api<Service> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
-    let resource = test_resource("test-svc", 3, 0);
+    let resource = test_cluster_with_config("test-svc", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -171,7 +116,7 @@ async fn test_creates_pdb() {
     let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
-    let resource = test_resource("test-pdb", 3, 0);
+    let resource = test_cluster_with_config("test-pdb", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -200,7 +145,7 @@ async fn test_phase_transitions() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
-    let resource = test_resource("test-phases", 3, 0);
+    let resource = test_cluster_with_config("test-phases", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -259,7 +204,7 @@ async fn test_resource_becomes_running() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
-    let resource = test_resource("test-running", 3, 0);
+    let resource = test_cluster_with_config("test-running", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -299,7 +244,7 @@ async fn test_resource_deletion() {
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
-    let resource = test_resource("test-delete", 3, 0);
+    let resource = test_cluster_with_config("test-delete", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -320,13 +265,9 @@ async fn test_resource_deletion() {
         .expect("ValkeyCluster should be deleted");
 
     // Verify owned resources are also deleted (via owner references)
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let statefulset_exists = sts_api.get("test-delete").await.is_ok();
-    assert!(
-        !statefulset_exists,
-        "StatefulSet should be garbage collected after ValkeyCluster deletion"
-    );
+    wait::wait_for_deletion(&sts_api, "test-delete", DEFAULT_TIMEOUT)
+        .await
+        .expect("StatefulSet should be garbage collected after ValkeyCluster deletion");
 }
 
 /// Test that validation rejects invalid master counts.
@@ -343,7 +284,7 @@ async fn test_validation_rejects_invalid_masters() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Try to create resource with invalid masters count (2 < minimum of 3)
-    let invalid_resource = test_resource("invalid-masters", 2, 0);
+    let invalid_resource = test_cluster_with_config("invalid-masters", 2, 0);
     let result = api.create(&PostParams::default(), &invalid_resource).await;
 
     // The resource might be created but should transition to Failed phase
@@ -387,7 +328,7 @@ async fn test_observed_generation_updated() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
-    let resource = test_resource("test-gen", 3, 0);
+    let resource = test_cluster_with_config("test-gen", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -428,7 +369,7 @@ async fn test_connection_endpoint_populated() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource
-    let resource = test_resource("test-conn", 3, 0);
+    let resource = test_cluster_with_config("test-conn", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");

@@ -124,6 +124,7 @@ impl ResourceAssertions {
         &self,
         sts_name: &str,
         owner_name: &str,
+        owner_kind: &str,
     ) -> Result<(), AssertionError> {
         let api: Api<StatefulSet> = Api::namespaced(self.client.clone(), &self.namespace);
         let sts = api.get(sts_name).await?;
@@ -134,14 +135,14 @@ impl ResourceAssertions {
             .as_ref()
             .map(|refs| {
                 refs.iter()
-                    .any(|r| r.name == owner_name && r.kind == "PostgresCluster")
+                    .any(|r| r.name == owner_name && r.kind == owner_kind)
             })
             .unwrap_or(false);
 
         if !has_ref {
             return Err(AssertionError::MissingOwnerReference {
                 resource: sts_name.to_string(),
-                expected_owner: owner_name.to_string(),
+                expected_owner: format!("{owner_kind} {owner_name}"),
             });
         }
 
@@ -159,13 +160,12 @@ impl ResourceAssertions {
         let cm = api.get(name).await?;
 
         let content = cm.data.as_ref().and_then(|d| d.get(key)).ok_or_else(|| {
-            AssertionError::ConfigMapContentMissing(format!("Key '{}' not found", key))
+            AssertionError::ConfigMapContentMissing(format!("Key '{key}' not found"))
         })?;
 
         if !content.contains(expected_content) {
             return Err(AssertionError::ConfigMapContentMissing(format!(
-                "Expected '{}' in ConfigMap key '{}', got: {}",
-                expected_content, key, content
+                "Expected '{expected_content}' in ConfigMap key '{key}', got: {content}"
             )));
         }
 

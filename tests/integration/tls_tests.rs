@@ -6,87 +6,14 @@
 //! - TLS secret name is exposed in cluster status
 //! - Auth secret is referenced correctly
 
-use std::time::Duration;
-
-use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, PostParams};
 
 use valkey_operator::crd::ValkeyCluster;
 
 use crate::{
-    ScopedOperator, SharedTestCluster, TestNamespace, ensure_cluster_crd_installed,
-    wait_for_condition, wait_for_operational,
+    DEFAULT_TIMEOUT, LONG_TIMEOUT, ScopedOperator, TestNamespace, create_auth_secret_with_name,
+    init_test, test_cluster, wait_for_condition, wait_for_operational,
 };
-
-/// Long timeout for cluster operations.
-const LONG_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// Default timeout for most operations.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Initialize tracing and ensure CRD is installed
-async fn init_test() -> std::sync::Arc<SharedTestCluster> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,kube=warn,valkey_operator=debug")
-        .with_test_writer()
-        .try_init();
-
-    let cluster = SharedTestCluster::get()
-        .await
-        .expect("Failed to get cluster");
-
-    ensure_cluster_crd_installed(&cluster)
-        .await
-        .expect("Failed to install ValkeyCluster CRD");
-
-    cluster
-}
-
-/// Helper to create a test ValkeyCluster.
-fn test_resource(name: &str) -> ValkeyCluster {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
-        "kind": "ValkeyCluster",
-        "metadata": {
-            "name": name
-        },
-        "spec": {
-            "masters": 3,
-            "replicasPerMaster": 0,
-            "tls": {
-                "issuerRef": {
-                    "name": "selfsigned-issuer"
-                }
-            },
-            "auth": {
-                "secretRef": {
-                    "name": "valkey-auth"
-                }
-            }
-        }
-    }))
-    .expect("Failed to create test resource")
-}
-
-/// Helper to create the auth secret for tests.
-async fn create_auth_secret(client: kube::Client, namespace: &str, name: &str) {
-    let secrets: Api<Secret> = Api::namespaced(client, namespace);
-
-    let secret: Secret = serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": name
-        },
-        "type": "Opaque",
-        "stringData": {
-            "password": "test-password-123"
-        }
-    }))
-    .expect("Failed to create secret");
-
-    let _ = secrets.create(&PostParams::default(), &secret).await;
-}
 
 /// Test that TLS secret name is populated in cluster status.
 #[tokio::test(flavor = "multi_thread")]
@@ -99,12 +26,12 @@ async fn test_tls_secret_in_status() {
     let ns_name = test_ns.name().to_string();
 
     // Create the auth secret first
-    create_auth_secret(client.clone(), &ns_name, "valkey-auth").await;
+    create_auth_secret_with_name(client.clone(), &ns_name, "valkey-auth").await;
 
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create the cluster
-    let resource = test_resource("tls-status-test");
+    let resource = test_cluster("tls-status-test");
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -146,12 +73,12 @@ async fn test_connection_secret_in_status() {
     let ns_name = test_ns.name().to_string();
 
     // Create the auth secret first
-    create_auth_secret(client.clone(), &ns_name, "valkey-auth").await;
+    create_auth_secret_with_name(client.clone(), &ns_name, "valkey-auth").await;
 
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create the cluster
-    let resource = test_resource("conn-secret-test");
+    let resource = test_cluster("conn-secret-test");
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -195,12 +122,12 @@ async fn test_cluster_operational_with_tls() {
     let ns_name = test_ns.name().to_string();
 
     // Create the auth secret first
-    create_auth_secret(client.clone(), &ns_name, "valkey-auth").await;
+    create_auth_secret_with_name(client.clone(), &ns_name, "valkey-auth").await;
 
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create the cluster
-    let resource = test_resource("tls-operational-test");
+    let resource = test_cluster("tls-operational-test");
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -321,7 +248,7 @@ async fn test_missing_auth_secret_detection() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create cluster referencing non-existent auth secret
-    let resource = test_resource("missing-auth-test");
+    let resource = test_cluster("missing-auth-test");
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");

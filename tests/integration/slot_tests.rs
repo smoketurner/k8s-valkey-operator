@@ -9,72 +9,17 @@
 //! - Slot migration during scale-down
 //! - No data loss during rebalancing operations
 
-use std::time::Duration;
-
 use kube::api::{Api, Patch, PatchParams, PostParams};
 
 use valkey_operator::crd::{ClusterPhase, ValkeyCluster, total_pods};
 use valkey_operator::slots::TOTAL_SLOTS;
 
 use crate::assertions::assert_valkeycluster_phase;
-use crate::fixtures::create_auth_secret;
 use crate::{
-    ScopedOperator, SharedTestCluster, TestNamespace, ensure_cluster_crd_installed,
-    wait_for_condition, wait_for_operational, wait_for_phase,
+    DEFAULT_TIMEOUT, EXTENDED_TIMEOUT, LONG_TIMEOUT, SHORT_TIMEOUT, ScopedOperator, TestNamespace,
+    create_auth_secret, init_test, test_cluster_with_config, wait_for_condition,
+    wait_for_operational, wait_for_phase,
 };
-
-/// Long timeout for cluster operations.
-const LONG_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// Extended timeout for slot migration operations.
-const EXTENDED_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Short timeout for quick checks.
-const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Initialize tracing and ensure CRD is installed
-async fn init_test() -> std::sync::Arc<SharedTestCluster> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,kube=warn,valkey_operator=debug")
-        .with_test_writer()
-        .try_init();
-
-    let cluster = SharedTestCluster::get()
-        .await
-        .expect("Failed to get cluster");
-
-    ensure_cluster_crd_installed(&cluster)
-        .await
-        .expect("Failed to install ValkeyCluster CRD");
-
-    cluster
-}
-
-/// Helper to create a test ValkeyCluster.
-fn test_resource(name: &str, masters: i32, replicas_per_master: i32) -> ValkeyCluster {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
-        "kind": "ValkeyCluster",
-        "metadata": {
-            "name": name
-        },
-        "spec": {
-            "masters": masters,
-            "replicasPerMaster": replicas_per_master,
-            "tls": {
-                "issuerRef": {
-                    "name": "selfsigned-issuer"
-                }
-            },
-            "auth": {
-                "secretRef": {
-                    "name": "valkey-auth"
-                }
-            }
-        }
-    }))
-    .expect("Failed to create test resource")
-}
 
 /// Helper to check if all slots are assigned (16384/16384).
 fn all_slots_assigned(resource: &ValkeyCluster) -> bool {
@@ -99,7 +44,7 @@ async fn test_initial_slot_distribution() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create a 3-master cluster
-    let resource = test_resource("slot-init-test", 3, 0);
+    let resource = test_cluster_with_config("slot-init-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -139,7 +84,7 @@ async fn test_slot_rebalancing_on_scale_up() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create a 3-master cluster
-    let resource = test_resource("slot-rebalance-test", 3, 0);
+    let resource = test_cluster_with_config("slot-rebalance-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -241,7 +186,7 @@ async fn test_slot_migration_on_scale_down() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create a 6-master cluster (larger to scale down)
-    let resource = test_resource("slot-migrate-test", 6, 0);
+    let resource = test_cluster_with_config("slot-migrate-test", 6, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -327,7 +272,7 @@ async fn test_slot_stability_during_multiple_scales() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create a 3-master cluster
-    let resource = test_resource("multi-scale-test", 3, 0);
+    let resource = test_cluster_with_config("multi-scale-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -412,7 +357,7 @@ async fn test_resharding_phase_detection() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create a 3-master cluster
-    let resource = test_resource("reshard-detect-test", 3, 0);
+    let resource = test_cluster_with_config("reshard-detect-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -437,7 +382,7 @@ async fn test_resharding_phase_detection() {
         &api,
         "reshard-detect-test",
         ClusterPhase::Resharding,
-        Duration::from_secs(60),
+        DEFAULT_TIMEOUT,
     )
     .await;
 

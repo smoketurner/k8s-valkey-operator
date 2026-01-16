@@ -55,9 +55,10 @@ where
     F: Fn(&K) -> bool,
 {
     let watch_future = async {
+        let field_selector = format!("metadata.name={name}");
         let mut stream = watcher::watcher(
             api.clone(),
-            watcher::Config::default().fields(&format!("metadata.name={}", name)),
+            watcher::Config::default().fields(&field_selector),
         )
         .boxed();
 
@@ -132,9 +133,10 @@ where
         }
 
         // Watch for deletion
+        let field_selector = format!("metadata.name={name}");
         let mut stream = watcher::watcher(
             api.clone(),
-            watcher::Config::default().fields(&format!("metadata.name={}", name)),
+            watcher::Config::default().fields(&field_selector),
         )
         .boxed();
 

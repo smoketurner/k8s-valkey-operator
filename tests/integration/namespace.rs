@@ -37,7 +37,7 @@ impl TestNamespace {
     /// The namespace name will be `{prefix}-{uuid}` to ensure uniqueness.
     pub async fn create(client: Client, prefix: &str) -> Self {
         let suffix = Uuid::new_v4().to_string()[..8].to_string();
-        let name = format!("{}-{}", prefix, suffix);
+        let name = format!("{prefix}-{suffix}");
 
         let ns_api: Api<Namespace> = Api::all(client.clone());
 

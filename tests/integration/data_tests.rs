@@ -11,91 +11,24 @@
 use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{Pod, Secret};
+use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 
 use valkey_operator::crd::{ClusterPhase, ValkeyCluster};
 
+use crate::common::fixtures::ValkeyClusterBuilder;
 use crate::{
-    ScopedOperator, SharedTestCluster, TestNamespace, ensure_cluster_crd_installed,
-    wait_for_condition, wait_for_operational, wait_for_resource,
+    DEFAULT_TIMEOUT, EXTENDED_TIMEOUT, LONG_TIMEOUT, ScopedOperator, TestNamespace,
+    create_auth_secret, init_test, wait_for_condition, wait_for_operational, wait_for_resource,
 };
 
-/// Long timeout for cluster operations.
-const LONG_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// Extended timeout for data-intensive operations.
-const EXTENDED_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Default timeout for most operations.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Initialize tracing and ensure CRD is installed
-async fn init_test() -> std::sync::Arc<SharedTestCluster> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,kube=warn,valkey_operator=debug")
-        .with_test_writer()
-        .try_init();
-
-    let cluster = SharedTestCluster::get()
-        .await
-        .expect("Failed to get cluster");
-
-    ensure_cluster_crd_installed(&cluster)
-        .await
-        .expect("Failed to install ValkeyCluster CRD");
-
-    cluster
-}
-
 /// Helper to create a test ValkeyCluster with persistence enabled.
-fn test_resource(name: &str, masters: i32, replicas: i32) -> ValkeyCluster {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
-        "kind": "ValkeyCluster",
-        "metadata": {
-            "name": name
-        },
-        "spec": {
-            "masters": masters,
-            "replicasPerMaster": replicas,
-            "tls": {
-                "issuerRef": {
-                    "name": "selfsigned-issuer"
-                }
-            },
-            "auth": {
-                "secretRef": {
-                    "name": "valkey-auth"
-                }
-            },
-            "persistence": {
-                "enabled": true,
-                "size": "1Gi"
-            }
-        }
-    }))
-    .expect("Failed to create test resource")
-}
-
-/// Helper to create the auth secret.
-async fn create_auth_secret(client: kube::Client, namespace: &str) {
-    let secrets: Api<Secret> = Api::namespaced(client, namespace);
-
-    let secret: Secret = serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": "valkey-auth"
-        },
-        "type": "Opaque",
-        "stringData": {
-            "password": "test-password-123"
-        }
-    }))
-    .expect("Failed to create secret");
-
-    let _ = secrets.create(&PostParams::default(), &secret).await;
+fn test_resource_with_persistence(name: &str, masters: i32, replicas: i32) -> ValkeyCluster {
+    ValkeyClusterBuilder::new(name)
+        .masters(masters)
+        .replicas_per_master(replicas)
+        .persistence(true, Some("1Gi"))
+        .build()
 }
 
 /// Helper to check if all slots are assigned.
@@ -122,7 +55,7 @@ async fn test_persistence_enabled() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create cluster with persistence
-    let resource = test_resource("persist-test", 3, 0);
+    let resource = test_resource_with_persistence("persist-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -178,7 +111,7 @@ async fn test_data_survives_pod_deletion() {
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns_name);
 
     // Create cluster with persistence and 1 replica per master
-    let resource = test_resource("data-survive-test", 3, 1);
+    let resource = test_resource_with_persistence("data-survive-test", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -256,7 +189,7 @@ async fn test_data_survives_scale_operations() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create initial cluster
-    let resource = test_resource("data-scale-test", 3, 0);
+    let resource = test_resource_with_persistence("data-scale-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -342,7 +275,7 @@ async fn test_recovery_maintains_data() {
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns_name);
 
     // Create cluster with replicas for redundancy
-    let resource = test_resource("data-recovery-test", 3, 1);
+    let resource = test_resource_with_persistence("data-recovery-test", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -420,32 +353,9 @@ async fn test_pvc_size_configuration() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create cluster with specific storage size
-    let resource: ValkeyCluster = serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
-        "kind": "ValkeyCluster",
-        "metadata": {
-            "name": "pvc-size-test"
-        },
-        "spec": {
-            "masters": 3,
-            "replicasPerMaster": 0,
-            "tls": {
-                "issuerRef": {
-                    "name": "selfsigned-issuer"
-                }
-            },
-            "auth": {
-                "secretRef": {
-                    "name": "valkey-auth"
-                }
-            },
-            "persistence": {
-                "enabled": true,
-                "size": "2Gi"
-            }
-        }
-    }))
-    .expect("Failed to create resource");
+    let resource = ValkeyClusterBuilder::new("pvc-size-test")
+        .persistence(true, Some("2Gi"))
+        .build();
 
     api.create(&PostParams::default(), &resource)
         .await

@@ -6,72 +6,17 @@
 //! - Replica scaling (add replicas per master)
 //! - Degraded state handling
 
-use std::time::Duration;
-
 use k8s_openapi::api::apps::v1::StatefulSet;
 use kube::api::{Api, Patch, PatchParams, PostParams};
 
 use valkey_operator::crd::{ClusterPhase, ValkeyCluster, total_pods};
 
 use crate::assertions::assert_statefulset_replicas;
-use crate::fixtures::create_auth_secret;
 use crate::{
-    ScopedOperator, SharedTestCluster, TestNamespace, ensure_cluster_crd_installed,
-    wait_for_condition, wait_for_operational, wait_for_phase,
+    EXTENDED_TIMEOUT, LONG_TIMEOUT, SHORT_TIMEOUT, ScopedOperator, TestNamespace,
+    create_auth_secret, init_test, test_cluster_with_config, wait_for_condition,
+    wait_for_operational, wait_for_phase,
 };
-
-/// Long timeout for scaling operations.
-const LONG_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// Extended timeout for large cluster operations.
-const EXTENDED_TIMEOUT: Duration = Duration::from_secs(240);
-
-/// Short timeout for quick checks.
-const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Initialize tracing and ensure CRD is installed
-async fn init_test() -> std::sync::Arc<SharedTestCluster> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,kube=warn,valkey_operator=debug")
-        .with_test_writer()
-        .try_init();
-
-    let cluster = SharedTestCluster::get()
-        .await
-        .expect("Failed to get cluster");
-
-    ensure_cluster_crd_installed(&cluster)
-        .await
-        .expect("Failed to install ValkeyCluster CRD");
-
-    cluster
-}
-
-/// Helper to create a test ValkeyCluster.
-fn test_resource(name: &str, masters: i32, replicas_per_master: i32) -> ValkeyCluster {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
-        "kind": "ValkeyCluster",
-        "metadata": {
-            "name": name
-        },
-        "spec": {
-            "masters": masters,
-            "replicasPerMaster": replicas_per_master,
-            "tls": {
-                "issuerRef": {
-                    "name": "selfsigned-issuer"
-                }
-            },
-            "auth": {
-                "secretRef": {
-                    "name": "valkey-auth"
-                }
-            }
-        }
-    }))
-    .expect("Failed to create test resource")
-}
 
 /// Test scaling up a ValkeyCluster by adding masters.
 #[tokio::test(flavor = "multi_thread")]
@@ -87,7 +32,7 @@ async fn test_scale_up_masters() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource with 3 masters and 0 replicas = 3 total pods
-    let resource = test_resource("scale-up-test", 3, 0);
+    let resource = test_cluster_with_config("scale-up-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -149,7 +94,7 @@ async fn test_scale_down_masters() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource with 6 masters and 0 replicas = 6 total pods
-    let resource = test_resource("scale-down-test", 6, 0);
+    let resource = test_cluster_with_config("scale-down-test", 6, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -219,7 +164,7 @@ async fn test_scale_up_replicas() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource with 3 masters and 0 replicas = 3 total pods
-    let resource = test_resource("scale-replicas-test", 3, 0);
+    let resource = test_cluster_with_config("scale-replicas-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -300,7 +245,7 @@ async fn test_degraded_state() {
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource with 3 masters and 1 replica per master = 6 total pods
-    let resource = test_resource("degraded-test", 3, 1);
+    let resource = test_cluster_with_config("degraded-test", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -388,7 +333,7 @@ async fn test_recovery_from_degraded() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource with 3 masters and 1 replica per master
-    let resource = test_resource("recovery-test", 3, 1);
+    let resource = test_cluster_with_config("recovery-test", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");

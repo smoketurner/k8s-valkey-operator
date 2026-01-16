@@ -6,104 +6,22 @@
 //! - Validation of invalid upgrades
 //! - Upgrade completion
 
-use std::time::Duration;
-
 use kube::ResourceExt;
 use kube::api::{Api, DeleteParams, PostParams};
 
 use valkey_operator::crd::{UpgradePhase, ValkeyCluster, ValkeyUpgrade};
 
-use crate::fixtures::create_auth_secret;
 use crate::{
-    ScopedOperator, SharedTestCluster, TestNamespace, ensure_cluster_crd_installed,
-    ensure_upgrade_crd_installed, wait_for_condition, wait_for_operational,
+    DEFAULT_TIMEOUT, LONG_TIMEOUT, SHORT_TIMEOUT, ScopedOperator, TestNamespace, UPGRADE_TIMEOUT,
+    create_auth_secret, init_test_with_upgrade, test_cluster, test_cluster_with_replicas,
+    test_upgrade, wait_for_condition, wait_for_operational,
 };
-
-/// Long timeout for upgrade operations.
-const LONG_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// Short timeout for quick checks.
-const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Default timeout for most operations.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Initialize tracing and ensure CRD is installed
-async fn init_test() -> std::sync::Arc<SharedTestCluster> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,kube=warn,valkey_operator=debug")
-        .with_test_writer()
-        .try_init();
-
-    let cluster = SharedTestCluster::get()
-        .await
-        .expect("Failed to get cluster");
-
-    ensure_cluster_crd_installed(&cluster)
-        .await
-        .expect("Failed to install ValkeyCluster CRD");
-
-    ensure_upgrade_crd_installed(&cluster)
-        .await
-        .expect("Failed to install ValkeyUpgrade CRD");
-
-    cluster
-}
-
-/// Helper to create a test ValkeyCluster.
-fn test_cluster(name: &str) -> ValkeyCluster {
-    test_cluster_with_replicas(name, 0)
-}
-
-/// Helper to create a test ValkeyCluster with specified replicas per master.
-fn test_cluster_with_replicas(name: &str, replicas_per_master: i32) -> ValkeyCluster {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
-        "kind": "ValkeyCluster",
-        "metadata": {
-            "name": name
-        },
-        "spec": {
-            "masters": 3,
-            "replicasPerMaster": replicas_per_master,
-            "tls": {
-                "issuerRef": {
-                    "name": "selfsigned-issuer"
-                }
-            },
-            "auth": {
-                "secretRef": {
-                    "name": "valkey-auth"
-                }
-            }
-        }
-    }))
-    .expect("Failed to create test cluster")
-}
-
-/// Helper to create a ValkeyUpgrade resource.
-fn test_upgrade(name: &str, cluster_name: &str, target_version: &str) -> ValkeyUpgrade {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
-        "kind": "ValkeyUpgrade",
-        "metadata": {
-            "name": name
-        },
-        "spec": {
-            "clusterRef": {
-                "name": cluster_name
-            },
-            "targetVersion": target_version
-        }
-    }))
-    .expect("Failed to create test upgrade")
-}
 
 /// Test that creating a ValkeyUpgrade fails when target cluster doesn't exist.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_fails_without_cluster() {
-    let cluster = init_test().await;
+    let cluster = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-no-cluster").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -143,7 +61,7 @@ async fn test_upgrade_fails_without_cluster() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_phase_transitions() {
-    let cluster = init_test().await;
+    let cluster = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-phases").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -200,7 +118,7 @@ async fn test_upgrade_phase_transitions() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_status_initialization() {
-    let cluster = init_test().await;
+    let cluster = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-status").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -272,7 +190,7 @@ async fn test_upgrade_status_initialization() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_observed_generation() {
-    let cluster = init_test().await;
+    let cluster = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-gen").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -311,7 +229,7 @@ async fn test_upgrade_observed_generation() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_finalizer_added() {
-    let cluster = init_test().await;
+    let cluster = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-finalizer").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -347,7 +265,7 @@ async fn test_upgrade_finalizer_added() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_deletion() {
-    let cluster = init_test().await;
+    let cluster = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-delete").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -389,7 +307,7 @@ async fn test_upgrade_deletion() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_progress_tracking() {
-    let cluster = init_test().await;
+    let cluster = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-progress").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -463,7 +381,7 @@ async fn test_upgrade_progress_tracking() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Kubernetes cluster with operator running"]
 async fn test_upgrade_execution_with_replicas() {
-    let cluster = init_test().await;
+    let cluster = init_test_with_upgrade().await;
     let client = cluster.new_client().await.expect("create client");
     let test_ns = TestNamespace::create(client.clone(), "upgrade-exec").await;
     let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
@@ -551,7 +469,7 @@ async fn test_upgrade_execution_with_replicas() {
                 })
                 .unwrap_or(false)
         },
-        LONG_TIMEOUT * 2, // Upgrades can take a long time
+        UPGRADE_TIMEOUT, // Upgrades can take a long time
     )
     .await;
 

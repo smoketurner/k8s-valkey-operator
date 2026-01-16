@@ -2,6 +2,12 @@
 //!
 //! These tests run without a Kubernetes cluster and test individual
 //! components in isolation.
+//!
+//! Test code is allowed to use expect() for error handling
+#![allow(clippy::expect_used)]
+
+#[path = "../common/mod.rs"]
+mod common;
 
 mod crd_tests {
     use valkey_operator::crd::{ClusterPhase, Condition};
@@ -193,7 +199,9 @@ mod error_tests {
 }
 
 mod status_tests {
-    use valkey_operator::controller::status::{ConditionBuilder, is_condition_true};
+    use valkey_operator::controller::status::{
+        ConditionBuilder, get_condition_reason, is_condition_true,
+    };
     use valkey_operator::crd::Condition;
 
     #[test]
@@ -224,5 +232,447 @@ mod status_tests {
     fn test_is_condition_true_missing() {
         let conditions: Vec<Condition> = vec![];
         assert!(!is_condition_true(&conditions, "Ready"));
+    }
+
+    #[test]
+    fn test_get_condition_reason() {
+        let mut builder = ConditionBuilder::new();
+        builder.ready(true, "AllReady", "Components ready", Some(1));
+        builder.degraded(false, "Healthy", "All healthy", Some(1));
+        let conditions = builder.build();
+
+        assert_eq!(get_condition_reason(&conditions, "Ready"), Some("AllReady"));
+        assert_eq!(
+            get_condition_reason(&conditions, "Degraded"),
+            Some("Healthy")
+        );
+        assert_eq!(get_condition_reason(&conditions, "Missing"), None);
+    }
+
+    #[test]
+    fn test_condition_builder_default() {
+        let builder = ConditionBuilder::default();
+        let conditions = builder.build();
+        assert!(conditions.is_empty());
+    }
+
+    #[test]
+    fn test_condition_builder_all_types() {
+        let mut builder = ConditionBuilder::new();
+        builder.ready(true, "Ready", "Ready", Some(1));
+        builder.progressing(true, "Progressing", "Progressing", Some(1));
+        builder.degraded(false, "NotDegraded", "Not degraded", Some(1));
+        let conditions = builder.build();
+
+        assert_eq!(conditions.len(), 3);
+        assert!(is_condition_true(&conditions, "Ready"));
+        assert!(is_condition_true(&conditions, "Progressing"));
+        assert!(!is_condition_true(&conditions, "Degraded"));
+    }
+}
+
+mod builder_tests {
+    use crate::common::fixtures::ValkeyClusterBuilder;
+    use crate::common::fixtures::ValkeyUpgradeBuilder;
+
+    #[test]
+    fn test_valkey_cluster_builder_all_options() {
+        let resource = ValkeyClusterBuilder::new("test-cluster")
+            .namespace("test-ns")
+            .masters(6)
+            .replicas_per_master(2)
+            .issuer_name("custom-issuer")
+            .secret_name("custom-secret")
+            .label("env", "test")
+            .label("team", "platform")
+            .annotation("description", "Test cluster")
+            .generation(5)
+            .uid("test-uid-123")
+            .persistence(true, Some("10Gi"))
+            .build();
+
+        assert_eq!(resource.metadata.name.as_deref(), Some("test-cluster"));
+        assert_eq!(resource.metadata.namespace.as_deref(), Some("test-ns"));
+        assert_eq!(resource.spec.masters, 6);
+        assert_eq!(resource.spec.replicas_per_master, 2);
+        assert_eq!(resource.spec.tls.issuer_ref.name, "custom-issuer");
+        assert_eq!(resource.spec.auth.secret_ref.name, "custom-secret");
+        assert_eq!(resource.metadata.generation, Some(5));
+        assert_eq!(resource.metadata.uid, Some("test-uid-123".to_string()));
+        assert!(resource.spec.persistence.enabled);
+        assert_eq!(resource.spec.persistence.size, "10Gi");
+    }
+
+    #[test]
+    fn test_valkey_cluster_builder_persistence_default_size() {
+        let resource = ValkeyClusterBuilder::new("test")
+            .persistence(true, None::<String>)
+            .build();
+
+        assert!(resource.spec.persistence.enabled);
+        assert_eq!(resource.spec.persistence.size, "1Gi");
+    }
+
+    #[test]
+    fn test_valkey_cluster_builder_multiple_labels() {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("env".to_string(), "prod".to_string());
+        labels.insert("region".to_string(), "us-east".to_string());
+
+        let resource = ValkeyClusterBuilder::new("test")
+            .labels(labels.clone())
+            .build();
+
+        assert_eq!(resource.metadata.labels, Some(labels));
+    }
+
+    #[test]
+    fn test_valkey_upgrade_builder() {
+        let upgrade = ValkeyUpgradeBuilder::new("test-upgrade")
+            .namespace("test-ns")
+            .cluster("my-cluster")
+            .cluster_namespace("cluster-ns")
+            .target_version("9.1.0")
+            .replication_sync_timeout(600)
+            .label("env", "test")
+            .annotation("description", "Test upgrade")
+            .build();
+
+        assert_eq!(upgrade.metadata.name.as_deref(), Some("test-upgrade"));
+        assert_eq!(upgrade.metadata.namespace.as_deref(), Some("test-ns"));
+        assert_eq!(upgrade.spec.cluster_ref.name, "my-cluster");
+        assert_eq!(
+            upgrade.spec.cluster_ref.namespace,
+            Some("cluster-ns".to_string())
+        );
+        assert_eq!(upgrade.spec.target_version, "9.1.0");
+        assert_eq!(upgrade.spec.replication_sync_timeout_seconds, 600);
+    }
+
+    #[test]
+    fn test_valkey_upgrade_builder_default_timeout() {
+        let upgrade = ValkeyUpgradeBuilder::new("test-upgrade")
+            .cluster("my-cluster")
+            .target_version("9.1.0")
+            .build();
+
+        assert_eq!(upgrade.spec.replication_sync_timeout_seconds, 300);
+    }
+}
+
+mod common_utils_tests {
+    use valkey_operator::controller::common::extract_pod_name;
+
+    #[test]
+    fn test_extract_pod_name_full_dns() {
+        assert_eq!(
+            extract_pod_name("my-cluster-0.my-cluster-headless.default.svc.cluster.local:6379"),
+            "my-cluster-0"
+        );
+    }
+
+    #[test]
+    fn test_extract_pod_name_short() {
+        assert_eq!(extract_pod_name("my-cluster-0:6379"), "my-cluster-0");
+    }
+
+    #[test]
+    fn test_extract_pod_name_no_port() {
+        assert_eq!(extract_pod_name("my-cluster-0"), "my-cluster-0");
+    }
+
+    #[test]
+    fn test_extract_pod_name_empty() {
+        assert_eq!(extract_pod_name(""), "unknown");
+    }
+
+    #[test]
+    fn test_extract_pod_name_invalid() {
+        assert_eq!(extract_pod_name(":"), "unknown");
+    }
+}
+
+mod crd_utils_tests {
+    use valkey_operator::crd::total_pods;
+
+    #[test]
+    fn test_total_pods_basic() {
+        assert_eq!(total_pods(3, 1), 6); // 3 masters + 3 replicas
+        assert_eq!(total_pods(3, 2), 9); // 3 masters + 6 replicas
+    }
+
+    #[test]
+    fn test_total_pods_no_replicas() {
+        assert_eq!(total_pods(3, 0), 3); // 3 masters only
+    }
+
+    #[test]
+    fn test_total_pods_large_cluster() {
+        assert_eq!(total_pods(10, 2), 30); // 10 masters + 20 replicas
+    }
+}
+
+mod resources_common_tests {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use std::collections::BTreeMap;
+    use valkey_operator::crd::{AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyClusterSpec};
+    use valkey_operator::resources::common::{
+        owner_reference, pod_selector_labels, standard_annotations, standard_labels,
+    };
+
+    fn test_resource(name: &str) -> valkey_operator::crd::ValkeyCluster {
+        valkey_operator::crd::ValkeyCluster {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some("default".to_string()),
+                uid: Some("test-uid".to_string()),
+                ..Default::default()
+            },
+            spec: ValkeyClusterSpec {
+                masters: 3,
+                replicas_per_master: 1,
+                tls: TlsSpec {
+                    issuer_ref: IssuerRef {
+                        name: "test-issuer".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                auth: AuthSpec {
+                    secret_ref: SecretKeyRef {
+                        name: "test-secret".to_string(),
+                        ..Default::default()
+                    },
+                },
+                labels: BTreeMap::new(),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    #[test]
+    fn test_standard_labels_with_custom() {
+        let mut resource = test_resource("my-cluster");
+        resource
+            .spec
+            .labels
+            .insert("env".to_string(), "prod".to_string());
+        resource
+            .spec
+            .labels
+            .insert("team".to_string(), "platform".to_string());
+
+        let labels = standard_labels(&resource);
+
+        assert_eq!(
+            labels.get("app.kubernetes.io/name"),
+            Some(&"my-cluster".to_string())
+        );
+        assert_eq!(labels.get("env"), Some(&"prod".to_string()));
+        assert_eq!(labels.get("team"), Some(&"platform".to_string()));
+    }
+
+    #[test]
+    fn test_standard_annotations() {
+        let mut resource = test_resource("my-cluster");
+        resource
+            .spec
+            .annotations
+            .insert("description".to_string(), "Test cluster".to_string());
+
+        let annotations = standard_annotations(&resource);
+
+        assert_eq!(
+            annotations.get("description"),
+            Some(&"Test cluster".to_string())
+        );
+    }
+
+    #[test]
+    fn test_pod_selector_labels() {
+        let resource = test_resource("my-cluster");
+        let labels = pod_selector_labels(&resource);
+
+        assert_eq!(
+            labels.get("app.kubernetes.io/name"),
+            Some(&"my-cluster".to_string())
+        );
+        assert_eq!(
+            labels.get("app.kubernetes.io/instance"),
+            Some(&"my-cluster".to_string())
+        );
+        assert_eq!(labels.len(), 2); // Only selector labels, not all standard labels
+    }
+
+    #[test]
+    fn test_owner_reference_uid() {
+        let resource = test_resource("my-cluster");
+        let owner_ref = owner_reference(&resource);
+
+        assert_eq!(owner_ref.uid, "test-uid");
+        assert_eq!(owner_ref.controller, Some(true));
+        assert_eq!(owner_ref.block_owner_deletion, Some(true));
+    }
+
+    #[test]
+    fn test_owner_reference_no_uid() {
+        let mut resource = test_resource("my-cluster");
+        resource.metadata.uid = None;
+
+        let owner_ref = owner_reference(&resource);
+
+        assert_eq!(owner_ref.uid, ""); // Should default to empty string
+    }
+}
+
+mod validation_tests {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use std::collections::BTreeMap;
+    use valkey_operator::controller::cluster_validation::{
+        MAX_REPLICAS_PER_MASTER, SpecDiff, generation_changed, validate_spec, validate_spec_change,
+    };
+    use valkey_operator::crd::{
+        AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyCluster, ValkeyClusterSpec,
+        ValkeyClusterStatus,
+    };
+
+    fn create_test_resource(masters: i32, replicas_per_master: i32) -> ValkeyCluster {
+        ValkeyCluster {
+            metadata: ObjectMeta {
+                name: Some("test".to_string()),
+                namespace: Some("default".to_string()),
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: ValkeyClusterSpec {
+                masters,
+                replicas_per_master,
+                tls: TlsSpec {
+                    issuer_ref: IssuerRef {
+                        name: "test-issuer".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                auth: AuthSpec {
+                    secret_ref: SecretKeyRef {
+                        name: "test-secret".to_string(),
+                        ..Default::default()
+                    },
+                },
+                labels: BTreeMap::new(),
+                ..Default::default()
+            },
+            status: Some(ValkeyClusterStatus::default()),
+        }
+    }
+
+    #[test]
+    fn test_validate_replicas_per_master_negative() {
+        let mut resource = create_test_resource(3, -1);
+        resource.spec.replicas_per_master = -1;
+        assert!(validate_spec(&resource).is_err());
+    }
+
+    #[test]
+    fn test_validate_replicas_per_master_too_high() {
+        let mut resource = create_test_resource(3, MAX_REPLICAS_PER_MASTER + 1);
+        resource.spec.replicas_per_master = MAX_REPLICAS_PER_MASTER + 1;
+        assert!(validate_spec(&resource).is_err());
+    }
+
+    #[test]
+    fn test_validate_tls_required() {
+        let mut resource = create_test_resource(3, 1);
+        resource.spec.tls.issuer_ref.name = String::new();
+        assert!(validate_spec(&resource).is_err());
+    }
+
+    #[test]
+    fn test_validate_auth_required() {
+        let mut resource = create_test_resource(3, 1);
+        resource.spec.auth.secret_ref.name = String::new();
+        assert!(validate_spec(&resource).is_err());
+    }
+
+    #[test]
+    fn test_spec_diff_requires_update() {
+        let old = create_test_resource(3, 1);
+        let mut new = create_test_resource(3, 1);
+        new.spec.image.tag = "9.1.0".to_string();
+
+        let diff = validate_spec_change(&old, &new).expect("valid spec change should succeed");
+        assert!(diff.image_changed);
+        assert!(diff.requires_update());
+    }
+
+    #[test]
+    fn test_spec_diff_resources_changed() {
+        let old = create_test_resource(3, 1);
+        let mut new = create_test_resource(3, 1);
+        new.spec.resources.requests.cpu = "2".to_string();
+
+        let diff = validate_spec_change(&old, &new).expect("valid spec change should succeed");
+        assert!(diff.resources_changed);
+        assert!(diff.requires_update());
+    }
+
+    #[test]
+    fn test_spec_diff_labels_changed() {
+        let old = create_test_resource(3, 1);
+        let mut new = create_test_resource(3, 1);
+        new.spec
+            .labels
+            .insert("env".to_string(), "prod".to_string());
+
+        let diff = validate_spec_change(&old, &new).expect("valid spec change should succeed");
+        assert!(diff.labels_changed);
+        assert!(diff.requires_update());
+    }
+
+    #[test]
+    fn test_spec_diff_scale_down_below_minimum() {
+        let old = create_test_resource(3, 1);
+        let new = create_test_resource(2, 1);
+
+        assert!(validate_spec_change(&old, &new).is_err());
+    }
+
+    #[test]
+    fn test_generation_changed_no_status() {
+        let mut resource = create_test_resource(3, 1);
+        resource.metadata.generation = Some(2);
+        resource.status = None;
+
+        assert!(generation_changed(&resource));
+    }
+
+    #[test]
+    fn test_generation_changed_no_generation() {
+        let mut resource = create_test_resource(3, 1);
+        resource.metadata.generation = None;
+        resource.status = Some(ValkeyClusterStatus {
+            observed_generation: Some(1),
+            ..Default::default()
+        });
+
+        assert!(!generation_changed(&resource));
+    }
+
+    #[test]
+    fn test_spec_diff_total_pod_delta_scale_up() {
+        let diff = SpecDiff::default();
+        // Scale up: 3 masters + 1 replica = 6 pods -> 6 masters + 2 replicas = 18 pods
+        let delta = diff.total_pod_delta(3, 1, 6, 2);
+        assert_eq!(delta, 12);
+    }
+
+    #[test]
+    fn test_spec_diff_total_pod_delta_scale_down() {
+        let diff = SpecDiff::default();
+        // Scale down: 6 masters + 2 replicas = 18 pods -> 3 masters + 1 replica = 6 pods
+        let delta = diff.total_pod_delta(6, 2, 3, 1);
+        assert_eq!(delta, -12);
     }
 }

@@ -57,7 +57,6 @@ mod upgrade_tests;
 // Re-export test modules for convenience
 pub use assertions::*;
 pub use cluster::*;
-pub use common::*;
 pub use fixtures::*;
 pub use namespace::*;
 pub use operator::*;

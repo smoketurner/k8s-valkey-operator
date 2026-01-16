@@ -14,64 +14,11 @@ use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 
 use valkey_operator::crd::{ClusterPhase, ValkeyCluster, total_pods};
 
-use crate::fixtures::create_auth_secret;
 use crate::{
-    ScopedOperator, SharedTestCluster, TestNamespace, ensure_cluster_crd_installed,
-    wait_for_condition, wait_for_operational,
+    EXTENDED_TIMEOUT, LONG_TIMEOUT, SHORT_TIMEOUT, ScopedOperator, TestNamespace,
+    create_auth_secret, init_test, test_cluster_with_config, wait_for_condition,
+    wait_for_operational,
 };
-
-/// Long timeout for cluster operations.
-const LONG_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// Extended timeout for recovery operations.
-const EXTENDED_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Short timeout for quick checks.
-const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Initialize tracing and ensure CRD is installed
-async fn init_test() -> std::sync::Arc<SharedTestCluster> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,kube=warn,valkey_operator=debug")
-        .with_test_writer()
-        .try_init();
-
-    let cluster = SharedTestCluster::get()
-        .await
-        .expect("Failed to get cluster");
-
-    ensure_cluster_crd_installed(&cluster)
-        .await
-        .expect("Failed to install ValkeyCluster CRD");
-
-    cluster
-}
-
-/// Helper to create a test ValkeyCluster.
-fn test_resource(name: &str, masters: i32, replicas: i32) -> ValkeyCluster {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
-        "kind": "ValkeyCluster",
-        "metadata": {
-            "name": name
-        },
-        "spec": {
-            "masters": masters,
-            "replicasPerMaster": replicas,
-            "tls": {
-                "issuerRef": {
-                    "name": "selfsigned-issuer"
-                }
-            },
-            "auth": {
-                "secretRef": {
-                    "name": "valkey-auth"
-                }
-            }
-        }
-    }))
-    .expect("Failed to create test resource")
-}
 
 /// Test that a single pod failure is detected and recovered.
 #[tokio::test(flavor = "multi_thread")]
@@ -88,7 +35,7 @@ async fn test_single_pod_failure_recovery() {
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns_name);
 
     // Create cluster with replicas for redundancy
-    let resource = test_resource("single-fail-test", 3, 1);
+    let resource = test_cluster_with_config("single-fail-test", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -165,7 +112,7 @@ async fn test_multiple_pod_failure_recovery() {
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns_name);
 
     // Create cluster with replicas for redundancy
-    let resource = test_resource("multi-fail-test", 3, 1);
+    let resource = test_cluster_with_config("multi-fail-test", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -218,7 +165,7 @@ async fn test_statefulset_replica_correction() {
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
 
     // Create cluster
-    let resource = test_resource("sts-correct-test", 3, 0);
+    let resource = test_cluster_with_config("sts-correct-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -288,7 +235,7 @@ async fn test_degraded_phase_detection() {
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
 
     // Create cluster with replicas
-    let resource = test_resource("degraded-detect-test", 3, 1);
+    let resource = test_cluster_with_config("degraded-detect-test", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -360,7 +307,7 @@ async fn test_full_cluster_restart() {
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns_name);
 
     // Create a small cluster (no replicas to make the test more dramatic)
-    let resource = test_resource("full-restart-test", 3, 0);
+    let resource = test_cluster_with_config("full-restart-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -410,7 +357,7 @@ async fn test_rapid_successive_failures() {
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns_name);
 
     // Create cluster with replicas
-    let resource = test_resource("rapid-fail-test", 3, 1);
+    let resource = test_cluster_with_config("rapid-fail-test", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -462,7 +409,7 @@ async fn test_condition_updates_during_failure() {
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns_name);
 
     // Create cluster
-    let resource = test_resource("cond-fail-test", 3, 0);
+    let resource = test_cluster_with_config("cond-fail-test", 3, 0);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
@@ -492,7 +439,7 @@ async fn test_condition_updates_during_failure() {
         .await;
 
     // Wait briefly for condition updates
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     // Check conditions during recovery (may or may not catch the degraded state)
     let during_recovery = api
