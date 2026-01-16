@@ -1,0 +1,107 @@
+# Coding Preferences
+
+This file defines coding standards, Rust patterns, and error handling conventions for the Valkey Kubernetes Operator.
+
+## Coding Standards
+
+### Rust 2024 Edition Patterns
+
+#### let-else for Early Returns
+```rust
+let Some(name) = resource.metadata.name.as_ref() else {
+    return Err(Error::MissingField("metadata.name"));
+};
+```
+
+#### if-let Chains
+```rust
+if let Some(status) = resource.status.as_ref()
+    && let Some(phase) = status.phase.as_ref()
+    && *phase == Phase::Running
+{
+    // Handle running state
+}
+```
+
+#### is_some_and / is_none_or
+```rust
+let has_finalizer = resource.finalizers().iter().any(|f| f == FINALIZER);
+let should_reconcile = generation.is_none_or(|g| g != observed);
+```
+
+### Safe Option/Result Handling
+
+| Pattern | Use Case | Example |
+|---------|----------|---------|
+| `unwrap_or_default()` | When a sensible default exists | `replicas.unwrap_or_default()` |
+| `unwrap_or(value)` | When you have a specific fallback | `port.unwrap_or(6379)` |
+| `ok_or(Error::...)` | Convert Option to Result | `name.ok_or(Error::MissingName)?` |
+| `map(\|v\| ...)` | Transform the inner value | `value.map(\|v\| v * 2)` |
+| `and_then(\|v\| ...)` | Chain Option-returning operations | `value.and_then(parse_int)` |
+| `as_ref()` | Borrow without consuming | `option.as_ref().map(...)` |
+| `as_deref()` | Get `&str` from `Option<String>` | `name.as_deref().unwrap_or("default")` |
+
+### Error Handling
+
+- Use `thiserror` for custom error types (see `src/controller/error.rs`)
+- Classify errors: **Transient** (retry), **Permanent** (fail), **Validation** (reject)
+- Preserve error context through the call stack
+- Update CRD status conditions on validation errors
+- Emit Kubernetes events for significant errors
+
+**Reference**: `src/controller/error.rs` for error classification patterns.
+
+### Server-Side Apply (SSA)
+
+Always use server-side apply for Kubernetes resource updates:
+
+```rust
+let patch = Patch::Apply(&resource);
+let params = PatchParams::apply(FIELD_MANAGER).force();
+api.patch(name, &params, &patch).await?;
+```
+
+**Why**: Idempotent, handles field ownership, automatic conflict resolution.
+
+**Reference**: `src/controller/cluster_reconciler.rs` for SSA usage.
+
+### Generation Tracking
+
+Track which spec version the status reflects:
+
+```rust
+let spec_gen = resource.metadata.generation;
+let observed_gen = resource.status.as_ref()
+    .and_then(|s| s.observed_generation);
+
+if observed_gen.is_none_or(|g| g != spec_gen) {
+    // Status is stale, need to reconcile
+}
+```
+
+**Reference**: `src/controller/status.rs` for generation tracking.
+
+## Testing Requirements
+
+### Test Organization
+
+| Directory | Purpose | Requirements |
+|-----------|---------|--------------|
+| `tests/unit/` | Component tests | None |
+| `tests/integration/` | End-to-end tests | Kubernetes cluster |
+| `tests/proptest/` | Property-based tests | None |
+| `tests/common/` | Shared fixtures | None |
+
+### Test Fixtures
+
+Builder pattern for creating test resources:
+
+**Reference**: `tests/common/fixtures.rs` for test fixture builders.
+
+### Testing Patterns
+
+- **Unit tests**: Test individual functions with mocks
+- **Integration tests**: Test against real Kubernetes cluster
+- **Property-based tests**: Generate random inputs to find edge cases
+
+**Note**: Test code may use `unwrap()` where panicking is acceptable.

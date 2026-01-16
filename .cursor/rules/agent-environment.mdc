@@ -1,0 +1,203 @@
+# Agent Environment
+
+This file provides project overview, core principles, build commands, and evaluation criteria for AI assistance.
+
+## Project Overview
+
+This is a **Kubernetes operator for managing Valkey Clusters** built in Rust using kube-rs 2.x.
+
+- **API Group**: `valkey-operator.smoketurner.com`
+- **API Version**: `v1alpha1`
+- **Kinds**: `ValkeyCluster`, `ValkeyUpgrade`
+- **Short Name**: `vc` (for ValkeyCluster)
+- **Minimum Kubernetes Version**: 1.35+
+- **Minimum Rust Version**: 1.92+ (Edition 2024)
+- **Valkey Version**: 9.x
+
+### Generated Resources
+
+For each ValkeyCluster, the operator creates:
+- **StatefulSet**: Valkey pods with stable identity
+- **Headless Service**: Cluster discovery
+- **Client Service**: Client access endpoint
+- **PodDisruptionBudget**: Maintain quorum
+- **Certificate**: TLS certs via cert-manager
+
+## Core Principles
+
+### 1. Panic-Free Code Policy (CRITICAL)
+
+**Production code must NEVER panic.** This is enforced by clippy lints in `Cargo.toml`.
+
+#### ❌ NEVER Do This:
+```rust
+// DON'T - These will fail clippy
+let value = option.unwrap();
+let result = operation().expect("should work");
+let item = items[0];
+panic!("error occurred");
+```
+
+#### ✅ ALWAYS Do This:
+```rust
+// DO - Safe alternatives
+let value = option.unwrap_or_default();
+let value = option.ok_or(Error::MissingField("field"))?;
+let item = items.first().ok_or(Error::Empty)?;
+let item = items.get(0).ok_or(Error::IndexOutOfBounds)?;
+return Err(Error::OperationFailed);
+```
+
+**Reference**: See `Cargo.toml` `[lints.clippy]` section for all enforced lints.
+
+### 2. Security by Default
+
+- Secure defaults should be enabled by default, not optional
+- Secrets should never be logged or exposed in status
+- Network policies should be deployed automatically
+- RBAC should follow least privilege
+- **Question to ask**: "If a developer deploys this with minimal config, is it secure?"
+
+### 3. Operational Simplicity
+
+- Fewer configuration options is better than more
+- Sensible defaults reduce support burden
+- Tier presets (small/medium/large) beat 50 knobs
+- Platform-level defaults reduce per-cluster configuration
+- **Question to ask**: "Does a developer need to understand internals to use this?"
+
+### 4. Self-Healing Over Manual Intervention
+
+- 90% of issues should resolve without human intervention
+- Failures should auto-retry with alerting
+- Degraded resources should attempt recovery before alerting
+- **Question to ask**: "What happens at 3 AM when this fails?"
+
+### 5. Observable by Default
+
+- Fleet-wide health should be visible at a glance
+- Standard alerts should be deployed automatically
+- Metrics should enable capacity planning and chargeback
+- Events should link to runbooks
+- **Question to ask**: "Can I see which resources are unhealthy without kubectl?"
+
+### 6. Idempotent Operations
+
+All reconciliation must be idempotent - running the same operation multiple times produces the same result.
+
+**Reference**: `src/controller/cluster_reconciler.rs` demonstrates idempotent reconciliation.
+
+## Build & Test Commands
+
+See [CLAUDE.md](CLAUDE.md) for complete command reference. Key commands:
+
+```bash
+make build              # Build release binary
+make test               # Run unit tests
+make test-integration   # Run integration tests
+make lint               # Run clippy lints
+make run                # Run operator locally
+make install            # Install CRD and RBAC
+make deploy             # Deploy operator to cluster
+```
+
+## File Reference Guide
+
+| Pattern | File |
+|---------|------|
+| CRD definition | `src/crd/valkey_cluster.rs`, `src/crd/valkey_upgrade.rs` |
+| Reconciliation | `src/controller/cluster_reconciler.rs`, `src/controller/upgrade_reconciler.rs` |
+| State machine | `src/controller/cluster_state_machine.rs`, `src/controller/upgrade_state_machine.rs` |
+| Error handling | `src/controller/error.rs` |
+| Status updates | `src/controller/status.rs` |
+| Shared context | `src/controller/context.rs` |
+| Resource generation | `src/resources/` |
+| Health server | `src/health.rs` |
+| Webhooks | `src/webhooks/server.rs` |
+| Leader election | `src/main.rs` |
+| Controller setup | `src/lib.rs` |
+| Test fixtures | `tests/common/fixtures.rs` |
+| Cluster operations | `src/client/cluster_ops.rs` |
+| Slot management | `src/slots/` |
+
+## Platform Engineering Evaluation Criteria
+
+When reviewing code or design, evaluate from these perspectives:
+
+### 1. Security by Default
+- ✅ Secure defaults enabled by default
+- ✅ Secrets never logged or exposed
+- ✅ Network policies deployed automatically
+- ✅ RBAC follows least privilege
+
+### 2. Operational Simplicity
+- ✅ Sensible defaults reduce support burden
+- ✅ Tier presets (small/medium/large) available
+- ✅ Platform-level defaults configured
+- ✅ Minimal configuration required
+
+### 3. Self-Healing
+- ✅ Auto-retry with exponential backoff
+- ✅ Degraded resources attempt recovery
+- ✅ Failures alert before manual intervention needed
+- ✅ Blast radius contained to one resource
+
+### 4. Observable by Default
+- ✅ Fleet-wide health visible at a glance
+- ✅ Standard alerts deployed automatically
+- ✅ Metrics enable capacity planning
+- ✅ Events link to runbooks
+
+### 5. Policy-Driven Governance
+- ✅ Admission webhooks enforce policies
+- ✅ Resource quotas prevent noisy neighbors
+- ✅ Compliance evidence automatic
+- ✅ Guardrails prevent dangerous configs
+
+## Red Flags to Identify
+
+When reviewing changes, flag these patterns:
+
+1. ❌ **New optional security features** - Security should be default, not opt-in
+2. ❌ **Expert-level configuration exposed** - Hide complexity behind presets
+3. ❌ **Silent failures** - All failures need alerting or auto-recovery
+4. ❌ **Per-resource configuration requirements** - Should be platform-level defaults
+5. ❌ **Manual operational procedures** - Should be automated or documented in runbooks
+6. ❌ **Missing status conditions** - Platform engineer needs visibility into health
+7. ❌ **Immutable decisions** - Avoid "can't change after creation" when possible
+
+## Common Scenarios
+
+### New Team Onboarding
+Developer needs a resource in 5 minutes with 10-line YAML. Ensure:
+- Minimal required configuration
+- Sensible defaults
+- Clear error messages
+
+### Production Incident
+3 AM alert, need to understand and resolve in 30 minutes. Ensure:
+- Clear status conditions
+- Actionable error messages
+- Self-healing where possible
+- Comprehensive logging
+
+### Security Audit
+Need to prove encryption, access controls, compliance. Ensure:
+- Secure by default
+- Audit logging
+- RBAC properly configured
+- Secrets properly handled
+
+## Key Links
+
+- [GUIDE.md](GUIDE.md) - Detailed pattern explanations and rationale
+- [CLAUDE.md](CLAUDE.md) - Project-specific commands and quick reference
+- [kube-rs documentation](https://kube.rs)
+- [kube-rs Controllers Guide](https://kube.rs/controllers/intro/) - Introduction to building Kubernetes controllers with kube-rs
+- [k8s-openapi documentation](https://docs.rs/k8s-openapi)
+- [Kubernetes API conventions](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md)
+- [Valkey Documentation](https://valkey.io/topics/) - Complete Valkey documentation including cluster, replication, and administration guides
+
+---
+
+**Remember**: When in doubt, refer to `GUIDE.md` for detailed explanations of why patterns exist, and `CLAUDE.md` for project-specific commands and context.

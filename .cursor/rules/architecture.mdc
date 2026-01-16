@@ -1,0 +1,208 @@
+# Architecture Patterns
+
+This file defines architecture patterns, Kubernetes operator patterns, and Valkey-specific patterns.
+
+## Architecture Patterns
+
+### Controller Reconciliation Flow
+
+```
+Reconcile Called
+    ↓
+Check deletion timestamp
+    ↓ (Has finalizer + deletion timestamp?)
+    ├─ No → Handle normal reconcile
+    └─ Yes → Handle deletion
+    ↓
+Ensure finalizer exists
+    ↓
+Apply owned resources (SSA)
+    ↓
+Check resource readiness
+    ↓
+Update status & conditions
+    ↓
+Return Action (requeue or await)
+```
+
+**Reference**: `src/controller/cluster_reconciler.rs` for full implementation.
+
+### State Machine
+
+Formal FSM for resource lifecycle with valid transitions:
+
+- `Pending → Creating → Running ⟷ Updating`
+- `Running → Degraded → Running` (recovery)
+- `Any state → Deleting` (on deletion)
+
+**Reference**: `src/controller/cluster_state_machine.rs` for transition rules.
+
+### Finalizer Pattern
+
+Hook for cleanup before Kubernetes deletes the resource:
+
+1. **On Create**: Add finalizer to resource
+2. **On Delete Request**: Kubernetes sets `deletionTimestamp` but doesn't delete
+3. **Operator Cleanup**: Scale down, delete external resources
+4. **Remove Finalizer**: Kubernetes can now delete the resource
+
+**Reference**: `FINALIZER` constant and `handle_deletion()` in `src/controller/cluster_reconciler.rs`.
+
+### Owner References
+
+Link child resources to parent CRD for automatic garbage collection:
+
+```rust
+let owner_ref = owner_reference(&cluster);
+resource.owner_references = Some(vec![owner_ref]);
+```
+
+**Reference**: `src/resources/common.rs` for `owner_reference()` helper.
+
+### Health Server
+
+HTTP endpoints for probes and metrics:
+
+- `/healthz`: Liveness probe (200 if process alive)
+- `/readyz`: Readiness probe (200 if ready to serve)
+- `/metrics`: Prometheus metrics
+
+Readiness state changes:
+- Startup → `ready = false` (not yet leader)
+- Leadership → `ready = true` (controller running)
+- Shutdown → `ready = false` (draining)
+
+**Reference**: `src/health.rs` for implementation.
+
+## Kubernetes Operator Patterns
+
+**Reference**: [kube-rs Controllers Guide](https://kube.rs/controllers/intro/) for comprehensive controller patterns and best practices.
+
+### CRD Structure
+
+**ValkeyCluster** (`src/crd/valkey_cluster.rs`):
+- `spec`: User-defined desired state (masters, replicasPerMaster, image, resources, tls, auth)
+- `status`: Operator-reported observed state (phase, conditions, observedGeneration)
+- `status.conditions`: Kubernetes-standard detailed status
+
+**ValkeyUpgrade** (`src/crd/valkey_upgrade.rs`):
+- Manages rolling upgrades with proper failover orchestration
+
+### Phase Lifecycle
+
+High-level state indicator for the resource:
+
+| Phase | Meaning |
+|-------|---------|
+| `Pending` | Resource created, not yet processed |
+| `Creating` | Initial resources being created |
+| `Running` | All resources healthy and operational |
+| `Updating` | Spec change being applied |
+| `Degraded` | Partially functional (some replicas unhealthy) |
+| `Failed` | Unrecoverable error (requires intervention) |
+| `Deleting` | Cleanup in progress |
+
+**Reference**: `Phase` enum in `src/crd/valkey_cluster.rs`.
+
+### Status Conditions
+
+Kubernetes-standard detailed status reporting:
+
+| Type | True When | False When |
+|------|-----------|------------|
+| `Ready` | All replicas healthy | Any replica unhealthy |
+| `Progressing` | Changes being applied | Stable state reached |
+| `Degraded` | Partial functionality | Fully healthy or fully failed |
+
+**Reference**: Condition constants and builders in `src/controller/status.rs`.
+
+### Admission Webhooks
+
+Validation webhook for enforcing policies:
+
+- Reject invalid resources before they're stored
+- Enforce policies beyond what CEL can express
+- Cross-resource validation
+
+**Reference**: `src/webhooks/server.rs` for webhook implementation.
+
+### RBAC with Least Privilege
+
+- Separate rules by resource type
+- List explicit verbs (avoid wildcards)
+- Status subresource separate permissions
+- Events: create/patch only
+- Pods: read-only (operator shouldn't modify pods directly)
+
+**Reference**: `config/rbac/role.yaml` for RBAC configuration.
+
+## Kubernetes 1.35+ Features
+
+### In-Place Pod Resource Resizing
+
+Modify CPU/memory requests without pod restart:
+
+```rust
+fn check_resize_status(pod: &Pod) -> Option<&str> {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.resize.as_deref())
+}
+
+fn get_allocated_resources(pod: &Pod) -> Option<&BTreeMap<String, Quantity>> {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .and_then(|cs| cs.first())
+        .and_then(|c| c.allocated_resources.as_ref())
+}
+```
+
+**Resize Status Values**:
+- `Proposed`: Resize requested, awaiting scheduler
+- `InProgress`: Kubelet applying the resize
+- `Deferred`: Cannot resize now, will retry
+- `Infeasible`: Cannot resize (node constraints)
+
+### Pod Generation Tracking
+
+Track when kubelet has applied spec changes:
+
+```rust
+fn is_pod_synced(pod: &Pod) -> bool {
+    let spec_gen = pod.metadata.generation;
+    let observed_gen = pod.status.as_ref().and_then(|s| s.observed_generation);
+
+    match (spec_gen, observed_gen) {
+        (Some(spec), Some(observed)) => spec == observed,
+        _ => true,  // Assume synced if missing (backwards compat)
+    }
+}
+```
+
+## Valkey-Specific Patterns
+
+**Reference**: [Valkey Documentation](https://valkey.io/topics/) for complete Valkey documentation including cluster specification, replication, and administration guides.
+
+### Cluster Initialization
+
+- CLUSTER MEET commands to form cluster
+- CLUSTER ADDSLOTS to assign slots to masters
+- CLUSTER REPLICATE for replica assignment
+
+**Reference**: `src/controller/cluster_init.rs` for cluster initialization logic.
+
+### Slot Distribution
+
+- Even distribution of 16384 slots across masters
+- Slot migration planning for scaling operations
+
+**Reference**: `src/slots/distribution.rs` and `src/slots/migration.rs`.
+
+### Scaling Operations
+
+- Scale up: Add new nodes, redistribute slots
+- Scale down: Migrate slots, remove nodes gracefully
+- Maintain quorum during scaling
+
+**Reference**: `src/client/scaling.rs` for scaling logic.

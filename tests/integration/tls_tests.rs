@@ -171,6 +171,8 @@ async fn test_cluster_requires_tls() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Try to create a cluster without TLS - should fail validation
+    // Note: tls and auth are required fields in the struct, so we include them
+    // but with empty/invalid values that should fail CRD validation
     let invalid_resource: ValkeyCluster = serde_json::from_value(serde_json::json!({
         "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
         "kind": "ValkeyCluster",
@@ -179,8 +181,18 @@ async fn test_cluster_requires_tls() {
         },
         "spec": {
             "masters": 3,
-            "replicasPerMaster": 0
-            // Missing tls and auth
+            "replicasPerMaster": 0,
+            "tls": {
+                "issuerRef": {
+                    "name": "",
+                    "kind": "ClusterIssuer"
+                }
+            },
+            "auth": {
+                "secretRef": {
+                    "name": "valkey-auth"
+                }
+            }
         }
     }))
     .expect("Failed to parse");
@@ -207,6 +219,7 @@ async fn test_cluster_requires_auth() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
 
     // Try to create a cluster with TLS but without auth - should fail validation
+    // Note: auth is a required field in the struct, so we include it but with empty/invalid values
     let invalid_resource: ValkeyCluster = serde_json::from_value(serde_json::json!({
         "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
         "kind": "ValkeyCluster",
@@ -218,10 +231,15 @@ async fn test_cluster_requires_auth() {
             "replicasPerMaster": 0,
             "tls": {
                 "issuerRef": {
-                    "name": "selfsigned-issuer"
+                    "name": "selfsigned-issuer",
+                    "kind": "ClusterIssuer"
+                }
+            },
+            "auth": {
+                "secretRef": {
+                    "name": ""
                 }
             }
-            // Missing auth
         }
     }))
     .expect("Failed to parse");

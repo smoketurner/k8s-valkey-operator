@@ -1,0 +1,23 @@
+{
+  "name": "Valkey Kubernetes Operator",
+  "description": "Kubernetes operator for managing Valkey Clusters built in Rust",
+  "language": "rust",
+  "framework": "kubernetes-operator",
+  "kubernetes": {
+    "minVersion": "1.35",
+    "apiGroup": "valkey-operator.smoketurner.com",
+    "apiVersion": "v1alpha1"
+  },
+  "rust": {
+    "edition": "2024",
+    "minVersion": "1.92"
+  },
+  "valkey": {
+    "version": "9.x"
+  },
+  "dependencies": {
+    "kube": "2.0.1",
+    "k8s-openapi": "0.26.1",
+    "tokio": "1.49.0"
+  }
+}

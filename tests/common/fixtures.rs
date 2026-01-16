@@ -146,14 +146,16 @@ impl ValkeyClusterBuilder {
                 tls: TlsSpec {
                     issuer_ref: IssuerRef {
                         name: self.issuer_name,
-                        ..Default::default()
+                        kind: "ClusterIssuer".to_string(),
+                        group: "cert-manager.io".to_string(),
                     },
-                    ..Default::default()
+                    duration: "2160h".to_string(),
+                    renew_before: "360h".to_string(),
                 },
                 auth: AuthSpec {
                     secret_ref: SecretKeyRef {
                         name: self.secret_name,
-                        ..Default::default()
+                        key: "password".to_string(),
                     },
                 },
                 persistence: if self.persistence_enabled {
