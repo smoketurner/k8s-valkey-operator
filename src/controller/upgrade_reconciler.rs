@@ -75,8 +75,14 @@ pub async fn reconcile(obj: Arc<ValkeyUpgrade>, ctx: Arc<Context>) -> Result<Act
     let cluster = match get_target_cluster(&obj, &ctx, &namespace).await {
         Ok(c) => c,
         Err(e) => {
-            error!(name = %name, error = %e, "Failed to get target cluster");
-            update_phase(&api, &name, UpgradePhase::Failed, Some(e.to_string())).await?;
+            let cluster_name = &obj.spec.cluster_ref.name;
+            let cluster_namespace = obj.spec.cluster_ref.namespace.as_deref().unwrap_or(namespace.as_str());
+            let error_msg = format!(
+                "Failed to get target ValkeyCluster '{}/{}': {}. Verify the cluster exists and the operator has read permissions.",
+                cluster_namespace, cluster_name, e
+            );
+            error!(name = %name, error = %e, cluster = %*cluster_name, "Failed to get target cluster");
+            update_phase(&api, &name, UpgradePhase::Failed, Some(error_msg.clone())).await?;
             return Ok(Action::requeue(Duration::from_secs(300)));
         }
     };
@@ -610,7 +616,11 @@ async fn wait_for_replication_sync(
     // Connect to the first replica and check replication status
     let Some((replica_host, replica_port)) = replica_pods.first() else {
         // This shouldn't happen since we checked is_empty above
-        return Err(Error::Validation("No replica pods found".to_string()));
+        let master_pod_name = format!("{}-{}", cluster.name_any(), shard_index);
+        return Err(Error::Validation(format!(
+            "No replica pods found for shard {} (master: {}). Verify the cluster has replicas configured (replicasPerMaster > 0) and pods are running.",
+            shard_index, master_pod_name
+        )));
     };
     let client = match ValkeyClient::connect_single(
         replica_host,
@@ -987,8 +997,14 @@ async fn execute_failover(
         Err(e) => {
             let _ = client.close().await;
             // Failover failed - mark shard as failed (triggers rollback)
+            let cluster_name = cluster.name_any();
+            let master_pod_name = format!("{}-{}", cluster_name, shard_index);
+            let error_msg = format!(
+                "CLUSTER FAILOVER failed for shard {} (master: {}): {}. This may indicate cluster connectivity issues, replica not ready, or cluster state problems. Check cluster health and replica status before retrying.",
+                shard_index, master_pod_name, e
+            );
             error!(name = %name, shard = shard_index, error = %e, "CLUSTER FAILOVER failed");
-            update_shard_status_with_error(api, &name, shard_index, e.to_string()).await?;
+            update_shard_status_with_error(api, &name, shard_index, error_msg).await?;
             Ok(Action::requeue(Duration::from_secs(1)))
         }
     }
@@ -1119,7 +1135,9 @@ async fn handle_rollback_phase(
         error!(name = %name, "Cannot rollback: original version not found in status");
         let mut status = obj.status.clone().unwrap_or_default();
         status.phase = UpgradePhase::Failed;
-        status.error_message = Some("Cannot rollback: original version not found in status".to_string());
+        status.error_message = Some(
+            "Cannot rollback: original image version not found in upgrade status. This may indicate the upgrade status was corrupted. Manual intervention may be required to restore the cluster.".to_string()
+        );
         status.conditions = compute_upgrade_conditions(
             UpgradePhase::Failed,
             status.total_shards,
@@ -1232,7 +1250,9 @@ async fn check_rollback_completion(
         error!(name = %name, "Cannot check rollback: original version not found");
         let mut status = obj.status.clone().unwrap_or_default();
         status.phase = UpgradePhase::Failed;
-        status.error_message = Some("Cannot check rollback: original version not found".to_string());
+        status.error_message = Some(
+            "Cannot verify rollback completion: original image version not found in upgrade status. Check the upgrade status.currentVersion field and manually verify cluster image if needed.".to_string()
+        );
         status.conditions = compute_upgrade_conditions(
             UpgradePhase::Failed,
             status.total_shards,
@@ -1421,7 +1441,9 @@ async fn validate_upgrade_spec(
 ) -> Result<(), Error> {
     // Validate target_version is not empty
     if spec.target_version.is_empty() {
-        return Err(Error::Validation("targetVersion is required".to_string()));
+        return Err(Error::Validation(
+            "targetVersion is required but was empty. Specify a valid Valkey version (e.g., '9.0.1') in the upgrade spec.".to_string()
+        ));
     }
 
     // Cluster must be in Running state
@@ -1433,8 +1455,8 @@ async fn validate_upgrade_spec(
 
     if cluster_phase != crate::crd::ClusterPhase::Running {
         return Err(Error::Validation(format!(
-            "Cluster must be in Running state, currently: {}",
-            cluster_phase
+            "Cluster '{}' must be in Running state before upgrade can proceed, but it is currently in {} phase. Wait for the cluster to become healthy or check cluster status for issues.",
+            cluster.name_any(), cluster_phase
         )));
     }
 
@@ -1485,7 +1507,7 @@ async fn validate_upgrade_spec(
 
                     if is_active {
                         return Err(Error::Validation(format!(
-                            "Another upgrade '{}' is already in progress (phase: {}) for cluster '{}'. Only one upgrade can target a cluster at a time.",
+                            "Cannot start upgrade: another upgrade '{}' is already in progress (phase: {}) for cluster '{}'. Only one upgrade can target a cluster at a time. Wait for the existing upgrade to complete, fail, or be deleted before starting a new one.",
                             upgrade.name_any(),
                             phase,
                             cluster_name
@@ -1511,6 +1533,7 @@ fn resolve_target_image(spec: &ValkeyUpgradeSpec, cluster: &ValkeyCluster) -> St
     let repository = &cluster.spec.image.repository;
     format!("{}:{}-alpine", repository, spec.target_version)
 }
+
 
 /// Initialize shard statuses from cluster topology
 async fn initialize_shard_statuses(
@@ -2210,5 +2233,275 @@ mod tests {
     #[test]
     fn test_upgrade_phase_not_terminal_rolling_back() {
         assert!(!UpgradePhase::RollingBack.is_terminal());
+    }
+}
+
+#[cfg(test)]
+mod upgrade_reconciler_function_tests {
+    use super::{compute_upgrade_conditions, resolve_target_image};
+    use crate::crd::{UpgradePhase, ValkeyCluster, ValkeyUpgradeSpec, ClusterReference};
+
+    /// Test resolve_target_image function
+    #[test]
+    fn test_resolve_target_image() {
+        let cluster = create_test_cluster("test-cluster", "valkeyio/valkey", "9.0.0");
+        let spec = create_test_upgrade_spec("test-upgrade", "test-cluster", "9.0.1");
+        
+        let image = resolve_target_image(&spec, &cluster);
+        assert_eq!(image, "valkeyio/valkey:9.0.1-alpine");
+    }
+
+    /// Test resolve_target_image with different repository
+    #[test]
+    fn test_resolve_target_image_custom_repository() {
+        let cluster = create_test_cluster("test-cluster", "my-registry/valkey", "9.0.0");
+        let spec = create_test_upgrade_spec("test-upgrade", "test-cluster", "9.0.2");
+        
+        let image = resolve_target_image(&spec, &cluster);
+        assert_eq!(image, "my-registry/valkey:9.0.2-alpine");
+    }
+
+    /// Test compute_upgrade_conditions for Completed phase
+    #[test]
+    fn test_compute_conditions_completed() {
+        let conditions = compute_upgrade_conditions(
+            UpgradePhase::Completed,
+            3,
+            3,
+            0,
+            None,
+            Some(1),
+        );
+        
+        assert_eq!(conditions.len(), 3);
+        
+        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        assert_eq!(ready.status, "True");
+        assert_eq!(ready.reason, "UpgradeCompleted");
+        
+        let progressing = conditions.iter().find(|c| c.r#type == "Progressing").unwrap();
+        assert_eq!(progressing.status, "False");
+        
+        let degraded = conditions.iter().find(|c| c.r#type == "Degraded").unwrap();
+        assert_eq!(degraded.status, "False");
+    }
+
+    /// Test compute_upgrade_conditions for Failed phase
+    #[test]
+    fn test_compute_conditions_failed() {
+        let error_msg = "Cluster health check failed";
+        let conditions = compute_upgrade_conditions(
+            UpgradePhase::Failed,
+            3,
+            1,
+            0,
+            Some(error_msg),
+            Some(1),
+        );
+        
+        assert_eq!(conditions.len(), 3);
+        
+        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "UpgradeFailed");
+        assert_eq!(ready.message, error_msg);
+        
+        let degraded = conditions.iter().find(|c| c.r#type == "Degraded").unwrap();
+        assert_eq!(degraded.status, "True");
+    }
+
+    /// Test compute_upgrade_conditions for InProgress phase
+    #[test]
+    fn test_compute_conditions_in_progress() {
+        let conditions = compute_upgrade_conditions(
+            UpgradePhase::InProgress,
+            6,
+            2,
+            0,
+            None,
+            Some(1),
+        );
+        
+        assert_eq!(conditions.len(), 3);
+        
+        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        assert_eq!(ready.status, "False");
+        assert!(ready.message.contains("2/6"));
+        
+        let progressing = conditions.iter().find(|c| c.r#type == "Progressing").unwrap();
+        assert_eq!(progressing.status, "True");
+        assert!(progressing.message.contains("Upgrading shard"));
+        
+        let degraded = conditions.iter().find(|c| c.r#type == "Degraded").unwrap();
+        assert_eq!(degraded.status, "False");
+    }
+
+    /// Test compute_upgrade_conditions for InProgress with failures
+    #[test]
+    fn test_compute_conditions_in_progress_with_failures() {
+        let conditions = compute_upgrade_conditions(
+            UpgradePhase::InProgress,
+            6,
+            2,
+            1,
+            None,
+            Some(1),
+        );
+        
+        let degraded = conditions.iter().find(|c| c.r#type == "Degraded").unwrap();
+        assert_eq!(degraded.status, "True");
+        assert_eq!(degraded.reason, "ShardFailures");
+        assert!(degraded.message.contains("1 shard(s) failed"));
+    }
+
+    /// Test compute_upgrade_conditions for RollingBack phase
+    #[test]
+    fn test_compute_conditions_rolling_back() {
+        let conditions = compute_upgrade_conditions(
+            UpgradePhase::RollingBack,
+            3,
+            1,
+            0,
+            None,
+            Some(1),
+        );
+        
+        assert_eq!(conditions.len(), 3);
+        
+        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "RollingBack");
+        
+        let progressing = conditions.iter().find(|c| c.r#type == "Progressing").unwrap();
+        assert_eq!(progressing.status, "True");
+        
+        let degraded = conditions.iter().find(|c| c.r#type == "Degraded").unwrap();
+        assert_eq!(degraded.status, "True");
+    }
+
+    /// Test compute_upgrade_conditions for RolledBack phase
+    #[test]
+    fn test_compute_conditions_rolled_back() {
+        let conditions = compute_upgrade_conditions(
+            UpgradePhase::RolledBack,
+            3,
+            1,
+            0,
+            None,
+            Some(1),
+        );
+        
+        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "RolledBack");
+        
+        let progressing = conditions.iter().find(|c| c.r#type == "Progressing").unwrap();
+        assert_eq!(progressing.status, "False");
+    }
+
+    /// Test compute_upgrade_conditions for PreChecks phase
+    #[test]
+    fn test_compute_conditions_prechecks() {
+        let conditions = compute_upgrade_conditions(
+            UpgradePhase::PreChecks,
+            3,
+            0,
+            0,
+            None,
+            Some(1),
+        );
+        
+        assert_eq!(conditions.len(), 3);
+        
+        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "PreChecks");
+        
+        let progressing = conditions.iter().find(|c| c.r#type == "Progressing").unwrap();
+        assert_eq!(progressing.status, "True");
+        assert!(progressing.message.contains("health") || progressing.message.contains("PreChecks"));
+    }
+
+    /// Test compute_upgrade_conditions for Pending phase
+    #[test]
+    fn test_compute_conditions_pending() {
+        let conditions = compute_upgrade_conditions(
+            UpgradePhase::Pending,
+            3,
+            0,
+            0,
+            None,
+            Some(1),
+        );
+        
+        assert_eq!(conditions.len(), 3);
+        
+        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "Pending");
+        
+        let progressing = conditions.iter().find(|c| c.r#type == "Progressing").unwrap();
+        assert_eq!(progressing.status, "False");
+    }
+
+    /// Test compute_upgrade_conditions with zero shards
+    #[test]
+    fn test_compute_conditions_zero_shards() {
+        let conditions = compute_upgrade_conditions(
+            UpgradePhase::InProgress,
+            0,
+            0,
+            0,
+            None,
+            Some(1),
+        );
+        
+        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        // Should handle zero division gracefully
+        assert!(ready.message.contains("0/0"));
+    }
+
+    // Helper functions to create test resources
+
+    fn create_test_cluster(name: &str, repository: &str, tag: &str) -> ValkeyCluster {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
+            "kind": "ValkeyCluster",
+            "metadata": {
+                "name": name
+            },
+            "spec": {
+                "masters": 3,
+                "replicasPerMaster": 1,
+                "image": {
+                    "repository": repository,
+                    "tag": tag
+                },
+                "tls": {
+                    "issuerRef": {
+                        "name": "selfsigned-issuer"
+                    }
+                },
+                "auth": {
+                    "secretRef": {
+                        "name": "valkey-auth"
+                    }
+                }
+            },
+            "status": {
+                "phase": "Running"
+            }
+        }))
+        .expect("Failed to create test cluster")
+    }
+
+    fn create_test_upgrade_spec(_name: &str, cluster_name: &str, target_version: &str) -> ValkeyUpgradeSpec {
+        ValkeyUpgradeSpec {
+            cluster_ref: ClusterReference {
+                name: cluster_name.to_string(),
+                namespace: None,
+            },
+            target_version: target_version.to_string(),
+        }
     }
 }
