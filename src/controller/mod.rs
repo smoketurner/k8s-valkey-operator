@@ -15,6 +15,7 @@ pub mod status;
 
 // ValkeyCluster controller
 pub mod cluster_init;
+pub mod cluster_phases;
 pub mod cluster_reconciler;
 pub mod cluster_state_machine;
 pub mod cluster_validation;

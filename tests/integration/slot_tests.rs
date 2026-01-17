@@ -127,22 +127,30 @@ async fn test_slot_rebalancing_on_scale_up() {
     .await
     .expect("Failed to scale up");
 
-    // Should transition through Updating/Resharding phases
-    let updating_or_resharding = wait_for_condition(
+    // Should transition through scaling phases
+    let scaling_phase = wait_for_condition(
         &api,
         "slot-rebalance-test",
         |r| {
             r.status
                 .as_ref()
-                .map(|s| s.phase == ClusterPhase::Updating || s.phase == ClusterPhase::Resharding)
+                .map(|s| {
+                    matches!(
+                        s.phase,
+                        ClusterPhase::DetectingChanges
+                            | ClusterPhase::ScalingStatefulSet
+                            | ClusterPhase::AddingNodes
+                            | ClusterPhase::MigratingSlots
+                    )
+                })
                 .unwrap_or(false)
         },
         SHORT_TIMEOUT,
     )
     .await;
 
-    if updating_or_resharding.is_ok() {
-        println!("Cluster entered Updating/Resharding phase during scale-up");
+    if scaling_phase.is_ok() {
+        println!("Cluster entered scaling phase during scale-up");
     }
 
     // Wait for cluster to be operational again
@@ -225,15 +233,15 @@ async fn test_slot_migration_on_scale_down() {
     .await
     .expect("Failed to scale down");
 
-    // Should transition through Updating/Resharding phases
+    // Should transition through scaling phases
     wait_for_phase(
         &api,
         "slot-migrate-test",
-        ClusterPhase::Updating,
+        ClusterPhase::DetectingChanges,
         SHORT_TIMEOUT,
     )
     .await
-    .ok(); // May be fast enough to skip directly to Resharding
+    .ok(); // May be fast enough to skip directly to MigratingSlots
 
     // Wait for cluster to be operational again
     wait_for_operational(&api, "slot-migrate-test", EXTENDED_TIMEOUT)
@@ -396,7 +404,7 @@ async fn test_resharding_phase_detection() {
     let resharding_detected = wait_for_phase(
         &api,
         "reshard-detect-test",
-        ClusterPhase::Resharding,
+        ClusterPhase::MigratingSlots,
         DEFAULT_TIMEOUT,
     )
     .await;
@@ -407,7 +415,7 @@ async fn test_resharding_phase_detection() {
             client.clone(),
             &ns_name,
             "reshard-detect-test",
-            ClusterPhase::Resharding,
+            ClusterPhase::MigratingSlots,
         )
         .await;
     } else {

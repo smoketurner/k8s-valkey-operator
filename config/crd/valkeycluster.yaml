@@ -226,8 +226,12 @@ spec:
                     - Initializing
                     - AssigningSlots
                     - Running
-                    - Updating
-                    - Resharding
+                    - DetectingChanges
+                    - ScalingStatefulSet
+                    - AddingNodes
+                    - MigratingSlots
+                    - RemovingNodes
+                    - VerifyingCluster
                     - Degraded
                     - Failed
                     - Deleting

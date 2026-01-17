@@ -192,6 +192,13 @@ pub enum ShardUpgradeState {
     /// Executing failover.
     FailingOver,
 
+    /// Waiting for cluster to stabilize after failover.
+    /// Verifies:
+    /// 1. cluster_state is "ok"
+    /// 2. Old master recognizes it's now a replica
+    /// 3. Replication link is up
+    WaitingForClusterStable,
+
     /// Upgrading old master (now replica).
     UpgradingOldMaster,
 
@@ -212,6 +219,7 @@ impl std::fmt::Display for ShardUpgradeState {
             ShardUpgradeState::UpgradingReplicas => write!(f, "UpgradingReplicas"),
             ShardUpgradeState::WaitingForSync => write!(f, "WaitingForSync"),
             ShardUpgradeState::FailingOver => write!(f, "FailingOver"),
+            ShardUpgradeState::WaitingForClusterStable => write!(f, "WaitingForClusterStable"),
             ShardUpgradeState::UpgradingOldMaster => write!(f, "UpgradingOldMaster"),
             ShardUpgradeState::Completed => write!(f, "Completed"),
             ShardUpgradeState::Failed => write!(f, "Failed"),

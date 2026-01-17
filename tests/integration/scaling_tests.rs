@@ -15,7 +15,7 @@ use crate::assertions::assert_statefulset_replicas;
 use crate::{
     EXTENDED_TIMEOUT, LONG_TIMEOUT, SHORT_TIMEOUT, ScopedOperator, TestNamespace,
     create_auth_secret, init_test, test_cluster_with_config, wait_for_condition,
-    wait_for_operational, wait_for_phase,
+    wait_for_operational,
 };
 
 /// Test scaling up a ValkeyCluster by adding masters.
@@ -56,12 +56,8 @@ async fn test_scale_up_masters() {
     .await
     .expect("Failed to scale up");
 
-    // Wait for updating phase
-    wait_for_phase(&api, "scale-up-test", ClusterPhase::Updating, SHORT_TIMEOUT)
-        .await
-        .expect("Resource should enter Updating phase");
-
-    // Wait for resource to be operational again
+    // Wait for resource to be operational again after scaling
+    // The operator will go through Updating/Resharding phases automatically
     wait_for_operational(&api, "scale-up-test", EXTENDED_TIMEOUT)
         .await
         .expect("Resource should become operational after scale up");
@@ -118,17 +114,8 @@ async fn test_scale_down_masters() {
     .await
     .expect("Failed to scale down");
 
-    // Wait for updating phase to ensure operator processes the change
-    wait_for_phase(
-        &api,
-        "scale-down-test",
-        ClusterPhase::Updating,
-        SHORT_TIMEOUT,
-    )
-    .await
-    .expect("Resource should enter Updating phase");
-
-    // Wait for resource to be operational again
+    // Wait for resource to be operational again after scaling
+    // The operator will go through Updating/Resharding phases automatically
     wait_for_operational(&api, "scale-down-test", EXTENDED_TIMEOUT)
         .await
         .expect("Resource should become operational after scale down");
@@ -188,17 +175,8 @@ async fn test_scale_up_replicas() {
     .await
     .expect("Failed to add replicas");
 
-    // Wait for updating phase
-    wait_for_phase(
-        &api,
-        "scale-replicas-test",
-        ClusterPhase::Updating,
-        SHORT_TIMEOUT,
-    )
-    .await
-    .expect("Resource should enter Updating phase");
-
-    // Wait for resource to be operational again
+    // Wait for resource to be operational again after adding replicas
+    // The operator will go through Updating phase automatically
     wait_for_operational(&api, "scale-replicas-test", LONG_TIMEOUT)
         .await
         .expect("Resource should become operational after adding replicas");

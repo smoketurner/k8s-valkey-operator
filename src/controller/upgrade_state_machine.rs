@@ -417,6 +417,9 @@ pub enum ShardEvent {
     /// Failover completed.
     FailoverCompleted,
 
+    /// Cluster has stabilized after failover.
+    ClusterStabilized,
+
     /// Old master upgraded.
     OldMasterUpgraded,
 
@@ -438,6 +441,7 @@ impl std::fmt::Display for ShardEvent {
             ShardEvent::ReplicationSynced => write!(f, "ReplicationSynced"),
             ShardEvent::FailoverStarted => write!(f, "FailoverStarted"),
             ShardEvent::FailoverCompleted => write!(f, "FailoverCompleted"),
+            ShardEvent::ClusterStabilized => write!(f, "ClusterStabilized"),
             ShardEvent::OldMasterUpgraded => write!(f, "OldMasterUpgraded"),
             ShardEvent::Failed => write!(f, "Failed"),
             ShardEvent::Skipped => write!(f, "Skipped"),
@@ -460,6 +464,10 @@ pub struct ShardTransitionContext {
 
     /// Whether failover completed.
     pub failover_completed: bool,
+
+    /// Whether the cluster has stabilized after failover.
+    /// This requires: cluster_state:ok, old master is now replica, replication link up.
+    pub cluster_stable: bool,
 
     /// Whether the shard is already at target version.
     pub already_upgraded: bool,
@@ -524,9 +532,17 @@ impl ShardStateMachine {
 
             // From FailingOver
             (ShardUpgradeState::FailingOver, ShardEvent::FailoverCompleted) => {
-                ShardUpgradeState::UpgradingOldMaster
+                ShardUpgradeState::WaitingForClusterStable
             }
             (ShardUpgradeState::FailingOver, ShardEvent::Failed) => ShardUpgradeState::Failed,
+
+            // From WaitingForClusterStable
+            (ShardUpgradeState::WaitingForClusterStable, ShardEvent::ClusterStabilized) => {
+                ShardUpgradeState::UpgradingOldMaster
+            }
+            (ShardUpgradeState::WaitingForClusterStable, ShardEvent::Failed) => {
+                ShardUpgradeState::Failed
+            }
 
             // From UpgradingOldMaster
             (ShardUpgradeState::UpgradingOldMaster, ShardEvent::OldMasterUpgraded) => {
@@ -568,8 +584,14 @@ impl ShardStateMachine {
             (ShardUpgradeState::WaitingForSync, ShardUpgradeState::Failed) => true,
 
             // From FailingOver
-            (ShardUpgradeState::FailingOver, ShardUpgradeState::UpgradingOldMaster) => true,
+            (ShardUpgradeState::FailingOver, ShardUpgradeState::WaitingForClusterStable) => true,
             (ShardUpgradeState::FailingOver, ShardUpgradeState::Failed) => true,
+
+            // From WaitingForClusterStable
+            (ShardUpgradeState::WaitingForClusterStable, ShardUpgradeState::UpgradingOldMaster) => {
+                true
+            }
+            (ShardUpgradeState::WaitingForClusterStable, ShardUpgradeState::Failed) => true,
 
             // From UpgradingOldMaster
             (ShardUpgradeState::UpgradingOldMaster, ShardUpgradeState::Completed) => true,
@@ -610,9 +632,12 @@ impl ShardStateMachine {
                 ShardUpgradeState::Failed,
             ],
             ShardUpgradeState::FailingOver => vec![
-                ShardUpgradeState::UpgradingOldMaster,
+                ShardUpgradeState::WaitingForClusterStable,
                 ShardUpgradeState::Failed,
             ],
+            ShardUpgradeState::WaitingForClusterStable => {
+                vec![ShardUpgradeState::UpgradingOldMaster, ShardUpgradeState::Failed]
+            }
             ShardUpgradeState::UpgradingOldMaster => {
                 vec![ShardUpgradeState::Completed, ShardUpgradeState::Failed]
             }
@@ -672,6 +697,14 @@ pub fn determine_shard_event(
                 Some(ShardEvent::FailoverCompleted)
             } else {
                 None // Continue failover
+            }
+        }
+
+        ShardUpgradeState::WaitingForClusterStable => {
+            if ctx.cluster_stable {
+                Some(ShardEvent::ClusterStabilized)
+            } else {
+                None // Continue waiting for stability
             }
         }
 
@@ -860,6 +893,10 @@ mod tests {
         ));
         assert!(sm.can_transition(
             ShardUpgradeState::FailingOver,
+            ShardUpgradeState::WaitingForClusterStable
+        ));
+        assert!(sm.can_transition(
+            ShardUpgradeState::WaitingForClusterStable,
             ShardUpgradeState::UpgradingOldMaster
         ));
         assert!(sm.can_transition(
@@ -870,6 +907,11 @@ mod tests {
         // Invalid transitions
         assert!(!sm.can_transition(ShardUpgradeState::Pending, ShardUpgradeState::Completed));
         assert!(!sm.can_transition(ShardUpgradeState::Completed, ShardUpgradeState::Pending));
+        // FailingOver should NOT go directly to UpgradingOldMaster anymore
+        assert!(!sm.can_transition(
+            ShardUpgradeState::FailingOver,
+            ShardUpgradeState::UpgradingOldMaster
+        ));
     }
 
     #[test]
@@ -882,6 +924,50 @@ mod tests {
 
         assert!(!sm.is_terminal(ShardUpgradeState::Pending));
         assert!(!sm.is_terminal(ShardUpgradeState::UpgradingReplicas));
+        assert!(!sm.is_terminal(ShardUpgradeState::WaitingForClusterStable));
+    }
+
+    #[test]
+    fn test_waiting_for_cluster_stable_transition() {
+        let sm = ShardStateMachine::new();
+
+        // WaitingForClusterStable transitions to UpgradingOldMaster when cluster is stable
+        let ctx = ShardTransitionContext {
+            cluster_stable: true,
+            ..Default::default()
+        };
+        let next = sm.transition(
+            ShardUpgradeState::WaitingForClusterStable,
+            ShardEvent::ClusterStabilized,
+            &ctx,
+        );
+        assert_eq!(next, Some(ShardUpgradeState::UpgradingOldMaster));
+
+        // WaitingForClusterStable transitions to Failed on error
+        let ctx = ShardTransitionContext::default();
+        let next = sm.transition(
+            ShardUpgradeState::WaitingForClusterStable,
+            ShardEvent::Failed,
+            &ctx,
+        );
+        assert_eq!(next, Some(ShardUpgradeState::Failed));
+    }
+
+    #[test]
+    fn test_failover_goes_to_waiting_for_stable() {
+        let sm = ShardStateMachine::new();
+
+        // FailingOver now transitions to WaitingForClusterStable (not UpgradingOldMaster)
+        let ctx = ShardTransitionContext {
+            failover_completed: true,
+            ..Default::default()
+        };
+        let next = sm.transition(
+            ShardUpgradeState::FailingOver,
+            ShardEvent::FailoverCompleted,
+            &ctx,
+        );
+        assert_eq!(next, Some(ShardUpgradeState::WaitingForClusterStable));
     }
 
     #[test]

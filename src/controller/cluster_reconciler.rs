@@ -3,6 +3,7 @@
 //! This module contains the main reconcile function that handles the lifecycle
 //! of ValkeyCluster custom resources.
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -32,6 +33,35 @@ pub const FIELD_MANAGER: &str = "valkey-operator";
 
 /// Finalizer name for graceful deletion
 pub const FINALIZER: &str = "valkey-operator.smoketurner.com/finalizer";
+
+/// Get the requeue duration for a given phase.
+///
+/// These are fallback intervals - the controller primarily reacts to watch events
+/// for immediate reconciliation. Short intervals ensure quick recovery from any
+/// missed events without unnecessary delay.
+fn requeue_duration(phase: ClusterPhase) -> std::time::Duration {
+    match phase {
+        // Running: periodic health check, can be longer
+        ClusterPhase::Running => std::time::Duration::from_secs(30),
+        // Active phases: quick requeue to catch state changes
+        ClusterPhase::Creating
+        | ClusterPhase::Initializing
+        | ClusterPhase::AssigningSlots
+        | ClusterPhase::DetectingChanges
+        | ClusterPhase::ScalingStatefulSet
+        | ClusterPhase::AddingNodes
+        | ClusterPhase::RemovingNodes
+        | ClusterPhase::VerifyingCluster => std::time::Duration::from_secs(2),
+        // Slot migration: moderate interval (migrations take time)
+        ClusterPhase::MigratingSlots => std::time::Duration::from_secs(5),
+        // Recovery phases: moderate interval
+        ClusterPhase::Degraded => std::time::Duration::from_secs(10),
+        // Failed: longer interval, needs manual intervention
+        ClusterPhase::Failed => std::time::Duration::from_secs(60),
+        // Pending/Deleting: moderate interval
+        ClusterPhase::Pending | ClusterPhase::Deleting => std::time::Duration::from_secs(5),
+    }
+}
 
 /// Reconcile a ValkeyCluster
 ///
@@ -82,6 +112,62 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
     // Initialize state machine for transition validation
     // TODO: Use state_machine for validating transitions and preventing invalid state changes
     let _state_machine = ClusterStateMachine::new();
+
+    // Stuck detection: check if we've been in the same non-terminal phase too long
+    // This prevents infinite loops and helps diagnose stuck operations
+    const MAX_RECONCILE_COUNT: i32 = 50;
+    const MAX_STUCK_DURATION_SECS: i64 = 300; // 5 minutes
+
+    let status = obj.status.as_ref();
+    let reconcile_count = status.map(|s| s.reconcile_count).unwrap_or(0);
+    let last_transition = status.and_then(|s| s.last_phase_transition.as_ref());
+
+    // Check for stuck condition (only in non-terminal, non-running phases)
+    let is_operational_phase = matches!(
+        current_phase,
+        ClusterPhase::Creating
+            | ClusterPhase::Initializing
+            | ClusterPhase::AssigningSlots
+            | ClusterPhase::DetectingChanges
+            | ClusterPhase::ScalingStatefulSet
+            | ClusterPhase::AddingNodes
+            | ClusterPhase::MigratingSlots
+            | ClusterPhase::RemovingNodes
+            | ClusterPhase::VerifyingCluster
+    );
+
+    if is_operational_phase {
+        // Check iteration count
+        if reconcile_count > MAX_RECONCILE_COUNT {
+            let error_msg = format!(
+                "Phase {} stuck: {} reconcile iterations exceeded threshold of {}",
+                current_phase, reconcile_count, MAX_RECONCILE_COUNT
+            );
+            error!(name = %name, phase = %current_phase, reconcile_count = reconcile_count, "Stuck detection triggered");
+            ctx.publish_warning_event(&obj, "StuckDetected", "Reconciling", Some(error_msg.clone()))
+                .await;
+            update_status(&api, &name, ClusterPhase::Failed, 0, Some(&error_msg), None).await?;
+            return Ok(Action::requeue(requeue_duration(ClusterPhase::Failed)));
+        }
+
+        // Check time-based stuck detection
+        if let Some(transition_time) = last_transition
+            && let Ok(ts) = jiff::Timestamp::from_str(transition_time)
+        {
+            let elapsed = jiff::Timestamp::now().duration_since(ts).as_secs();
+            if elapsed > MAX_STUCK_DURATION_SECS {
+                let error_msg = format!(
+                    "Phase {} stuck: {} seconds since last transition exceeds threshold of {}",
+                    current_phase, elapsed, MAX_STUCK_DURATION_SECS
+                );
+                error!(name = %name, phase = %current_phase, elapsed_secs = elapsed, "Stuck detection triggered");
+                ctx.publish_warning_event(&obj, "StuckDetected", "Reconciling", Some(error_msg.clone()))
+                    .await;
+                update_status(&api, &name, ClusterPhase::Failed, 0, Some(&error_msg), None).await?;
+                return Ok(Action::requeue(requeue_duration(ClusterPhase::Failed)));
+            }
+        }
+    }
 
     // Determine next phase based on current state
     let next_phase = match current_phase {
@@ -153,11 +239,11 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                 ctx.publish_normal_event(
                     &obj,
                     "SpecChanged",
-                    "Updating",
-                    Some("Resource spec changed, applying updates".to_string()),
+                    "DetectingChanges",
+                    Some("Resource spec changed, detecting required changes".to_string()),
                 )
                 .await;
-                ClusterPhase::Updating
+                ClusterPhase::DetectingChanges
             } else {
                 // Ensure resources are in sync
                 create_owned_resources(&obj, &ctx, &namespace).await?;
@@ -178,156 +264,6 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     ClusterPhase::Degraded
                 } else {
                     ClusterPhase::Running
-                }
-            }
-        }
-        ClusterPhase::Updating => {
-            // Apply updates
-            create_owned_resources(&obj, &ctx, &namespace).await?;
-
-            // Check running pods - new pods might need to be added to cluster
-            let running_pods = check_running_pods(&obj, &ctx, &namespace).await?;
-            let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
-
-            // Check if all desired pods are running
-            if running_pods < desired_replicas {
-                debug!(
-                    name = %name,
-                    running = running_pods,
-                    desired = desired_replicas,
-                    "Waiting for pods to be running"
-                );
-                ClusterPhase::Updating
-            } else {
-                // All pods are running, check if new nodes need to be added to cluster
-                let nodes_in_cluster = get_nodes_in_cluster_count(&obj, &ctx, &namespace).await?;
-
-                if nodes_in_cluster < desired_replicas {
-                    // New pods need to be added to cluster via CLUSTER MEET + REPLICATE
-                    info!(
-                        name = %name,
-                        nodes_in_cluster = nodes_in_cluster,
-                        desired = desired_replicas,
-                        "New pods detected, adding to cluster"
-                    );
-
-                    match add_new_replicas_to_cluster(&obj, &ctx, &namespace).await {
-                        Ok(added) => {
-                            info!(name = %name, added = added, "Added new replicas to cluster");
-                            ctx.publish_normal_event(
-                                &obj,
-                                "ReplicasAdded",
-                                "Updating",
-                                Some(format!("Added {} new replicas to cluster", added)),
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            warn!(name = %name, error = %e, "Failed to add replicas, will retry");
-                            ctx.publish_warning_event(
-                                &obj,
-                                "ReplicaAddFailed",
-                                "Updating",
-                                Some(format!("Failed to add replicas: {}", e)),
-                            )
-                            .await;
-                        }
-                    }
-                    // Stay in Updating to verify all replicas are ready
-                    ClusterPhase::Updating
-                } else {
-                    // All pods are in cluster, check ready status
-                    let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
-
-                    // Check if we have the exact number of ready replicas
-                    // For scale-down, we need to wait for extra pods to terminate
-                    if ready_replicas > desired_replicas {
-                        // Scale-down in progress, wait for StatefulSet to terminate extra pods
-                        debug!(
-                            name = %name,
-                            ready = ready_replicas,
-                            desired = desired_replicas,
-                            "Waiting for scale-down to complete (too many ready pods)"
-                        );
-                        ClusterPhase::Updating
-                    } else if ready_replicas >= desired_replicas {
-                        // Check if this update involves scaling (masters count change)
-                        let current_masters =
-                            get_current_master_count(&obj, &ctx, &namespace).await?;
-                        let target_masters = obj.spec.masters;
-
-                        if current_masters != target_masters && current_masters > 0 {
-                            // Check if operation is allowed (no upgrade/init in progress)
-                            if let Err(e) = operation_coordination::check_operation_allowed(
-                                &api,
-                                &name,
-                                OperationType::Scaling,
-                            )
-                            .await
-                            {
-                                warn!(
-                                    name = %name,
-                                    error = %e,
-                                    "Cannot start scaling operation due to operation conflict"
-                                );
-                                ctx.publish_warning_event(
-                                    &obj,
-                                    "ScalingBlocked",
-                                    "Updating",
-                                    Some(e.to_string()),
-                                )
-                                .await;
-                                // Stay in Updating to retry later
-                                ClusterPhase::Updating
-                            } else {
-                                // Scaling operation needed - transition to Resharding
-                                let direction = if target_masters > current_masters {
-                                    "up"
-                                } else {
-                                    "down"
-                                };
-                                info!(
-                                    name = %name,
-                                    current_masters = current_masters,
-                                    target_masters = target_masters,
-                                    direction = direction,
-                                    "Scaling detected, transitioning to Resharding"
-                                );
-                                ctx.publish_normal_event(
-                                    &obj,
-                                    "ScalingDetected",
-                                    "Updating",
-                                    Some(format!(
-                                        "Scaling {} from {} to {} masters",
-                                        direction, current_masters, target_masters
-                                    )),
-                                )
-                                .await;
-                                ClusterPhase::Resharding
-                            }
-                        } else {
-                            // No scaling needed, ready_replicas >= desired_replicas
-                            // Readiness probe verifies cluster_state:ok, so we can
-                            // transition to Running
-                            ctx.publish_normal_event(
-                                &obj,
-                                "Updated",
-                                "Updating",
-                                Some("Resource update completed successfully".to_string()),
-                            )
-                            .await;
-                            ClusterPhase::Running
-                        }
-                    } else {
-                        // Wait for pods to become ready
-                        debug!(
-                            name = %name,
-                            ready = ready_replicas,
-                            desired = desired_replicas,
-                            "Waiting for pods to become ready"
-                        );
-                        ClusterPhase::Updating
-                    }
                 }
             }
         }
@@ -522,126 +458,31 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                 }
             }
         }
-        ClusterPhase::Resharding => {
-            // Hash slots are being migrated (scaling operation)
-            info!(name = %name, "Executing scaling operation");
-
-            // Acquire operation lock for scaling
-            if let Err(e) =
-                operation_coordination::start_operation(&api, &name, OperationType::Scaling).await
-            {
-                warn!(name = %name, error = %e, "Failed to acquire operation lock for scaling");
-                // If lock acquisition fails, stay in Resharding to retry
-                return Ok(Action::requeue(std::time::Duration::from_secs(10)));
-            }
-
-            let scaling_result = execute_scaling_operation(&obj, &ctx, &namespace).await;
-
-            // Release operation lock regardless of result
-            let _ = operation_coordination::complete_operation(&api, &name, OperationType::Scaling)
-                .await;
-
-            match scaling_result {
-                Ok(result) => {
-                    if result.success {
-                        let direction = if !result.nodes_added.is_empty() {
-                            "up"
-                        } else {
-                            "down"
-                        };
-                        info!(
-                            name = %name,
-                            direction = direction,
-                            nodes_added = result.nodes_added.len(),
-                            nodes_removed = result.nodes_removed.len(),
-                            slots_moved = result.slots_moved,
-                            "Scaling operation completed"
-                        );
-                        ctx.publish_normal_event(
-                            &obj,
-                            "ReshardingComplete",
-                            "Scaling",
-                            Some(format!(
-                                "Scaling {} complete: {} slots moved",
-                                direction, result.slots_moved
-                            )),
-                        )
-                        .await;
-
-                        // Update StatefulSet with new replica count after scaling
-                        // This is especially important for scale down where the
-                        // StatefulSet replicas need to be reduced
-                        if let Err(e) = create_owned_resources(&obj, &ctx, &namespace).await {
-                            warn!(
-                                name = %name,
-                                error = %e,
-                                "Failed to update resources after scaling, will retry"
-                            );
-                            return Ok(Action::requeue(std::time::Duration::from_secs(5)));
-                        }
-
-                        // For scale-down, verify the StatefulSet has the correct number
-                        // of ready replicas before transitioning to Running
-                        let desired_replicas =
-                            total_pods(obj.spec.masters, obj.spec.replicas_per_master);
-                        let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace)
-                            .await
-                            .unwrap_or(0);
-
-                        if ready_replicas > desired_replicas {
-                            // Scale-down not complete yet, stay in Updating to wait
-                            info!(
-                                name = %name,
-                                ready = ready_replicas,
-                                desired = desired_replicas,
-                                "Waiting for StatefulSet to scale down"
-                            );
-                            ClusterPhase::Updating
-                        } else if ready_replicas == desired_replicas {
-                            // All pods at desired count and ready (readiness probe passed)
-                            // Readiness probe verifies cluster_state:ok, so we can
-                            // transition to Running without additional health check
-                            ClusterPhase::Running
-                        } else {
-                            // Fewer ready than desired - pods still coming up after scale
-                            debug!(
-                                name = %name,
-                                ready = ready_replicas,
-                                desired = desired_replicas,
-                                "Waiting for pods to become ready after scaling"
-                            );
-                            ClusterPhase::Updating
-                        }
-                    } else {
-                        warn!(
-                            name = %name,
-                            error = ?result.error,
-                            "Scaling operation failed"
-                        );
-                        ctx.publish_warning_event(
-                            &obj,
-                            "ReshardingFailed",
-                            "Scaling",
-                            result.error.clone(),
-                        )
-                        .await;
-                        // Stay in Resharding to retry
-                        ClusterPhase::Resharding
-                    }
-                }
-                Err(e) => {
-                    warn!(name = %name, error = %e, "Scaling operation error, will retry");
-                    ctx.publish_warning_event(
-                        &obj,
-                        "ReshardingFailed",
-                        "Scaling",
-                        Some(format!("Scaling failed: {}", e)),
-                    )
-                    .await;
-                    // Stay in Resharding to retry
-                    ClusterPhase::Resharding
-                }
-            }
+        // Granular phases for scaling operations
+        // These provide better observability and resumability
+        ClusterPhase::DetectingChanges => {
+            // Compute what changes are needed and store in pending_changes
+            handle_detecting_changes(&obj, &ctx, &api, &namespace).await?
+        }
+        ClusterPhase::ScalingStatefulSet => {
+            // Update StatefulSet replica count
+            handle_scaling_statefulset(&obj, &ctx, &api, &namespace).await?
+        }
+        ClusterPhase::AddingNodes => {
+            // Execute CLUSTER MEET for new nodes
+            handle_adding_nodes(&obj, &ctx, &api, &namespace).await?
+        }
+        ClusterPhase::MigratingSlots => {
+            // Migrate slots for rebalancing
+            handle_migrating_slots(&obj, &ctx, &api, &namespace).await?
+        }
+        ClusterPhase::RemovingNodes => {
+            // Execute CLUSTER FORGET for removed nodes
+            handle_removing_nodes(&obj, &ctx, &api, &namespace).await?
+        }
+        ClusterPhase::VerifyingCluster => {
+            // Final health check before transitioning to Running
+            handle_verifying_cluster(&obj, &ctx, &api, &namespace).await?
         }
         ClusterPhase::Failed => {
             // Manual intervention required
@@ -702,20 +543,8 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
         );
     }
 
-    // Determine requeue interval based on state
-    let requeue_duration = match next_phase {
-        ClusterPhase::Running => std::time::Duration::from_secs(60),
-        ClusterPhase::Creating | ClusterPhase::Updating => std::time::Duration::from_secs(10),
-        ClusterPhase::Initializing | ClusterPhase::AssigningSlots => {
-            std::time::Duration::from_secs(5)
-        }
-        ClusterPhase::Resharding => std::time::Duration::from_secs(15),
-        ClusterPhase::Degraded => std::time::Duration::from_secs(30),
-        ClusterPhase::Failed => std::time::Duration::from_secs(300),
-        ClusterPhase::Pending | ClusterPhase::Deleting => std::time::Duration::from_secs(30),
-    };
-
-    Ok(Action::requeue(requeue_duration))
+    // Determine requeue interval based on state (uses fast mode if VALKEY_OPERATOR_FAST_REQUEUE=1)
+    Ok(Action::requeue(requeue_duration(next_phase)))
 }
 
 /// Error policy for the controller
@@ -1224,6 +1053,27 @@ async fn update_status(
         None
     };
 
+    // Preserve new status fields if present
+    let pending_changes = existing_status.and_then(|s| s.pending_changes.clone());
+    let operation_progress = existing_status.and_then(|s| s.operation_progress.clone());
+    let message = existing_status.map(|s| s.message.clone()).unwrap_or_default();
+    let last_phase_transition = existing_status.and_then(|s| s.last_phase_transition.clone());
+
+    // Track reconcile count for stuck detection
+    let prev_phase = existing_status.map(|s| s.phase).unwrap_or(ClusterPhase::Pending);
+    let reconcile_count = if phase == prev_phase {
+        existing_status.map(|s| s.reconcile_count).unwrap_or(0) + 1
+    } else {
+        0
+    };
+
+    // Update last_phase_transition if phase changed
+    let last_phase_transition = if phase != prev_phase {
+        Some(jiff::Timestamp::now().to_string())
+    } else {
+        last_phase_transition
+    };
+
     let status = ValkeyClusterStatus {
         phase,
         ready_nodes: format!("{}/{}", ready_replicas, desired_replicas),
@@ -1239,6 +1089,11 @@ async fn update_status(
         tls_secret: Some(tls_secret_name),
         current_operation,
         operation_started_at,
+        pending_changes,
+        operation_progress,
+        message,
+        reconcile_count,
+        last_phase_transition,
     };
 
     let patch = serde_json::json!({
@@ -1292,6 +1147,10 @@ async fn get_current_master_count(
 }
 
 /// Execute a scaling operation (scale up or scale down).
+///
+/// For scale-down operations, this function connects directly to each source node
+/// to execute CLUSTER MIGRATESLOTS, since that command must run on the node that
+/// owns the slots being migrated.
 async fn execute_scaling_operation(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -1333,23 +1192,296 @@ async fn execute_scaling_operation(
             target = target_masters,
             "Executing scale up"
         );
-        client.scale_up(&scaling_ctx).await
+        let result = client.scale_up(&scaling_ctx).await;
+        let _ = client.close().await;
+        result
     } else if scaling_ctx.is_scale_down() {
         info!(
             current = current_masters,
             target = target_masters,
             "Executing scale down"
         );
-        client.scale_down(&scaling_ctx).await
+        // For scale-down, we need to connect to each source node directly
+        // because CLUSTER MIGRATESLOTS must be executed on the source node
+        let _ = client.close().await;
+        execute_scale_down(obj, ctx, namespace, &cluster_nodes, &scaling_ctx).await
     } else {
         // No scaling needed
         let _ = client.close().await;
         return Ok(crate::client::ScalingResult::default());
     };
 
+    result.map_err(|e| Error::Valkey(format!("Scaling operation failed: {}", e)))
+}
+
+/// Execute a scale-down operation with proper per-node connections.
+///
+/// CLUSTER MIGRATESLOTS must be executed on the source node (the node that currently
+/// owns the slots). This function connects to each node being removed and executes
+/// the migration commands from there.
+async fn execute_scale_down(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+    cluster_nodes: &crate::client::ParsedClusterNodes,
+    scaling_ctx: &ScalingContext,
+) -> Result<crate::client::ScalingResult, crate::client::ValkeyError> {
+    use crate::client::ValkeyError;
+    use std::collections::HashMap;
+
+    let mut result = crate::client::ScalingResult::default();
+    let masters: Vec<_> = cluster_nodes.masters().into_iter().collect();
+
+    // Find masters to remove (highest ordinals)
+    let ordinals_to_remove = scaling_ctx.masters_to_remove();
+
+    // Get pod IPs to build a mapping from IP -> ordinal
+    // CLUSTER NODES returns IP addresses, not DNS names, so we need this mapping
+    let cluster_name = obj.name_any();
+    let current_total =
+        crate::crd::total_pods(scaling_ctx.current_masters, obj.spec.replicas_per_master);
+
+    let pod_ips =
+        cluster_init::get_pod_ips(&ctx.client, namespace, &cluster_name, current_total).await?;
+
+    // Build IP -> ordinal mapping
+    let ip_to_ordinal: HashMap<&str, i32> = pod_ips
+        .iter()
+        .filter_map(|(pod_name, ip, _)| {
+            // Extract ordinal from pod name (e.g., "scale-down-test-3" -> 3)
+            let ordinal = pod_name.rsplit('-').next()?.parse().ok()?;
+            Some((ip.as_str(), ordinal))
+        })
+        .collect();
+
+    // Find nodes to remove by matching their IPs to ordinals
+    let nodes_to_remove: Vec<_> = masters
+        .iter()
+        .filter(|m| {
+            if let Some(&ordinal) = ip_to_ordinal.get(m.ip.as_str()) {
+                ordinals_to_remove.contains(&ordinal)
+            } else {
+                false
+            }
+        })
+        .copied()
+        .collect();
+
+    if nodes_to_remove.is_empty() {
+        warn!(
+            ordinals_to_remove = ?ordinals_to_remove,
+            master_ips = ?masters.iter().map(|m| &m.ip).collect::<Vec<_>>(),
+            ip_to_ordinal = ?ip_to_ordinal,
+            "No nodes found to remove, skipping scale down"
+        );
+        return Ok(result);
+    }
+
+    // Find remaining masters (those not being removed)
+    let remaining_masters: Vec<_> = masters
+        .iter()
+        .filter(|m| !nodes_to_remove.iter().any(|n| n.node_id == m.node_id))
+        .copied()
+        .collect();
+
+    if remaining_masters.is_empty() {
+        return Err(ValkeyError::InvalidConfig(
+            "Cannot scale down: no remaining masters to receive slots".to_string(),
+        ));
+    }
+
+    info!(
+        nodes_to_remove = nodes_to_remove.len(),
+        remaining_masters = remaining_masters.len(),
+        "Starting scale-down slot migration"
+    );
+
+    // Migrate slots from each node being removed
+    for node in &nodes_to_remove {
+        let slot_ranges = node.slots.clone();
+
+        if slot_ranges.is_empty() {
+            debug!(node_id = %node.node_id, "Node has no slots to migrate");
+            continue;
+        }
+
+        // Look up the ordinal for this node's IP
+        let Some(&ordinal) = ip_to_ordinal.get(node.ip.as_str()) else {
+            return Err(ValkeyError::InvalidConfig(format!(
+                "Cannot find ordinal for node IP {}: no matching pod",
+                node.ip
+            )));
+        };
+
+        info!(
+            node_id = %node.node_id,
+            ip = %node.ip,
+            ordinal = ordinal,
+            slot_ranges = slot_ranges.len(),
+            "Connecting to source node for slot migration"
+        );
+
+        // Connect to the source node via port forwarding using its ordinal
+        // CLUSTER MIGRATESLOTS must be executed on the node that owns the slots
+        let source_client = ctx
+            .connect_to_cluster(obj, namespace, ordinal)
+            .await
+            .map_err(|e| {
+                ValkeyError::Connection(format!(
+                    "Failed to connect to source node {} (ordinal {}): {}",
+                    node.node_id, ordinal, e
+                ))
+            })?;
+
+        // Migrate each slot range to a remaining master (round-robin)
+        for (range_idx, range) in slot_ranges.iter().enumerate() {
+            let dest_idx = range_idx % remaining_masters.len();
+            let Some(dest_node) = remaining_masters.get(dest_idx) else {
+                let _ = source_client.close().await;
+                return Err(ValkeyError::InvalidConfig(
+                    "Cannot determine destination master for slot migration".to_string(),
+                ));
+            };
+
+            info!(
+                from_node = %node.node_id,
+                to_node = %dest_node.node_id,
+                start_slot = range.start,
+                end_slot = range.end,
+                "Migrating slot range using CLUSTER MIGRATESLOTS"
+            );
+
+            // Execute CLUSTER MIGRATESLOTS from the source node
+            match source_client
+                .cluster_migrateslots(range.start as u16, range.end as u16, &dest_node.node_id)
+                .await
+            {
+                Ok(()) => {
+                    // Wait for migration to complete
+                    if let Err(e) = wait_for_slot_migration(
+                        ctx,
+                        obj,
+                        namespace,
+                        range.start as u16,
+                        range.end as u16,
+                        &dest_node.node_id,
+                    )
+                    .await
+                    {
+                        let _ = source_client.close().await;
+                        return Err(e);
+                    }
+                    result.slots_moved += range.end - range.start + 1;
+                    debug!(range = ?range, "Slot range migration completed");
+                }
+                Err(e) => {
+                    warn!(
+                        range = ?range,
+                        error = %e,
+                        "Failed to migrate slot range"
+                    );
+                    let _ = source_client.close().await;
+                    return Err(e);
+                }
+            }
+        }
+
+        let _ = source_client.close().await;
+    }
+
+    // After all migrations complete, CLUSTER FORGET the removed nodes
+    // This can be done from any node in the cluster
+    let client = ctx
+        .connect_to_cluster(obj, namespace, 0)
+        .await
+        .map_err(|e| ValkeyError::Connection(format!("Failed to connect for FORGET: {}", e)))?;
+
+    for node in &nodes_to_remove {
+        info!(node_id = %node.node_id, "Removing node from cluster via CLUSTER FORGET");
+        if let Err(e) = client.cluster_forget(&node.node_id).await {
+            warn!(node_id = %node.node_id, error = %e, "Failed to forget node, continuing");
+            // Don't fail the whole operation if FORGET fails for one node
+        }
+        result.nodes_removed.push(node.node_id.clone());
+    }
+
     let _ = client.close().await;
 
-    result.map_err(|e| Error::Valkey(format!("Scaling operation failed: {}", e)))
+    info!(
+        nodes_removed = result.nodes_removed.len(),
+        slots_moved = result.slots_moved,
+        "Scale down complete"
+    );
+
+    Ok(result)
+}
+
+/// Wait for a slot migration to complete by polling cluster state.
+async fn wait_for_slot_migration(
+    ctx: &Context,
+    obj: &ValkeyCluster,
+    namespace: &str,
+    start_slot: u16,
+    end_slot: u16,
+    target_node_id: &str,
+) -> Result<(), crate::client::ValkeyError> {
+    use crate::client::ValkeyError;
+    use std::time::{Duration, Instant};
+
+    const MAX_WAIT_SECS: u64 = 300; // 5 minutes max
+    const POLL_INTERVAL_SECS: u64 = 2;
+    let start = Instant::now();
+
+    loop {
+        if start.elapsed().as_secs() > MAX_WAIT_SECS {
+            return Err(ValkeyError::Timeout {
+                operation: format!(
+                    "Slot migration {}-{} to {}",
+                    start_slot, end_slot, target_node_id
+                ),
+                duration: Duration::from_secs(MAX_WAIT_SECS),
+            });
+        }
+
+        // Connect to check cluster state
+        let client = ctx.connect_to_cluster(obj, namespace, 0).await.map_err(|e| {
+            ValkeyError::Connection(format!("Failed to connect for migration check: {}", e))
+        })?;
+
+        let nodes_result = client.cluster_nodes().await;
+        let _ = client.close().await;
+
+        match nodes_result {
+            Ok(nodes) => {
+                if let Some(target) = nodes.get_node(target_node_id) {
+                    // Check if target node now owns the slot range
+                    let owns_range = target.slots.iter().any(|range| {
+                        range.start <= start_slot as i32 && range.end >= end_slot as i32
+                    });
+
+                    if owns_range {
+                        debug!(
+                            start_slot = start_slot,
+                            end_slot = end_slot,
+                            "Slot range migration verified"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "Failed to get cluster nodes, will retry");
+            }
+        }
+
+        // Migration still in progress, wait and poll again
+        debug!(
+            start_slot = start_slot,
+            end_slot = end_slot,
+            "Slot migration in progress, waiting..."
+        );
+        tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+    }
 }
 
 /// Get the total number of nodes in the Valkey cluster.
@@ -1554,6 +1686,544 @@ async fn add_new_replicas_to_cluster(
     }
 
     Ok(added)
+}
+
+// ============================================================================
+// Phase Handlers - Granular scaling operation phases
+// ============================================================================
+
+/// Handle DetectingChanges phase.
+///
+/// Computes what changes are needed (scale direction, nodes to add/remove)
+/// and stores them in `pending_changes` status field.
+async fn handle_detecting_changes(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    api: &Api<ValkeyCluster>,
+    namespace: &str,
+) -> Result<ClusterPhase, Error> {
+    let name = obj.name_any();
+    info!(name = %name, "Detecting changes for cluster update");
+
+    // Get current cluster state
+    let current_masters = get_current_master_count(obj, ctx, namespace).await?;
+    let target_masters = obj.spec.masters;
+    let target_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+
+    // Get running pods to compare
+    let running_pods = check_running_pods(obj, ctx, namespace).await?;
+
+    // Determine scale direction
+    let scale_direction = if current_masters > target_masters && current_masters > 0 {
+        "down"
+    } else if current_masters < target_masters && current_masters > 0 {
+        "up"
+    } else if running_pods != target_replicas {
+        "replica_change"
+    } else {
+        "none"
+    };
+
+    info!(
+        name = %name,
+        current_masters = current_masters,
+        target_masters = target_masters,
+        running_pods = running_pods,
+        target_replicas = target_replicas,
+        scale_direction = scale_direction,
+        "Change detection complete"
+    );
+
+    // Compute nodes to add/remove
+    let (nodes_to_add, nodes_to_remove) = if scale_direction == "up" {
+        let new_masters: Vec<String> = (current_masters..target_masters)
+            .map(|i| format!("{}-{}", name, i))
+            .collect();
+        (new_masters, Vec::new())
+    } else if scale_direction == "down" {
+        let removed_masters: Vec<String> = (target_masters..current_masters)
+            .map(|i| format!("{}-{}", name, i))
+            .collect();
+        (Vec::new(), removed_masters)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    // Create PendingChanges
+    let pending_changes = crate::crd::PendingChanges {
+        scale_direction: scale_direction.to_string(),
+        previous_masters: current_masters,
+        target_masters,
+        nodes_to_add: nodes_to_add.clone(),
+        nodes_to_remove: nodes_to_remove.clone(),
+        slot_migrations: Vec::new(), // Will be populated during MigratingSlots
+        requires_rolling_update: false,
+        for_generation: obj.metadata.generation.unwrap_or(0),
+    };
+
+    // Update status with pending changes
+    let mut status = obj.status.clone().unwrap_or_default();
+    status.pending_changes = Some(pending_changes);
+    status.message = format!("Detected {} operation", scale_direction);
+
+    // Update status via patch
+    let patch = serde_json::json!({
+        "status": status
+    });
+    api.patch_status(
+        &name,
+        &kube::api::PatchParams::apply(FIELD_MANAGER),
+        &kube::api::Patch::Merge(&patch),
+    )
+    .await?;
+
+    // Check if operation is allowed
+    if scale_direction != "none"
+        && let Err(e) =
+            operation_coordination::check_operation_allowed(api, &name, OperationType::Scaling).await
+    {
+        warn!(name = %name, error = %e, "Cannot start scaling operation due to conflict");
+        ctx.publish_warning_event(
+            obj,
+            "ScalingBlocked",
+            "DetectingChanges",
+            Some(e.to_string()),
+        )
+        .await;
+        // Stay in DetectingChanges to retry
+        return Ok(ClusterPhase::DetectingChanges);
+    }
+
+    ctx.publish_normal_event(
+        obj,
+        "ChangesDetected",
+        "DetectingChanges",
+        Some(format!(
+            "Detected {} operation: {} -> {} masters",
+            scale_direction, current_masters, target_masters
+        )),
+    )
+    .await;
+
+    // Determine next phase based on scale direction
+    match scale_direction {
+        "down" => {
+            // Scale-down: must migrate slots BEFORE removing pods
+            Ok(ClusterPhase::MigratingSlots)
+        }
+        "up" | "replica_change" => {
+            // Scale-up or replica change: update StatefulSet first
+            Ok(ClusterPhase::ScalingStatefulSet)
+        }
+        _ => {
+            // No changes needed
+            Ok(ClusterPhase::Running)
+        }
+    }
+}
+
+/// Handle ScalingStatefulSet phase.
+///
+/// Updates the StatefulSet replica count and waits for pods to be ready.
+async fn handle_scaling_statefulset(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    _api: &Api<ValkeyCluster>,
+    namespace: &str,
+) -> Result<ClusterPhase, Error> {
+    let name = obj.name_any();
+    info!(name = %name, "Scaling StatefulSet");
+
+    // Apply StatefulSet changes
+    create_owned_resources(obj, ctx, namespace).await?;
+
+    // Get pending changes to determine what we're doing
+    let pending_changes = obj
+        .status
+        .as_ref()
+        .and_then(|s| s.pending_changes.as_ref());
+
+    let scale_direction = pending_changes
+        .map(|p| p.scale_direction.as_str())
+        .unwrap_or("none");
+
+    // Check running pods
+    let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+    let running_pods = check_running_pods(obj, ctx, namespace).await?;
+
+    if scale_direction == "down" {
+        // For scale-down, we're reducing replicas AFTER slot migration
+        // StatefulSet should already be updated, just verify
+        if running_pods <= desired_replicas {
+            info!(
+                name = %name,
+                running = running_pods,
+                desired = desired_replicas,
+                "StatefulSet scaled down, verifying cluster"
+            );
+            ctx.publish_normal_event(
+                obj,
+                "StatefulSetScaled",
+                "ScalingStatefulSet",
+                Some(format!("StatefulSet scaled to {} pods", desired_replicas)),
+            )
+            .await;
+            return Ok(ClusterPhase::VerifyingCluster);
+        } else {
+            // Still waiting for pods to terminate
+            debug!(
+                name = %name,
+                running = running_pods,
+                desired = desired_replicas,
+                "Waiting for StatefulSet to scale down"
+            );
+            return Ok(ClusterPhase::ScalingStatefulSet);
+        }
+    }
+
+    // For scale-up, wait for all pods to be running
+    if running_pods < desired_replicas {
+        debug!(
+            name = %name,
+            running = running_pods,
+            desired = desired_replicas,
+            "Waiting for pods to start"
+        );
+        return Ok(ClusterPhase::ScalingStatefulSet);
+    }
+
+    // All pods running, move to adding nodes
+    info!(
+        name = %name,
+        running = running_pods,
+        "All pods running, proceeding to add nodes to cluster"
+    );
+
+    ctx.publish_normal_event(
+        obj,
+        "PodsReady",
+        "ScalingStatefulSet",
+        Some(format!("{} pods ready", running_pods)),
+    )
+    .await;
+
+    Ok(ClusterPhase::AddingNodes)
+}
+
+/// Handle AddingNodes phase.
+///
+/// Executes CLUSTER MEET for new nodes to join the cluster.
+async fn handle_adding_nodes(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    _api: &Api<ValkeyCluster>,
+    namespace: &str,
+) -> Result<ClusterPhase, Error> {
+    let name = obj.name_any();
+    info!(name = %name, "Adding new nodes to cluster");
+
+    // Get pending changes to see what nodes to add
+    let pending_changes = obj
+        .status
+        .as_ref()
+        .and_then(|s| s.pending_changes.as_ref());
+
+    let nodes_to_add = pending_changes
+        .map(|p| p.nodes_to_add.clone())
+        .unwrap_or_default();
+
+    if nodes_to_add.is_empty() {
+        // No new master nodes, but might have new replicas
+        match add_new_replicas_to_cluster(obj, ctx, namespace).await {
+            Ok(added) if added > 0 => {
+                info!(name = %name, added = added, "Added new replicas to cluster");
+                ctx.publish_normal_event(
+                    obj,
+                    "ReplicasAdded",
+                    "AddingNodes",
+                    Some(format!("Added {} new replicas", added)),
+                )
+                .await;
+            }
+            Ok(_) => {
+                debug!(name = %name, "No new replicas to add");
+            }
+            Err(e) => {
+                warn!(name = %name, error = %e, "Failed to add replicas, will retry");
+                return Ok(ClusterPhase::AddingNodes);
+            }
+        }
+        // No scaling needed, verify cluster
+        return Ok(ClusterPhase::VerifyingCluster);
+    }
+
+    // Check how many nodes are in the cluster
+    let nodes_in_cluster = get_nodes_in_cluster_count(obj, ctx, namespace).await?;
+    let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+
+    if nodes_in_cluster >= desired_replicas {
+        // All nodes already in cluster
+        info!(
+            name = %name,
+            nodes = nodes_in_cluster,
+            "All nodes in cluster, proceeding to slot migration"
+        );
+        ctx.publish_normal_event(
+            obj,
+            "NodesAdded",
+            "AddingNodes",
+            Some(format!("{} nodes in cluster", nodes_in_cluster)),
+        )
+        .await;
+        return Ok(ClusterPhase::MigratingSlots);
+    }
+
+    // Add new replicas (which includes CLUSTER MEET for new masters)
+    match add_new_replicas_to_cluster(obj, ctx, namespace).await {
+        Ok(added) => {
+            info!(name = %name, added = added, "Added nodes to cluster");
+            ctx.publish_normal_event(
+                obj,
+                "NodesAdded",
+                "AddingNodes",
+                Some(format!("Added {} nodes to cluster", added)),
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!(name = %name, error = %e, "Failed to add nodes, will retry");
+            ctx.publish_warning_event(
+                obj,
+                "NodeAddFailed",
+                "AddingNodes",
+                Some(format!("Failed to add nodes: {}", e)),
+            )
+            .await;
+            return Ok(ClusterPhase::AddingNodes);
+        }
+    }
+
+    // Check again if all nodes are now in cluster
+    let nodes_in_cluster = get_nodes_in_cluster_count(obj, ctx, namespace).await?;
+    if nodes_in_cluster >= desired_replicas {
+        Ok(ClusterPhase::MigratingSlots)
+    } else {
+        // Still more nodes to add
+        Ok(ClusterPhase::AddingNodes)
+    }
+}
+
+/// Handle MigratingSlots phase.
+///
+/// Migrates slots for rebalancing during scale operations.
+async fn handle_migrating_slots(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    api: &Api<ValkeyCluster>,
+    namespace: &str,
+) -> Result<ClusterPhase, Error> {
+    let name = obj.name_any();
+    info!(name = %name, "Migrating slots");
+
+    // Acquire operation lock for scaling
+    if let Err(e) =
+        operation_coordination::start_operation(api, &name, OperationType::Scaling).await
+    {
+        warn!(name = %name, error = %e, "Failed to acquire operation lock");
+        return Ok(ClusterPhase::MigratingSlots);
+    }
+
+    // Execute the scaling operation (which handles slot migration)
+    let scaling_result = execute_scaling_operation(obj, ctx, namespace).await;
+
+    // Release operation lock
+    let _ = operation_coordination::complete_operation(api, &name, OperationType::Scaling).await;
+
+    match scaling_result {
+        Ok(result) => {
+            if result.success {
+                info!(
+                    name = %name,
+                    slots_moved = result.slots_moved,
+                    nodes_added = result.nodes_added.len(),
+                    nodes_removed = result.nodes_removed.len(),
+                    "Slot migration completed"
+                );
+
+                ctx.publish_normal_event(
+                    obj,
+                    "SlotsMigrated",
+                    "MigratingSlots",
+                    Some(format!("{} slots migrated", result.slots_moved)),
+                )
+                .await;
+
+                // Determine next phase based on operation type
+                let pending_changes = obj
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.pending_changes.as_ref());
+
+                let scale_direction = pending_changes
+                    .map(|p| p.scale_direction.as_str())
+                    .unwrap_or("none");
+
+                if scale_direction == "down" {
+                    // Scale-down: need to remove nodes from cluster
+                    Ok(ClusterPhase::RemovingNodes)
+                } else {
+                    // Scale-up: verify cluster health
+                    Ok(ClusterPhase::VerifyingCluster)
+                }
+            } else {
+                warn!(name = %name, error = ?result.error, "Slot migration failed");
+                ctx.publish_warning_event(
+                    obj,
+                    "SlotMigrationFailed",
+                    "MigratingSlots",
+                    result.error.clone(),
+                )
+                .await;
+                // Stay in MigratingSlots to retry
+                Ok(ClusterPhase::MigratingSlots)
+            }
+        }
+        Err(e) => {
+            warn!(name = %name, error = %e, "Slot migration error");
+            ctx.publish_warning_event(
+                obj,
+                "SlotMigrationFailed",
+                "MigratingSlots",
+                Some(format!("Migration failed: {}", e)),
+            )
+            .await;
+            // Stay in MigratingSlots to retry
+            Ok(ClusterPhase::MigratingSlots)
+        }
+    }
+}
+
+/// Handle RemovingNodes phase.
+///
+/// Executes CLUSTER FORGET for nodes being removed during scale-down.
+async fn handle_removing_nodes(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    _api: &Api<ValkeyCluster>,
+    _namespace: &str,
+) -> Result<ClusterPhase, Error> {
+    let name = obj.name_any();
+    info!(name = %name, "Removing nodes from cluster");
+
+    // Get pending changes to see what nodes to remove
+    let pending_changes = obj
+        .status
+        .as_ref()
+        .and_then(|s| s.pending_changes.as_ref());
+
+    let nodes_to_remove = pending_changes
+        .map(|p| p.nodes_to_remove.clone())
+        .unwrap_or_default();
+
+    if nodes_to_remove.is_empty() {
+        info!(name = %name, "No nodes to remove");
+        return Ok(ClusterPhase::ScalingStatefulSet);
+    }
+
+    // The execute_scaling_operation already handles CLUSTER FORGET
+    // So at this point, the nodes should already be forgotten
+    // We just need to verify and update the StatefulSet
+
+    info!(
+        name = %name,
+        nodes = ?nodes_to_remove,
+        "Nodes removed from cluster, updating StatefulSet"
+    );
+
+    ctx.publish_normal_event(
+        obj,
+        "NodesRemoved",
+        "RemovingNodes",
+        Some(format!("Removed {} nodes from cluster", nodes_to_remove.len())),
+    )
+    .await;
+
+    // Proceed to scale down the StatefulSet
+    Ok(ClusterPhase::ScalingStatefulSet)
+}
+
+/// Handle VerifyingCluster phase.
+///
+/// Performs final health check before transitioning to Running.
+async fn handle_verifying_cluster(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    api: &Api<ValkeyCluster>,
+    namespace: &str,
+) -> Result<ClusterPhase, Error> {
+    let name = obj.name_any();
+    info!(name = %name, "Verifying cluster health");
+
+    // Check cluster health
+    match check_cluster_health(obj, ctx, namespace).await {
+        Ok(health) if health.is_healthy => {
+            info!(
+                name = %name,
+                slots_assigned = health.slots_assigned,
+                healthy_masters = health.healthy_masters,
+                "Cluster verification passed"
+            );
+
+            // Clear pending changes
+            let mut status = obj.status.clone().unwrap_or_default();
+            status.pending_changes = None;
+            status.operation_progress = None;
+            status.message = "Cluster healthy".to_string();
+
+            let patch = serde_json::json!({
+                "status": status
+            });
+            let _ = api
+                .patch_status(
+                    &name,
+                    &kube::api::PatchParams::apply(FIELD_MANAGER),
+                    &kube::api::Patch::Merge(&patch),
+                )
+                .await;
+
+            ctx.publish_normal_event(
+                obj,
+                "ClusterVerified",
+                "VerifyingCluster",
+                Some("Cluster health verification passed".to_string()),
+            )
+            .await;
+
+            Ok(ClusterPhase::Running)
+        }
+        Ok(health) => {
+            // Cluster not healthy yet, check if degraded
+            warn!(
+                name = %name,
+                slots_assigned = health.slots_assigned,
+                healthy_masters = health.healthy_masters,
+                "Cluster not yet healthy, waiting"
+            );
+
+            if health.healthy_masters == 0 {
+                // No healthy masters - this is a problem
+                Ok(ClusterPhase::Degraded)
+            } else {
+                // Some masters healthy, might still be stabilizing
+                Ok(ClusterPhase::VerifyingCluster)
+            }
+        }
+        Err(e) => {
+            warn!(name = %name, error = %e, "Health check failed during verification");
+            // Might be transient, stay in VerifyingCluster to retry
+            Ok(ClusterPhase::VerifyingCluster)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1798,40 +2468,68 @@ mod tests {
 
     #[test]
     fn test_requeue_duration_running_phase() {
-        let duration = match ClusterPhase::Running {
-            ClusterPhase::Running => std::time::Duration::from_secs(60),
-            _ => std::time::Duration::from_secs(0),
-        };
-        assert_eq!(duration.as_secs(), 60);
+        assert_eq!(requeue_duration(ClusterPhase::Running).as_secs(), 30);
     }
 
     #[test]
     fn test_requeue_duration_creating_phase() {
-        let duration = match ClusterPhase::Creating {
-            ClusterPhase::Creating | ClusterPhase::Updating => std::time::Duration::from_secs(10),
-            _ => std::time::Duration::from_secs(0),
-        };
-        assert_eq!(duration.as_secs(), 10);
+        assert_eq!(requeue_duration(ClusterPhase::Creating).as_secs(), 2);
     }
 
     #[test]
     fn test_requeue_duration_initializing_phase() {
-        let duration = match ClusterPhase::Initializing {
-            ClusterPhase::Initializing | ClusterPhase::AssigningSlots => {
-                std::time::Duration::from_secs(5)
-            }
-            _ => std::time::Duration::from_secs(0),
-        };
-        assert_eq!(duration.as_secs(), 5);
+        assert_eq!(requeue_duration(ClusterPhase::Initializing).as_secs(), 2);
+        assert_eq!(requeue_duration(ClusterPhase::AssigningSlots).as_secs(), 2);
     }
 
     #[test]
     fn test_requeue_duration_failed_phase() {
-        let duration = match ClusterPhase::Failed {
-            ClusterPhase::Failed => std::time::Duration::from_secs(300),
-            _ => std::time::Duration::from_secs(0),
-        };
-        assert_eq!(duration.as_secs(), 300);
+        assert_eq!(requeue_duration(ClusterPhase::Failed).as_secs(), 60);
+    }
+
+    #[test]
+    fn test_requeue_duration_detecting_changes_phase() {
+        assert_eq!(requeue_duration(ClusterPhase::DetectingChanges).as_secs(), 2);
+    }
+
+    #[test]
+    fn test_requeue_duration_scaling_statefulset_phase() {
+        assert_eq!(requeue_duration(ClusterPhase::ScalingStatefulSet).as_secs(), 2);
+    }
+
+    #[test]
+    fn test_requeue_duration_adding_nodes_phase() {
+        assert_eq!(requeue_duration(ClusterPhase::AddingNodes).as_secs(), 2);
+    }
+
+    #[test]
+    fn test_requeue_duration_removing_nodes_phase() {
+        assert_eq!(requeue_duration(ClusterPhase::RemovingNodes).as_secs(), 2);
+    }
+
+    #[test]
+    fn test_requeue_duration_verifying_cluster_phase() {
+        assert_eq!(requeue_duration(ClusterPhase::VerifyingCluster).as_secs(), 2);
+    }
+
+    #[test]
+    fn test_requeue_duration_migrating_slots_phase() {
+        assert_eq!(requeue_duration(ClusterPhase::MigratingSlots).as_secs(), 5);
+    }
+
+    #[test]
+    fn test_requeue_duration_degraded_phase() {
+        assert_eq!(requeue_duration(ClusterPhase::Degraded).as_secs(), 10);
+    }
+
+    #[test]
+    fn test_requeue_duration_pending_phase() {
+        assert_eq!(requeue_duration(ClusterPhase::Pending).as_secs(), 5);
+    }
+
+    #[test]
+    fn test_requeue_duration_deleting_phase() {
+        assert_eq!(requeue_duration(ClusterPhase::Deleting).as_secs(), 5);
     }
 
     // ==========================================================================

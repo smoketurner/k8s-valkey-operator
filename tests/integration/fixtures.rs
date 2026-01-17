@@ -51,7 +51,7 @@ pub async fn acquire_cluster_creation_permit() -> tokio::sync::SemaphorePermit<'
 // ============================================================
 
 /// Short timeout for quick operations.
-pub const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const SHORT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Default timeout for most operations.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);

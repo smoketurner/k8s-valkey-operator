@@ -196,13 +196,34 @@ pub fn has_ready_replicas(resource: &ValkeyCluster, count: i32) -> bool {
 }
 
 /// Check if a ValkeyCluster is operational (Running phase with all replicas ready).
+///
+/// This verifies:
+/// 1. The operator has observed the current generation (processed the spec)
+/// 2. The phase is Running
+/// 3. The ready replicas match the expected count
+///
+/// For scale-down operations, this ensures we wait until the scaling is complete
+/// rather than returning immediately when ready_replicas > expected.
 pub fn is_operational(resource: &ValkeyCluster) -> bool {
     let total_pods =
         valkey_operator::crd::total_pods(resource.spec.masters, resource.spec.replicas_per_master);
+
+    // First check that the operator has observed the current generation
+    let gen_observed = match (resource.metadata.generation, &resource.status) {
+        (Some(current_gen), Some(status)) => status.observed_generation == Some(current_gen),
+        _ => false,
+    };
+
+    if !gen_observed {
+        return false;
+    }
+
+    // Then check operational status
+    // Use == instead of >= to handle scale-down correctly
     resource
         .status
         .as_ref()
-        .map(|s| s.phase == ClusterPhase::Running && s.ready_replicas >= total_pods)
+        .map(|s| s.phase == ClusterPhase::Running && s.ready_replicas == total_pods)
         .unwrap_or(false)
 }
 

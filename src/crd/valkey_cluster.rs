@@ -555,6 +555,29 @@ pub struct ValkeyClusterStatus {
     /// Timestamp when current operation started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_started_at: Option<String>,
+
+    /// Pending changes detected from spec diff.
+    /// Set in DetectingChanges phase, cleared when changes are applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_changes: Option<PendingChanges>,
+
+    /// Progress tracking for multi-step operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_progress: Option<OperationProgress>,
+
+    /// Human-readable status message for operators.
+    #[serde(default)]
+    pub message: String,
+
+    /// Counter for detecting stuck reconciliation loops.
+    /// Reset when phase changes, incremented each reconcile in same phase.
+    #[serde(default)]
+    pub reconcile_count: i32,
+
+    /// Timestamp when the cluster last transitioned to a different phase.
+    /// Used for stuck detection (alert if stuck in same phase too long).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_phase_transition: Option<String>,
 }
 
 /// ClusterPhase represents the current lifecycle phase of a ValkeyCluster.
@@ -565,16 +588,24 @@ pub enum ClusterPhase {
     Pending,
     /// Kubernetes resources (StatefulSet, Services) are being created.
     Creating,
-    /// Cluster nodes are running, performing CLUSTER MEET and slot assignment.
+    /// Cluster nodes are running, performing CLUSTER MEET.
     Initializing,
     /// Hash slots are being assigned to master nodes.
     AssigningSlots,
     /// Cluster is fully operational.
     Running,
-    /// Cluster configuration is being updated.
-    Updating,
-    /// Hash slots are being migrated (scaling operation).
-    Resharding,
+    /// Detecting what changes are needed based on spec vs current state.
+    DetectingChanges,
+    /// Updating StatefulSet replica count.
+    ScalingStatefulSet,
+    /// Adding new nodes to cluster via CLUSTER MEET.
+    AddingNodes,
+    /// Migrating hash slots between nodes.
+    MigratingSlots,
+    /// Removing nodes from cluster via CLUSTER FORGET.
+    RemovingNodes,
+    /// Verifying cluster health before returning to Running.
+    VerifyingCluster,
     /// Cluster is operational but degraded (some nodes unavailable).
     Degraded,
     /// Cluster has failed and requires intervention.
@@ -591,8 +622,12 @@ impl std::fmt::Display for ClusterPhase {
             ClusterPhase::Initializing => write!(f, "Initializing"),
             ClusterPhase::AssigningSlots => write!(f, "AssigningSlots"),
             ClusterPhase::Running => write!(f, "Running"),
-            ClusterPhase::Updating => write!(f, "Updating"),
-            ClusterPhase::Resharding => write!(f, "Resharding"),
+            ClusterPhase::DetectingChanges => write!(f, "DetectingChanges"),
+            ClusterPhase::ScalingStatefulSet => write!(f, "ScalingStatefulSet"),
+            ClusterPhase::AddingNodes => write!(f, "AddingNodes"),
+            ClusterPhase::MigratingSlots => write!(f, "MigratingSlots"),
+            ClusterPhase::RemovingNodes => write!(f, "RemovingNodes"),
+            ClusterPhase::VerifyingCluster => write!(f, "VerifyingCluster"),
             ClusterPhase::Degraded => write!(f, "Degraded"),
             ClusterPhase::Failed => write!(f, "Failed"),
             ClusterPhase::Deleting => write!(f, "Deleting"),
@@ -736,6 +771,76 @@ pub struct ReplicaNode {
     pub replication_lag: i64,
 }
 
+/// Records what changes need to be applied to the cluster.
+/// Computed once during DetectingChanges phase to avoid repeated detection.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingChanges {
+    /// Scale direction: "up", "down", or "none".
+    pub scale_direction: String,
+    /// Previous master count (from cluster state).
+    pub previous_masters: i32,
+    /// Target master count (from spec).
+    pub target_masters: i32,
+    /// Pod names of nodes to add (for scale-up).
+    #[serde(default)]
+    pub nodes_to_add: Vec<String>,
+    /// Node IDs of nodes to remove (for scale-down).
+    #[serde(default)]
+    pub nodes_to_remove: Vec<String>,
+    /// Slot migrations to perform.
+    #[serde(default)]
+    pub slot_migrations: Vec<SlotMigrationStatus>,
+    /// Whether image/config changes require rolling update.
+    #[serde(default)]
+    pub requires_rolling_update: bool,
+    /// Generation when these changes were computed.
+    pub for_generation: i64,
+}
+
+/// Tracks a single slot migration operation.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SlotMigrationStatus {
+    /// Source node ID (node currently owning the slots).
+    pub source_node_id: String,
+    /// Target node ID (node that will own the slots).
+    pub target_node_id: String,
+    /// Start slot of the range.
+    pub start_slot: i32,
+    /// End slot of the range (inclusive).
+    pub end_slot: i32,
+    /// Status: "pending", "in_progress", "completed", "failed".
+    pub status: String,
+    /// Error message if status is "failed".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Progress tracking for multi-step operations.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationProgress {
+    /// Total steps in the operation.
+    pub total_steps: i32,
+    /// Completed steps.
+    pub completed_steps: i32,
+    /// Current step description for human operators.
+    pub current_step: String,
+    /// Slots migrated so far (for resharding operations).
+    #[serde(default)]
+    pub slots_migrated: i32,
+    /// Total slots to migrate.
+    #[serde(default)]
+    pub total_slots_to_migrate: i32,
+    /// Nodes that have been processed.
+    #[serde(default)]
+    pub nodes_processed: Vec<String>,
+    /// Error details if any step failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 /// Total number of hash slots in a Valkey cluster.
 pub const TOTAL_HASH_SLOTS: i32 = 16384;
 
@@ -767,8 +872,12 @@ mod tests {
         assert_eq!(ClusterPhase::Initializing.to_string(), "Initializing");
         assert_eq!(ClusterPhase::AssigningSlots.to_string(), "AssigningSlots");
         assert_eq!(ClusterPhase::Running.to_string(), "Running");
-        assert_eq!(ClusterPhase::Updating.to_string(), "Updating");
-        assert_eq!(ClusterPhase::Resharding.to_string(), "Resharding");
+        assert_eq!(ClusterPhase::DetectingChanges.to_string(), "DetectingChanges");
+        assert_eq!(ClusterPhase::ScalingStatefulSet.to_string(), "ScalingStatefulSet");
+        assert_eq!(ClusterPhase::AddingNodes.to_string(), "AddingNodes");
+        assert_eq!(ClusterPhase::MigratingSlots.to_string(), "MigratingSlots");
+        assert_eq!(ClusterPhase::RemovingNodes.to_string(), "RemovingNodes");
+        assert_eq!(ClusterPhase::VerifyingCluster.to_string(), "VerifyingCluster");
         assert_eq!(ClusterPhase::Degraded.to_string(), "Degraded");
         assert_eq!(ClusterPhase::Failed.to_string(), "Failed");
         assert_eq!(ClusterPhase::Deleting.to_string(), "Deleting");

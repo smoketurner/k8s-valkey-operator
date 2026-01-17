@@ -4,6 +4,7 @@
 //! of ValkeyUpgrade custom resources, orchestrating per-shard rolling upgrades
 //! with proper failover to minimize data loss and downtime.
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -430,6 +431,9 @@ async fn handle_inprogress_phase(
         }
         ShardUpgradeState::FailingOver => {
             execute_failover(obj, ctx, api, cluster, namespace, current_shard).await
+        }
+        ShardUpgradeState::WaitingForClusterStable => {
+            wait_for_cluster_stable(obj, ctx, api, cluster, namespace, current_shard).await
         }
         ShardUpgradeState::UpgradingOldMaster => {
             upgrade_old_master(obj, ctx, api, cluster, namespace, current_shard).await
@@ -1115,7 +1119,7 @@ async fn execute_failover(
                     });
             }
             if let Some(shard) = status.shard_statuses.get_mut(shard_idx) {
-                shard.status = ShardUpgradeState::UpgradingOldMaster;
+                shard.status = ShardUpgradeState::WaitingForClusterStable;
                 shard.promoted_replica = Some(replica_pod_name.to_string());
             }
             update_status(api, &name, status).await?;
@@ -1125,13 +1129,13 @@ async fn execute_failover(
                 "FailoverExecuted",
                 "Upgrading",
                 Some(format!(
-                    "Failover executed for shard {}, promoted {}",
+                    "Failover executed for shard {}, promoted {}. Waiting for cluster to stabilize.",
                     shard_index, replica_pod_name
                 )),
             )
             .await;
 
-            // Proceed to upgrade old master
+            // Wait for cluster to stabilize before upgrading old master
             Ok(Action::requeue(Duration::from_secs(1)))
         }
         Err(e) => {
@@ -1148,6 +1152,268 @@ async fn execute_failover(
             Ok(Action::requeue(Duration::from_secs(1)))
         }
     }
+}
+
+/// Wait for cluster to stabilize after failover.
+///
+/// This function verifies:
+/// 1. cluster_state is "ok"
+/// 2. Old master recognizes it's now a replica (ROLE = slave)
+/// 3. Replication link is up (master_link_status:up)
+///
+/// This is critical to avoid the bug where the old master pod is deleted
+/// before the cluster has fully recognized the role change, causing the
+/// pod to restart with stale state and fail readiness probes forever.
+async fn wait_for_cluster_stable(
+    obj: &ValkeyUpgrade,
+    ctx: &Context,
+    api: &Api<ValkeyUpgrade>,
+    cluster: &ValkeyCluster,
+    namespace: &str,
+    shard_index: i32,
+) -> Result<Action, Error> {
+    let name = obj.name_any();
+    let cluster_name = cluster.name_any();
+
+    // Old master pod name - this is the pod we need to check has become a replica
+    let old_master_pod_name = format!("{}-{}", cluster_name, shard_index);
+
+    info!(
+        name = %name,
+        shard = shard_index,
+        pod = %old_master_pod_name,
+        "Waiting for cluster to stabilize after failover"
+    );
+
+    // Stability check timeout - 30 seconds
+    const STABILITY_TIMEOUT_SECS: u64 = 30;
+
+    // Get status to check if we've been waiting too long
+    let status = obj.status.clone().unwrap_or_default();
+    let sync_started_at = status.sync_started_at.clone();
+
+    // Calculate elapsed time
+    let (sync_started, elapsed_secs) = if let Some(started) = &sync_started_at {
+        if let Ok(ts) = jiff::Timestamp::from_str(started) {
+            let elapsed = jiff::Timestamp::now()
+                .duration_since(ts)
+                .as_secs()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            (Some(started.clone()), elapsed)
+        } else {
+            (None, 0)
+        }
+    } else {
+        (None, 0)
+    };
+
+    // If we don't have a start time yet, set it and requeue
+    if sync_started.is_none() {
+        let mut new_status = status;
+        new_status.sync_started_at = Some(jiff::Timestamp::now().to_string());
+        new_status.sync_elapsed_seconds = Some(0);
+        update_status(api, &name, new_status).await?;
+        return Ok(Action::requeue(Duration::from_secs(2)));
+    }
+
+    // Check for timeout
+    if elapsed_secs > STABILITY_TIMEOUT_SECS {
+        warn!(
+            name = %name,
+            shard = shard_index,
+            elapsed_secs = elapsed_secs,
+            timeout = STABILITY_TIMEOUT_SECS,
+            "Stability check timed out, proceeding anyway"
+        );
+        // Don't fail the upgrade, just proceed with a warning
+        // The pod deletion might still cause issues, but we don't want to block forever
+        update_shard_status(api, &name, shard_index, ShardUpgradeState::UpgradingOldMaster).await?;
+
+        // Clear sync tracking
+        let mut new_status = obj.status.clone().unwrap_or_default();
+        new_status.sync_started_at = None;
+        new_status.sync_elapsed_seconds = None;
+        update_status(api, &name, new_status).await?;
+
+        return Ok(Action::requeue(Duration::from_secs(1)));
+    }
+
+    // Get master pod DNS names to find the old master
+    let master_pods = master_pod_dns_names(cluster);
+    let (old_master_host, old_master_port) = master_pods
+        .get(shard_index as usize)
+        .ok_or_else(|| Error::Validation(format!("No master pod found for shard {}", shard_index)))?;
+
+    // Connect to the old master (should now be a replica)
+    let client = match ctx
+        .connect_to_host(cluster, namespace, old_master_host, *old_master_port)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            // Can't connect - cluster might still be reconfiguring
+            info!(
+                name = %name,
+                shard = shard_index,
+                error = %e,
+                elapsed = elapsed_secs,
+                "Cannot connect to old master yet, waiting..."
+            );
+            // Update elapsed time in status
+            let mut new_status = obj.status.clone().unwrap_or_default();
+            new_status.sync_elapsed_seconds = Some(elapsed_secs);
+            new_status.progress = format!(
+                "Shard {}: Waiting for cluster to stabilize ({}/{}s)",
+                shard_index, elapsed_secs, STABILITY_TIMEOUT_SECS
+            );
+            update_status(api, &name, new_status).await?;
+            return Ok(Action::requeue(Duration::from_secs(2)));
+        }
+    };
+
+    // Check 1: Verify cluster_state is "ok"
+    let cluster_info = match client.cluster_info().await {
+        Ok(info) => info,
+        Err(e) => {
+            let _ = client.close().await;
+            info!(
+                name = %name,
+                shard = shard_index,
+                error = %e,
+                "Failed to get cluster info, waiting..."
+            );
+            let mut new_status = obj.status.clone().unwrap_or_default();
+            new_status.sync_elapsed_seconds = Some(elapsed_secs);
+            update_status(api, &name, new_status).await?;
+            return Ok(Action::requeue(Duration::from_secs(2)));
+        }
+    };
+
+    if !cluster_info.is_healthy() {
+        let _ = client.close().await;
+        info!(
+            name = %name,
+            shard = shard_index,
+            cluster_state = ?cluster_info.state,
+            elapsed = elapsed_secs,
+            "Cluster state not ok yet, waiting..."
+        );
+        let mut new_status = obj.status.clone().unwrap_or_default();
+        new_status.sync_elapsed_seconds = Some(elapsed_secs);
+        new_status.progress = format!(
+            "Shard {}: Waiting for cluster_state:ok ({}/{}s)",
+            shard_index, elapsed_secs, STABILITY_TIMEOUT_SECS
+        );
+        update_status(api, &name, new_status).await?;
+        return Ok(Action::requeue(Duration::from_secs(2)));
+    }
+
+    // Check 2: Verify old master recognizes it's now a replica
+    let role = match client.role().await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = client.close().await;
+            info!(
+                name = %name,
+                shard = shard_index,
+                error = %e,
+                "Failed to get role, waiting..."
+            );
+            let mut new_status = obj.status.clone().unwrap_or_default();
+            new_status.sync_elapsed_seconds = Some(elapsed_secs);
+            update_status(api, &name, new_status).await?;
+            return Ok(Action::requeue(Duration::from_secs(2)));
+        }
+    };
+
+    if role != "slave" && role != "replica" {
+        let _ = client.close().await;
+        info!(
+            name = %name,
+            shard = shard_index,
+            role = %role,
+            elapsed = elapsed_secs,
+            "Old master still thinks it's a master, waiting..."
+        );
+        let mut new_status = obj.status.clone().unwrap_or_default();
+        new_status.sync_elapsed_seconds = Some(elapsed_secs);
+        new_status.progress = format!(
+            "Shard {}: Waiting for role change to replica ({}/{}s)",
+            shard_index, elapsed_secs, STABILITY_TIMEOUT_SECS
+        );
+        update_status(api, &name, new_status).await?;
+        return Ok(Action::requeue(Duration::from_secs(2)));
+    }
+
+    // Check 3: Verify replication link is up
+    let repl_info = match client.info(Some(fred::types::InfoKind::Replication)).await {
+        Ok(info) => info,
+        Err(e) => {
+            let _ = client.close().await;
+            info!(
+                name = %name,
+                shard = shard_index,
+                error = %e,
+                "Failed to get replication info, waiting..."
+            );
+            let mut new_status = obj.status.clone().unwrap_or_default();
+            new_status.sync_elapsed_seconds = Some(elapsed_secs);
+            update_status(api, &name, new_status).await?;
+            return Ok(Action::requeue(Duration::from_secs(2)));
+        }
+    };
+
+    // Check for master_link_status:up in the replication info
+    let link_up = repl_info.contains("master_link_status:up");
+    if !link_up {
+        let _ = client.close().await;
+        info!(
+            name = %name,
+            shard = shard_index,
+            elapsed = elapsed_secs,
+            "Replication link not up yet, waiting..."
+        );
+        let mut new_status = obj.status.clone().unwrap_or_default();
+        new_status.sync_elapsed_seconds = Some(elapsed_secs);
+        new_status.progress = format!(
+            "Shard {}: Waiting for master_link_status:up ({}/{}s)",
+            shard_index, elapsed_secs, STABILITY_TIMEOUT_SECS
+        );
+        update_status(api, &name, new_status).await?;
+        return Ok(Action::requeue(Duration::from_secs(2)));
+    }
+
+    let _ = client.close().await;
+
+    // All checks passed - cluster is stable
+    info!(
+        name = %name,
+        shard = shard_index,
+        elapsed = elapsed_secs,
+        "Cluster stabilized after failover, proceeding to upgrade old master"
+    );
+
+    // Clear sync tracking and transition to UpgradingOldMaster
+    let mut new_status = obj.status.clone().unwrap_or_default();
+    new_status.sync_started_at = None;
+    new_status.sync_elapsed_seconds = None;
+    update_status(api, &name, new_status).await?;
+
+    update_shard_status(api, &name, shard_index, ShardUpgradeState::UpgradingOldMaster).await?;
+
+    ctx.publish_upgrade_event(
+        obj,
+        "ClusterStabilized",
+        "Upgrading",
+        Some(format!(
+            "Cluster stabilized for shard {}, proceeding to upgrade old master",
+            shard_index
+        )),
+    )
+    .await;
+
+    Ok(Action::requeue(Duration::from_secs(1)))
 }
 
 /// Upgrade the old master (now replica) after failover
@@ -2060,9 +2326,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_upgrade_spec_cluster_updating() {
+    async fn test_validate_upgrade_spec_cluster_scaling() {
         let spec = create_test_upgrade_spec("9");
-        let cluster = create_test_cluster("test", ClusterPhase::Updating);
+        // Test that upgrade is rejected when cluster is in a scaling operation
+        let cluster = create_test_cluster("test", ClusterPhase::ScalingStatefulSet);
         let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
         assert!(result.is_err());
     }
