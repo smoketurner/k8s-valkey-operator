@@ -89,6 +89,11 @@ pub fn client_service_name(resource: &ValkeyCluster) -> String {
     resource.name_any()
 }
 
+/// Generate the read service name for a ValkeyCluster.
+pub fn read_service_name(resource: &ValkeyCluster) -> String {
+    format!("{}-read", resource.name_any())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -124,6 +129,7 @@ mod tests {
                         name: "test-secret".to_string(),
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
                 ..Default::default()
             },

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a **Kubernetes operator for managing Valkey Clusters** built in Rust using kube-rs. It manages ValkeyCluster and ValkeyUpgrade custom resources.
 
-**For detailed pattern explanations, see `GUIDE.md`.**
+**For detailed documentation, see the `docs/` directory.**
 
 ## Version Requirements
 
@@ -83,6 +83,7 @@ The operator creates these Kubernetes resources for each ValkeyCluster:
 - **StatefulSet**: Valkey pods with stable identity
 - **Headless Service**: Cluster discovery
 - **Client Service**: Client access endpoint
+- **Read Service** (optional): Read-only traffic distribution
 - **PodDisruptionBudget**: Maintain quorum
 - **Certificate**: TLS certs via cert-manager
 
@@ -120,4 +121,5 @@ The operator must **never panic** in production code:
 
 ## Documentation
 
-For detailed patterns, rationale, and best practices, see **`GUIDE.md`**.
+- `docs/state-machines.md`: Lifecycle phases and transitions
+- `docs/features.md`: Feature configuration details

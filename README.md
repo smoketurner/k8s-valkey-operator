@@ -1,136 +1,221 @@
-# Kubernetes Operator Template (Rust)
+# Valkey Operator for Kubernetes
 
-A production-ready template for building Kubernetes operators in Rust using [kube-rs](https://kube.rs).
+A production-ready Kubernetes operator for managing [Valkey](https://valkey.io) clusters, built in Rust using [kube-rs](https://kube.rs).
 
 ## Features
 
-- **Working Skeleton**: Compiles and runs immediately with example `MyResource` CRD
-- **Best Practices**: Panic-free code, server-side apply, finalizers, generation tracking
-- **Full Stack**: CRD, controller, webhooks, health server, metrics
-- **Testing**: Unit, integration, and property-based test scaffolding
-- **CI/CD**: GitHub Actions for lint, test, build, and release
-- **Deployment**: Kubernetes manifests and Helm chart included
+- **High Availability**: Automatic cluster formation with configurable masters and replicas
+- **Secure by Default**: Required TLS (via cert-manager) and authentication
+- **Horizontal Scaling**: Add/remove masters with automatic slot migration
+- **Rolling Upgrades**: Zero-downtime upgrades via ValkeyUpgrade CRD with coordinated failover
+- **Observability**: Optional Prometheus metrics exporter sidecar
+- **ACL Support**: Fine-grained access control with Valkey 7+ ACL system
+- **Panic-Free**: All production code paths handle errors gracefully
 
 ## Quick Start
 
 ### Prerequisites
 
-- Rust 1.92+ (install via [rustup](https://rustup.rs))
-- Kubernetes cluster (local: [kind](https://kind.sigs.k8s.io), [minikube](https://minikube.sigs.k8s.io))
+- Kubernetes 1.35+
+- Rust 1.92+ (for building from source)
+- [cert-manager](https://cert-manager.io) installed in the cluster
 - kubectl configured
 
-### Build and Run
+### Installation
 
 ```bash
-# Clone the template
-git clone https://github.com/YOUR_ORG/k8s-operator-template my-operator
-cd my-operator
+# Install CRDs
+kubectl apply -f config/crd/
 
-# Build the operator
-make build
+# Install RBAC
+kubectl apply -f config/rbac/
 
-# Install CRD and RBAC
-make install
-
-# Run the operator locally
-make run
+# Deploy the operator
+kubectl apply -f config/deploy/
 ```
 
-### Deploy a Sample Resource
+Or using Helm:
 
 ```bash
-# In a separate terminal
-make deploy-sample
-
-# Watch the resource
-kubectl get myresources -w
+helm install valkey-operator ./charts/valkey-operator
 ```
 
-## Customization
+### Deploy a Valkey Cluster
 
-### 1. Rename the Project
+1. Create a password secret:
 
-Update `Cargo.toml`:
-```toml
-[package]
-name = "your-operator"
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: valkey-auth
+type: Opaque
+stringData:
+  password: "your-secure-password"
 ```
 
-### 2. Define Your CRD
+2. Create a ValkeyCluster:
 
-Edit `src/crd/mod.rs`:
-```rust
-#[derive(CustomResource, ...)]
-#[kube(
-    group = "yourcompany.com",
-    version = "v1alpha1",
-    kind = "YourResource",
-    ...
-)]
-pub struct YourResourceSpec {
-    // Your fields here
-}
+```yaml
+apiVersion: valkey-operator.smoketurner.com/v1alpha1
+kind: ValkeyCluster
+metadata:
+  name: my-cluster
+spec:
+  masters: 3
+  replicasPerMaster: 1
+  tls:
+    issuerRef:
+      name: my-cluster-issuer
+      kind: ClusterIssuer
+  auth:
+    secretRef:
+      name: valkey-auth
 ```
 
-### 3. Implement Reconciliation
+3. Watch the cluster come up:
 
-Customize `src/controller/reconciler.rs` with your business logic:
-```rust
-async fn reconcile(
-    resource: Arc<YourResource>,
-    ctx: Arc<Context>,
-) -> Result<Action, Error> {
-    // Your reconciliation logic
-}
+```bash
+kubectl get vc -w
 ```
 
-### 4. Update Kubernetes Manifests
+## Configuration
 
-- `config/deploy/` - Deployment manifests
-- `config/rbac/` - RBAC permissions for your CRD
-- `charts/my-operator/` - Helm chart
+### ValkeyCluster Spec
 
-### 5. Update CI/CD
+| Field | Description | Default |
+|-------|-------------|---------|
+| `masters` | Number of master nodes (min 3) | 3 |
+| `replicasPerMaster` | Replicas per master | 1 |
+| `tls.issuerRef` | cert-manager issuer reference | Required |
+| `auth.secretRef` | Secret containing password | Required |
+| `auth.acl` | ACL configuration for fine-grained access | Disabled |
+| `persistence.enabled` | Enable persistent storage | true |
+| `persistence.size` | PVC size | 10Gi |
+| `readService.enabled` | Enable read-only service | false |
+| `metricsExporter.enabled` | Enable Prometheus exporter sidecar | false |
+| `replication.disklessSync` | Enable diskless replication | false |
+| `replication.minReplicasToWrite` | Minimum replicas for write acknowledgment | 0 |
 
-- `.github/workflows/ci.yml` - Update image name
-- `.github/workflows/release.yml` - Configure registry
+See [docs/features.md](docs/features.md) for detailed configuration options.
 
-## Project Structure
+### Example with All Features
 
+```yaml
+apiVersion: valkey-operator.smoketurner.com/v1alpha1
+kind: ValkeyCluster
+metadata:
+  name: production-cluster
+spec:
+  masters: 6
+  replicasPerMaster: 2
+  tls:
+    issuerRef:
+      name: letsencrypt-prod
+      kind: ClusterIssuer
+  auth:
+    secretRef:
+      name: valkey-auth
+    acl:
+      enabled: true
+      configSecretRef:
+        name: valkey-acl
+        key: acl.conf
+  persistence:
+    enabled: true
+    size: 50Gi
+    storageClassName: ssd
+  resources:
+    requests:
+      cpu: "1"
+      memory: "4Gi"
+    limits:
+      cpu: "2"
+      memory: "8Gi"
+  readService:
+    enabled: true
+  metricsExporter:
+    enabled: true
+    port: 9121
+  replication:
+    disklessSync: true
+    minReplicasToWrite: 1
+    minReplicasMaxLag: 10
 ```
-├── src/
-│   ├── main.rs              # Entry point with leader election
-│   ├── lib.rs               # Controller setup
-│   ├── health.rs            # Health server (metrics, probes)
-│   ├── crd/                  # Custom Resource Definition
-│   │   └── mod.rs
-│   ├── controller/           # Reconciliation logic
-│   │   ├── mod.rs
-│   │   ├── reconciler.rs
-│   │   ├── state_machine.rs
-│   │   ├── error.rs
-│   │   ├── status.rs
-│   │   └── context.rs
-│   ├── resources/            # Generated K8s resources
-│   │   ├── mod.rs
-│   │   └── common.rs
-│   └── webhooks/             # Admission webhooks
-│       ├── mod.rs
-│       └── server.rs
-├── tests/
-│   ├── common/               # Test utilities
-│   ├── unit/                 # Unit tests
-│   ├── integration/          # Integration tests
-│   └── proptest/             # Property-based tests
-├── config/
-│   ├── deploy/               # Deployment manifests
-│   ├── rbac/                 # RBAC manifests
-│   └── samples/              # Example resources
-├── charts/
-│   └── my-operator/          # Helm chart
-└── .github/
-    └── workflows/            # CI/CD pipelines
+
+## Rolling Upgrades
+
+Create a ValkeyUpgrade resource to perform zero-downtime upgrades:
+
+```yaml
+apiVersion: valkey-operator.smoketurner.com/v1alpha1
+kind: ValkeyUpgrade
+metadata:
+  name: upgrade-to-9.1
+spec:
+  clusterRef:
+    name: my-cluster
+  targetVersion: "9.1.0"
 ```
+
+The operator performs per-shard rolling upgrades:
+1. Upgrade replicas first
+2. Wait for replication sync
+3. Execute coordinated failover
+4. Upgrade old master (now replica)
+5. Move to next shard
+
+See [docs/state-machines.md](docs/state-machines.md) for detailed upgrade workflow.
+
+## Architecture
+
+### Custom Resources
+
+| CRD | Purpose |
+|-----|---------|
+| `ValkeyCluster` | Deploy and manage Valkey cluster topology |
+| `ValkeyUpgrade` | Handle rolling upgrades with failover orchestration |
+
+### Generated Resources
+
+For each ValkeyCluster, the operator creates:
+- **StatefulSet**: Valkey pods with stable identity
+- **Headless Service**: Cluster discovery
+- **Client Service**: Client access endpoint
+- **Read Service** (optional): Read-only traffic distribution
+- **PodDisruptionBudget**: Maintain quorum
+- **Certificate**: TLS certs via cert-manager
+
+## Development
+
+### Build
+
+```bash
+make build              # Build release binary
+make docker-build       # Build Docker image
+make docker-push        # Push Docker image
+```
+
+### Test
+
+```bash
+make test               # Run unit tests
+make test-integration   # Run integration tests
+make lint               # Run clippy lints
+```
+
+### Run Locally
+
+```bash
+make install            # Install CRD and RBAC
+make run                # Run operator locally
+```
+
+## Documentation
+
+- [State Machines](docs/state-machines.md) - Lifecycle phases and transitions
+- [Features](docs/features.md) - Detailed feature documentation
+- [CLAUDE.md](CLAUDE.md) - AI assistant instructions
 
 ## Make Targets
 
@@ -146,26 +231,19 @@ async fn reconcile(
 | `make deploy` | Deploy to cluster |
 | `make docker-build` | Build Docker image |
 
-## Documentation
-
-- **CLAUDE.md** - AI assistant instructions
-- **GUIDE.md** - Detailed patterns and best practices
-
 ## Design Principles
 
 ### Panic-Free Code
-All production code paths handle errors gracefully. The Cargo.toml enforces this via clippy lints that deny `unwrap()`, `expect()`, and `panic!()`.
+All production code paths handle errors gracefully. Clippy lints deny `unwrap()`, `expect()`, and `panic!()`.
 
 ### Idempotent Reconciliation
-Every reconcile operation can be safely retried. Use server-side apply for atomic updates.
+Every reconcile operation can be safely retried. Uses server-side apply for atomic updates.
 
-### Generation Tracking
-Skip redundant reconciliations by comparing `metadata.generation` with `status.observedGeneration`.
+### Secure by Default
+TLS and authentication are required, not optional. The operator enforces security best practices.
 
-### State Machine
-Resource lifecycle is managed through a formal FSM with defined phase transitions:
-- Pending → Creating → Running → Updating → Running
-- Any state → Deleting (terminal)
+### State Machine Driven
+Resource lifecycle is managed through formal FSMs with defined phase transitions. See [docs/state-machines.md](docs/state-machines.md).
 
 ## License
 

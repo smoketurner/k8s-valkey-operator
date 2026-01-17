@@ -877,6 +877,18 @@ async fn create_owned_resources(
         )
         .await?;
 
+    // Apply Read Service (for read-only traffic distribution) if enabled
+    if let Some(read_svc) = services::generate_read_service(obj) {
+        let read_svc_name = common::read_service_name(obj);
+        svc_api
+            .patch(
+                &read_svc_name,
+                &PatchParams::apply(FIELD_MANAGER).force(),
+                &Patch::Apply(&read_svc),
+            )
+            .await?;
+    }
+
     // Apply PodDisruptionBudget
     let pdb = pdb::generate_pod_disruption_budget(obj);
     let pdb_api: Api<k8s_openapi::api::policy::v1::PodDisruptionBudget> =
@@ -2587,6 +2599,7 @@ mod tests {
                         name: "test-auth-secret".to_string(),
                         key: "password".to_string(),
                     },
+                    ..Default::default()
                 },
                 tls: TlsSpec {
                     issuer_ref: IssuerRef {
@@ -2602,6 +2615,7 @@ mod tests {
                 scheduling: SchedulingSpec::default(),
                 labels: BTreeMap::new(),
                 annotations: BTreeMap::new(),
+                ..Default::default()
             },
             status: None,
         }

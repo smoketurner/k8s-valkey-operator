@@ -1162,6 +1162,7 @@ mod tests {
                         name: "test-secret".to_string(),
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
                 ..Default::default()
             },

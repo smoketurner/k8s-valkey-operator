@@ -12,7 +12,7 @@ use kube::ResourceExt;
 use crate::crd::ValkeyCluster;
 use crate::resources::common::{
     client_service_name, headless_service_name, owner_reference, pod_selector_labels,
-    standard_annotations, standard_labels,
+    read_service_name, standard_annotations, standard_labels,
 };
 
 /// Valkey client port
@@ -123,6 +123,63 @@ pub fn generate_client_service(resource: &ValkeyCluster) -> Service {
     }
 }
 
+/// Generate a read Service for distributing read traffic across all pods.
+///
+/// The read service provides:
+/// - Load balancing across all pods (masters and replicas)
+/// - Enables read-heavy workloads to be distributed
+/// - Configurable service type (ClusterIP, NodePort, LoadBalancer)
+///
+/// Returns `None` if read service is not enabled.
+pub fn generate_read_service(resource: &ValkeyCluster) -> Option<Service> {
+    let read_spec = resource.spec.read_service.as_ref()?;
+    if !read_spec.enabled {
+        return None;
+    }
+
+    let name = read_service_name(resource);
+    let namespace = resource.namespace();
+    let mut labels = standard_labels(resource);
+    labels.insert(
+        "app.kubernetes.io/service-type".to_string(),
+        "read".to_string(),
+    );
+
+    // Merge standard annotations with read service specific annotations
+    let mut annotations = standard_annotations(resource);
+    for (key, value) in &read_spec.annotations {
+        annotations.insert(key.clone(), value.clone());
+    }
+
+    Some(Service {
+        metadata: ObjectMeta {
+            name: Some(name),
+            namespace,
+            labels: Some(labels),
+            annotations: if annotations.is_empty() {
+                None
+            } else {
+                Some(annotations)
+            },
+            owner_references: Some(vec![owner_reference(resource)]),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            type_: Some(read_spec.service_type.clone()),
+            selector: Some(pod_selector_labels(resource)),
+            ports: Some(vec![ServicePort {
+                port: CLIENT_PORT,
+                target_port: Some(IntOrString::String("client".to_string())),
+                name: Some("client".to_string()),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -157,6 +214,7 @@ mod tests {
                         name: "test-secret".to_string(),
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
                 ..Default::default()
             },

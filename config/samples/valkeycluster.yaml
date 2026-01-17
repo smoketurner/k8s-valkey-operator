@@ -39,3 +39,18 @@ spec:
   # Disable spread for single-node cluster testing
   scheduling:
     spreadMasters: false
+  # Optional: Enable read service for read-heavy workloads
+  # readService:
+  #   enabled: true
+  #   serviceType: ClusterIP
+  # Optional: Enable Prometheus metrics exporter sidecar
+  # metricsExporter:
+  #   enabled: true
+  #   image: oliver006/redis_exporter:latest
+  #   port: 9121
+  # Optional: Replication configuration
+  # replication:
+  #   disklessSync: true
+  #   disklessSyncDelay: 5
+  #   minReplicasToWrite: 1
+  #   minReplicasMaxLag: 10

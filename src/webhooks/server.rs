@@ -238,6 +238,7 @@ mod tests {
                         name: "test-secret".to_string(),
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
                 labels: BTreeMap::new(),
                 ..Default::default()

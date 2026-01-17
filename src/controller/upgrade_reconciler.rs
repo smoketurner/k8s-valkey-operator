@@ -2217,6 +2217,7 @@ mod tests {
                         name: "test-auth-secret".to_string(),
                         key: "password".to_string(),
                     },
+                    ..Default::default()
                 },
                 tls: TlsSpec {
                     issuer_ref: IssuerRef {
@@ -2232,6 +2233,7 @@ mod tests {
                 scheduling: SchedulingSpec::default(),
                 labels: BTreeMap::new(),
                 annotations: BTreeMap::new(),
+                ..Default::default()
             },
             status: Some(ValkeyClusterStatus {
                 phase,

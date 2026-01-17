@@ -158,6 +158,7 @@ impl ValkeyClusterBuilder {
                         name: self.secret_name,
                         key: "password".to_string(),
                     },
+                    ..Default::default()
                 },
                 persistence: if self.persistence_enabled {
                     PersistenceSpec {

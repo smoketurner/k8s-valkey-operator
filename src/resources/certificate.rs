@@ -216,6 +216,7 @@ mod tests {
                         name: "test-secret".to_string(),
                         key: "password".to_string(),
                     },
+                    ..Default::default()
                 },
                 ..Default::default()
             },

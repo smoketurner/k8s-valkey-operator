@@ -100,6 +100,21 @@ pub struct ValkeyClusterSpec {
     /// Additional annotations to apply to all managed resources.
     #[serde(default)]
     pub annotations: BTreeMap<String, String>,
+
+    // === Services ===
+    /// Read-only service for distributing read traffic across replicas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_service: Option<ReadServiceSpec>,
+
+    // === Observability ===
+    /// Prometheus metrics exporter sidecar configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics_exporter: Option<MetricsExporterSpec>,
+
+    // === Replication ===
+    /// Replication configuration for master-replica synchronization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replication: Option<ReplicationSpec>,
 }
 
 impl Default for ValkeyClusterSpec {
@@ -115,6 +130,9 @@ impl Default for ValkeyClusterSpec {
             scheduling: SchedulingSpec::default(),
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
+            read_service: None,
+            metrics_exporter: None,
+            replication: None,
         }
     }
 }
@@ -225,6 +243,40 @@ fn default_issuer_group() -> String {
 pub struct AuthSpec {
     /// Reference to a Secret containing the password.
     pub secret_ref: SecretKeyRef,
+
+    /// ACL (Access Control List) configuration for fine-grained access control.
+    /// When enabled, uses Valkey 7+ ACL system instead of simple password auth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acl: Option<AclSpec>,
+}
+
+/// ACL (Access Control List) configuration for Valkey 7+.
+///
+/// Provides fine-grained access control with multiple users and permissions.
+/// When enabled, an ACL file is mounted from a Secret containing user definitions.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AclSpec {
+    /// Enable ACL-based authentication (default: false).
+    /// When true, the ACL file from configSecretRef is used.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Reference to a Secret containing the ACL configuration file.
+    /// The secret should contain a key with ACL rules in Valkey ACL file format.
+    /// Example ACL format:
+    /// ```text
+    /// user default on >password ~* &* +@all
+    /// user readonly on >readpass ~* &* +@read -@write
+    /// user replication on >replpass ~* &* +psync +replconf +ping
+    /// ```
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_secret_ref: Option<SecretKeyRef>,
+
+    /// Username for the default/admin user (default: "default").
+    /// This user is used for cluster operations and health checks.
+    #[serde(default = "default_acl_admin_user")]
+    pub admin_user: String,
 }
 
 /// Reference to a key within a Secret.
@@ -241,6 +293,20 @@ pub struct SecretKeyRef {
 
 fn default_password_key() -> String {
     "password".to_string()
+}
+
+fn default_acl_admin_user() -> String {
+    "default".to_string()
+}
+
+impl Default for AclSpec {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            config_secret_ref: None,
+            admin_user: default_acl_admin_user(),
+        }
+    }
 }
 
 /// Persistence configuration for data durability.
@@ -492,6 +558,190 @@ pub struct Toleration {
     /// Toleration seconds (for NoExecute effect).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub toleration_seconds: Option<i64>,
+}
+
+/// Read service configuration for distributing read traffic.
+///
+/// Creates a dedicated service that load balances across all pods (masters and replicas),
+/// enabling read-heavy workloads to be distributed across replicas.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadServiceSpec {
+    /// Enable the read service (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Service type (default: ClusterIP).
+    /// Supported values: ClusterIP, NodePort, LoadBalancer.
+    #[serde(default = "default_service_type")]
+    pub service_type: String,
+
+    /// Additional annotations for the read service.
+    /// Useful for cloud provider load balancer configuration.
+    #[serde(default)]
+    pub annotations: BTreeMap<String, String>,
+}
+
+impl Default for ReadServiceSpec {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service_type: default_service_type(),
+            annotations: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_service_type() -> String {
+    "ClusterIP".to_string()
+}
+
+/// Prometheus metrics exporter sidecar configuration.
+///
+/// Deploys a Valkey exporter sidecar container that exposes Prometheus metrics
+/// on a configurable port. Compatible with standard Prometheus scraping.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsExporterSpec {
+    /// Enable the metrics exporter sidecar (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Container image for the exporter (default: oliver006/redis_exporter:latest).
+    /// Compatible exporters: oliver006/redis_exporter, bitnami/redis-exporter.
+    #[serde(default = "default_exporter_image")]
+    pub image: String,
+
+    /// Port to expose metrics on (default: 9121).
+    #[serde(default = "default_exporter_port")]
+    pub port: i32,
+
+    /// Resource requirements for the exporter container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ExporterResourcesSpec>,
+
+    /// Additional environment variables for the exporter.
+    #[serde(default)]
+    pub extra_env: BTreeMap<String, String>,
+}
+
+impl Default for MetricsExporterSpec {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            image: default_exporter_image(),
+            port: default_exporter_port(),
+            resources: None,
+            extra_env: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_exporter_image() -> String {
+    "oliver006/redis_exporter:latest".to_string()
+}
+
+fn default_exporter_port() -> i32 {
+    9121
+}
+
+/// Resource requirements for the metrics exporter sidecar.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExporterResourcesSpec {
+    /// CPU request (default: 50m).
+    #[serde(default = "default_exporter_cpu_request")]
+    pub cpu_request: String,
+
+    /// Memory request (default: 64Mi).
+    #[serde(default = "default_exporter_memory_request")]
+    pub memory_request: String,
+
+    /// CPU limit (default: 100m).
+    #[serde(default = "default_exporter_cpu_limit")]
+    pub cpu_limit: String,
+
+    /// Memory limit (default: 128Mi).
+    #[serde(default = "default_exporter_memory_limit")]
+    pub memory_limit: String,
+}
+
+impl Default for ExporterResourcesSpec {
+    fn default() -> Self {
+        Self {
+            cpu_request: default_exporter_cpu_request(),
+            memory_request: default_exporter_memory_request(),
+            cpu_limit: default_exporter_cpu_limit(),
+            memory_limit: default_exporter_memory_limit(),
+        }
+    }
+}
+
+fn default_exporter_cpu_request() -> String {
+    "50m".to_string()
+}
+
+fn default_exporter_memory_request() -> String {
+    "64Mi".to_string()
+}
+
+fn default_exporter_cpu_limit() -> String {
+    "100m".to_string()
+}
+
+fn default_exporter_memory_limit() -> String {
+    "128Mi".to_string()
+}
+
+/// Replication configuration for master-replica synchronization.
+///
+/// Controls how replicas synchronize with masters, including diskless sync
+/// options and health thresholds for write safety.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicationSpec {
+    /// Enable diskless synchronization (default: false).
+    /// When enabled, replicas receive data directly from memory without
+    /// the master creating an RDB file on disk. Faster for large datasets
+    /// but uses more memory during sync.
+    #[serde(default)]
+    pub diskless_sync: bool,
+
+    /// Delay in seconds before starting diskless sync (default: 5).
+    /// Allows multiple replicas to connect before sync starts.
+    /// Only used when diskless_sync is enabled.
+    #[serde(default = "default_diskless_sync_delay")]
+    pub diskless_sync_delay: i32,
+
+    /// Minimum number of replicas that must acknowledge writes (default: 0 = disabled).
+    /// When set, masters will reject writes if fewer than this many replicas
+    /// are connected and caught up. Improves durability at cost of availability.
+    #[serde(default)]
+    pub min_replicas_to_write: i32,
+
+    /// Maximum replication lag in seconds for min_replicas_to_write (default: 10).
+    /// Replicas with lag exceeding this are not counted as "caught up".
+    #[serde(default = "default_min_replicas_max_lag")]
+    pub min_replicas_max_lag: i32,
+}
+
+impl Default for ReplicationSpec {
+    fn default() -> Self {
+        Self {
+            diskless_sync: false,
+            diskless_sync_delay: default_diskless_sync_delay(),
+            min_replicas_to_write: 0,
+            min_replicas_max_lag: default_min_replicas_max_lag(),
+        }
+    }
+}
+
+fn default_diskless_sync_delay() -> i32 {
+    5
+}
+
+fn default_min_replicas_max_lag() -> i32 {
+    10
 }
 
 /// Status of a ValkeyCluster.
@@ -940,6 +1190,7 @@ mod tests {
                     name: "valkey-auth".to_string(),
                     key: "password".to_string(),
                 },
+                ..Default::default()
             },
             ..Default::default()
         };

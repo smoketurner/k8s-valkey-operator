@@ -447,6 +447,7 @@ mod resources_common_tests {
                         name: "test-secret".to_string(),
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
                 labels: BTreeMap::new(),
                 ..Default::default()
@@ -564,6 +565,7 @@ mod validation_tests {
                         name: "test-secret".to_string(),
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
                 labels: BTreeMap::new(),
                 ..Default::default()

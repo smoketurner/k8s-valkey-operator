@@ -18,10 +18,11 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::ResourceExt;
 use std::collections::BTreeMap;
 
-use crate::crd::{ValkeyCluster, total_pods};
+use crate::crd::{ExporterResourcesSpec, ValkeyCluster, total_pods};
 use crate::resources::common::{
     headless_service_name, owner_reference, pod_selector_labels, standard_annotations,
     standard_labels,
@@ -108,6 +109,14 @@ fn generate_pod_template(
         Some(resource.spec.scheduling.node_selector.clone())
     };
 
+    // Build container list
+    let mut containers = vec![generate_valkey_container(resource)];
+
+    // Add metrics exporter sidecar if enabled
+    if let Some(exporter) = generate_metrics_exporter_container(resource) {
+        containers.push(exporter);
+    }
+
     PodTemplateSpec {
         metadata: Some(ObjectMeta {
             labels: Some(labels.clone()),
@@ -122,7 +131,7 @@ fn generate_pod_template(
             termination_grace_period_seconds: Some(TERMINATION_GRACE_PERIOD),
             security_context: Some(generate_pod_security_context()),
             affinity: Some(generate_affinity(resource)),
-            containers: vec![generate_valkey_container(resource)],
+            containers,
             volumes: Some(generate_volumes(resource)),
             // Apply scheduling constraints from spec
             node_selector,
@@ -333,7 +342,7 @@ fn generate_env_vars(resource: &ValkeyCluster) -> Vec<EnvVar> {
 
 /// Build the VALKEY_EXTRA_FLAGS environment variable value.
 fn build_valkey_extra_flags(
-    _resource: &ValkeyCluster,
+    resource: &ValkeyCluster,
     namespace: &str,
     headless_svc: &str,
 ) -> String {
@@ -375,6 +384,38 @@ fn build_valkey_extra_flags(
         // maxmemory-policy: evict least recently used keys when memory limit reached
         "--maxmemory-policy allkeys-lru".to_string(),
     ];
+
+    // Replication configuration
+    if let Some(replication) = &resource.spec.replication {
+        // Diskless sync configuration
+        if replication.diskless_sync {
+            flags.push("--repl-diskless-sync yes".to_string());
+            flags.push(format!(
+                "--repl-diskless-sync-delay {}",
+                replication.diskless_sync_delay
+            ));
+        } else {
+            flags.push("--repl-diskless-sync no".to_string());
+        }
+
+        // Replica health thresholds (only if min_replicas_to_write > 0)
+        if replication.min_replicas_to_write > 0 {
+            flags.push(format!(
+                "--min-replicas-to-write {}",
+                replication.min_replicas_to_write
+            ));
+            flags.push(format!(
+                "--min-replicas-max-lag {}",
+                replication.min_replicas_max_lag
+            ));
+        }
+    }
+
+    // ACL configuration
+    if let Some(acl) = &resource.spec.auth.acl
+        && acl.enabled && acl.config_secret_ref.is_some() {
+            flags.push("--aclfile /etc/valkey/acl/acl.conf".to_string());
+        }
 
     // TLS configuration
     flags.push("--tls-port 6379".to_string());
@@ -447,7 +488,7 @@ fn generate_container_security_context() -> SecurityContext {
 ///
 /// Uses simple PING during startup to allow time for AOF loading.
 /// Higher failure threshold to accommodate large datasets.
-/// Uses VALKEYCLI_AUTH environment variable for secure password handling.
+/// Uses REDISCLI_AUTH environment variable for secure password handling.
 /// Uses --tls --insecure for localhost connections (skips cert validation).
 fn generate_startup_probe() -> Probe {
     Probe {
@@ -455,7 +496,7 @@ fn generate_startup_probe() -> Probe {
             command: Some(vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "VALKEYCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure ping".to_string(),
+                "REDISCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure ping".to_string(),
             ]),
         }),
         // 60 failures * 5 seconds = 5 minutes for AOF loading
@@ -469,7 +510,7 @@ fn generate_startup_probe() -> Probe {
 /// Generate liveness probe.
 ///
 /// Uses simple PING to verify the process is responsive.
-/// Uses VALKEYCLI_AUTH environment variable for secure password handling.
+/// Uses REDISCLI_AUTH environment variable for secure password handling.
 /// Uses --tls --insecure for localhost connections (skips cert validation).
 fn generate_liveness_probe() -> Probe {
     Probe {
@@ -477,7 +518,7 @@ fn generate_liveness_probe() -> Probe {
             command: Some(vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "VALKEYCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure ping".to_string(),
+                "REDISCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure ping".to_string(),
             ]),
         }),
         initial_delay_seconds: Some(10),
@@ -501,7 +542,7 @@ fn generate_readiness_probe() -> Probe {
             command: Some(vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "VALKEYCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure cluster info | grep cluster_state:ok".to_string(),
+                "REDISCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure cluster info | grep cluster_state:ok".to_string(),
             ]),
         }),
         initial_delay_seconds: Some(5),
@@ -516,7 +557,7 @@ fn generate_readiness_probe() -> Probe {
 /// Generate lifecycle hooks.
 ///
 /// preStop hook performs BGSAVE before termination to minimize data loss.
-/// Uses VALKEYCLI_AUTH environment variable for secure password handling.
+/// Uses REDISCLI_AUTH environment variable for secure password handling.
 /// Uses --tls --insecure for localhost connections (skips cert validation).
 fn generate_lifecycle() -> Lifecycle {
     Lifecycle {
@@ -525,7 +566,7 @@ fn generate_lifecycle() -> Lifecycle {
                 command: Some(vec![
                     "sh".to_string(),
                     "-c".to_string(),
-                    "VALKEYCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure bgsave && sleep 5"
+                    "REDISCLI_AUTH=$VALKEY_PASSWORD valkey-cli --tls --insecure bgsave && sleep 5"
                         .to_string(),
                 ]),
             }),
@@ -533,6 +574,136 @@ fn generate_lifecycle() -> Lifecycle {
         }),
         ..Default::default()
     }
+}
+
+/// Generate the metrics exporter sidecar container.
+///
+/// Returns `None` if the metrics exporter is not enabled.
+/// The exporter connects to the local Valkey instance and exposes Prometheus metrics.
+fn generate_metrics_exporter_container(resource: &ValkeyCluster) -> Option<Container> {
+    let exporter_spec = resource.spec.metrics_exporter.as_ref()?;
+    if !exporter_spec.enabled {
+        return None;
+    }
+
+    let port = exporter_spec.port;
+    let default_resources = ExporterResourcesSpec::default();
+    let resources = exporter_spec.resources.as_ref().unwrap_or(&default_resources);
+
+    // Build environment variables for the exporter
+    let mut env = vec![
+        // Valkey connection URL with TLS
+        EnvVar {
+            name: "REDIS_ADDR".to_string(),
+            value: Some("rediss://localhost:6379".to_string()),
+            ..Default::default()
+        },
+        // Password from secret
+        EnvVar {
+            name: "REDIS_PASSWORD".to_string(),
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: resource.spec.auth.secret_ref.name.clone(),
+                    key: resource.spec.auth.secret_ref.key.clone(),
+                    optional: Some(false),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        // Skip TLS verification for localhost
+        EnvVar {
+            name: "REDIS_EXPORTER_SKIP_TLS_VERIFICATION".to_string(),
+            value: Some("true".to_string()),
+            ..Default::default()
+        },
+        // Disable checking keys for performance
+        EnvVar {
+            name: "REDIS_EXPORTER_CHECK_KEYS".to_string(),
+            value: Some("".to_string()),
+            ..Default::default()
+        },
+    ];
+
+    // Add user-defined environment variables
+    for (key, value) in &exporter_spec.extra_env {
+        env.push(EnvVar {
+            name: key.clone(),
+            value: Some(value.clone()),
+            ..Default::default()
+        });
+    }
+
+    Some(Container {
+        name: "metrics-exporter".to_string(),
+        image: Some(exporter_spec.image.clone()),
+        image_pull_policy: Some("IfNotPresent".to_string()),
+        ports: Some(vec![ContainerPort {
+            container_port: port,
+            name: Some("metrics".to_string()),
+            protocol: Some("TCP".to_string()),
+            ..Default::default()
+        }]),
+        env: Some(env),
+        resources: Some(ResourceRequirements {
+            limits: Some({
+                let mut limits = BTreeMap::new();
+                limits.insert("cpu".to_string(), Quantity(resources.cpu_limit.clone()));
+                limits.insert(
+                    "memory".to_string(),
+                    Quantity(resources.memory_limit.clone()),
+                );
+                limits
+            }),
+            requests: Some({
+                let mut requests = BTreeMap::new();
+                requests.insert("cpu".to_string(), Quantity(resources.cpu_request.clone()));
+                requests.insert(
+                    "memory".to_string(),
+                    Quantity(resources.memory_request.clone()),
+                );
+                requests
+            }),
+            ..Default::default()
+        }),
+        security_context: Some(SecurityContext {
+            allow_privilege_escalation: Some(false),
+            read_only_root_filesystem: Some(true),
+            run_as_non_root: Some(true),
+            run_as_user: Some(VALKEY_USER_ID),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        // Simple liveness/readiness probes for the exporter
+        liveness_probe: Some(Probe {
+            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
+                path: Some("/health".to_string()),
+                port: IntOrString::Int(port),
+                ..Default::default()
+            }),
+            initial_delay_seconds: Some(10),
+            period_seconds: Some(30),
+            timeout_seconds: Some(5),
+            failure_threshold: Some(3),
+            ..Default::default()
+        }),
+        readiness_probe: Some(Probe {
+            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
+                path: Some("/health".to_string()),
+                port: IntOrString::Int(port),
+                ..Default::default()
+            }),
+            initial_delay_seconds: Some(5),
+            period_seconds: Some(10),
+            timeout_seconds: Some(5),
+            failure_threshold: Some(3),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
 }
 
 /// Generate volumes for the pod.
@@ -561,12 +732,32 @@ fn generate_volumes(resource: &ValkeyCluster) -> Vec<Volume> {
         });
     }
 
+    // ACL configuration volume if enabled
+    if let Some(acl) = &resource.spec.auth.acl
+        && acl.enabled
+            && let Some(secret_ref) = &acl.config_secret_ref {
+                volumes.push(Volume {
+                    name: "acl-config".to_string(),
+                    secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+                        secret_name: Some(secret_ref.name.clone()),
+                        default_mode: Some(0o400),
+                        items: Some(vec![k8s_openapi::api::core::v1::KeyToPath {
+                            key: secret_ref.key.clone(),
+                            path: "acl.conf".to_string(),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            }
+
     volumes
 }
 
 /// Generate volume mounts for the container.
-fn generate_volume_mounts(_resource: &ValkeyCluster) -> Vec<VolumeMount> {
-    vec![
+fn generate_volume_mounts(resource: &ValkeyCluster) -> Vec<VolumeMount> {
+    let mut mounts = vec![
         VolumeMount {
             name: "data".to_string(),
             mount_path: "/data".to_string(),
@@ -578,7 +769,20 @@ fn generate_volume_mounts(_resource: &ValkeyCluster) -> Vec<VolumeMount> {
             read_only: Some(true),
             ..Default::default()
         },
-    ]
+    ];
+
+    // ACL configuration mount if enabled
+    if let Some(acl) = &resource.spec.auth.acl
+        && acl.enabled && acl.config_secret_ref.is_some() {
+            mounts.push(VolumeMount {
+                name: "acl-config".to_string(),
+                mount_path: "/etc/valkey/acl".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
+
+    mounts
 }
 
 /// Generate PVC template for the StatefulSet.
@@ -642,6 +846,7 @@ mod tests {
                         name: "test-secret".to_string(),
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
                 ..Default::default()
             },
