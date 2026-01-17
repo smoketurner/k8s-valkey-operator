@@ -397,18 +397,35 @@ fn build_valkey_extra_flags(
         } else {
             flags.push("--repl-diskless-sync no".to_string());
         }
+    }
 
-        // Replica health thresholds (only if min_replicas_to_write > 0)
-        if replication.min_replicas_to_write > 0 {
-            flags.push(format!(
-                "--min-replicas-to-write {}",
-                replication.min_replicas_to_write
-            ));
-            flags.push(format!(
-                "--min-replicas-max-lag {}",
-                replication.min_replicas_max_lag
-            ));
-        }
+    // Replica health thresholds - secure by default
+    // When replicas are configured, require at least 1 replica to acknowledge writes
+    // to prevent silent data loss. Users can explicitly set to 0 to disable.
+    let min_replicas_to_write = resource
+        .spec
+        .replication
+        .as_ref()
+        .map(|r| r.min_replicas_to_write)
+        .unwrap_or_else(|| {
+            // Secure default: require 1 replica ack when replicas exist
+            if resource.spec.replicas_per_master > 0 {
+                1
+            } else {
+                0
+            }
+        });
+
+    let min_replicas_max_lag = resource
+        .spec
+        .replication
+        .as_ref()
+        .map(|r| r.min_replicas_max_lag)
+        .unwrap_or(10);
+
+    if min_replicas_to_write > 0 {
+        flags.push(format!("--min-replicas-to-write {}", min_replicas_to_write));
+        flags.push(format!("--min-replicas-max-lag {}", min_replicas_max_lag));
     }
 
     // ACL configuration

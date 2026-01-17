@@ -95,7 +95,7 @@ kubectl get vc -w
 | `readService.enabled` | Enable read-only service | false |
 | `metricsExporter.enabled` | Enable Prometheus exporter sidecar | false |
 | `replication.disklessSync` | Enable diskless replication | false |
-| `replication.minReplicasToWrite` | Minimum replicas for write acknowledgment | 0 |
+| `replication.minReplicasToWrite` | Minimum replicas for write acknowledgment | 1 (when replicas exist) |
 
 See [docs/features.md](docs/features.md) for detailed configuration options.
 

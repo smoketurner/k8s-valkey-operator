@@ -306,8 +306,7 @@ spec:
                       description: Delay in seconds before starting diskless sync
                     minReplicasToWrite:
                       type: integer
-                      default: 0
-                      description: Minimum replicas that must acknowledge writes (0 = disabled)
+                      description: Minimum replicas that must acknowledge writes. Defaults to 1 when replicasPerMaster > 0 (secure by default). Set to 0 to disable.
                     minReplicasMaxLag:
                       type: integer
                       default: 10

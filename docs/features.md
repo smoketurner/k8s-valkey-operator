@@ -394,7 +394,7 @@ spec:
   replication:
     disklessSync: true           # Enable diskless sync (default: false)
     disklessSyncDelay: 5         # Delay before diskless sync (default: 5 seconds)
-    minReplicasToWrite: 1        # Min replicas to acknowledge writes (default: 0)
+    minReplicasToWrite: 1        # Min replicas to acknowledge writes (see below)
     minReplicasMaxLag: 10        # Max lag for replica health (default: 10 seconds)
 ```
 
@@ -412,9 +412,15 @@ When enabled, masters stream RDB data directly to replicas without writing to di
 - Datasets are large
 - Memory is available for streaming
 
-### Replica Health Thresholds
+### Replica Health Thresholds (Secure by Default)
 
-Control write durability by requiring replica acknowledgments:
+The operator enforces durability by default when replicas are configured.
+
+**Default behavior:**
+- When `replicasPerMaster > 0`: `minReplicasToWrite` defaults to **1**
+- When `replicasPerMaster = 0`: `minReplicasToWrite` defaults to **0**
+
+This ensures that if you configure replicas for high availability, writes are only accepted when at least one replica can acknowledge them, preventing silent data loss.
 
 ```yaml
 spec:
@@ -425,9 +431,17 @@ spec:
 
 | Setting | Value | Effect |
 |---------|-------|--------|
-| `minReplicasToWrite: 0` | Disabled | Writes always accepted |
-| `minReplicasToWrite: 1` | 1 replica required | Better durability |
+| `minReplicasToWrite: 0` | Disabled | Writes always accepted (explicit opt-out) |
+| `minReplicasToWrite: 1` | 1 replica required | **Default when replicas exist** |
 | `minReplicasToWrite: 2` | 2 replicas required | Strong durability |
+
+**To prioritize availability over durability**, explicitly set:
+
+```yaml
+spec:
+  replication:
+    minReplicasToWrite: 0  # Accept writes even with no healthy replicas
+```
 
 **Warning**: Setting `minReplicasToWrite` too high can cause write unavailability during replica failures.
 
