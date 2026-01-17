@@ -146,7 +146,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             error!(name = %name, phase = %current_phase, reconcile_count = reconcile_count, "Stuck detection triggered");
             ctx.publish_warning_event(&obj, "StuckDetected", "Reconciling", Some(error_msg.clone()))
                 .await;
-            update_status(&api, &name, ClusterPhase::Failed, 0, Some(&error_msg), None).await?;
+            update_status(&api, &name, ClusterPhase::Failed, 0, Some(&error_msg), None, current_gen).await?;
             return Ok(Action::requeue(requeue_duration(ClusterPhase::Failed)));
         }
 
@@ -163,7 +163,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                 error!(name = %name, phase = %current_phase, elapsed_secs = elapsed, "Stuck detection triggered");
                 ctx.publish_warning_event(&obj, "StuckDetected", "Reconciling", Some(error_msg.clone()))
                     .await;
-                update_status(&api, &name, ClusterPhase::Failed, 0, Some(&error_msg), None).await?;
+                update_status(&api, &name, ClusterPhase::Failed, 0, Some(&error_msg), None, current_gen).await?;
                 return Ok(Action::requeue(requeue_duration(ClusterPhase::Failed)));
             }
         }
@@ -189,6 +189,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     0,
                     Some(&e.to_string()),
                     None,
+                    current_gen,
                 )
                 .await?;
                 return Err(e);
@@ -273,11 +274,10 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             create_owned_resources(&obj, &ctx, &namespace).await?;
 
             // Check if recovered
-            // For Degraded recovery, we trust the readiness probe (cluster_state:ok)
-            // rather than the full health check, since recovering nodes may be
-            // temporarily marked as pfail/fail while rejoining the cluster
             let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
+            let running_pods = check_running_pods(&obj, &ctx, &namespace).await?;
             let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+
             if ready_replicas >= desired_replicas {
                 ctx.publish_normal_event(
                     &obj,
@@ -290,7 +290,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                 )
                 .await;
                 ClusterPhase::Running
-            } else if ready_replicas == 0 {
+            } else if ready_replicas == 0 && running_pods == 0 {
                 ctx.publish_warning_event(
                     &obj,
                     "Failed",
@@ -299,6 +299,26 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                 )
                 .await;
                 ClusterPhase::Failed
+            } else if running_pods >= desired_replicas && ready_replicas < desired_replicas {
+                // Pods are running but not ready - likely cluster health issue
+                // Try to heal the cluster by running CLUSTER MEET to re-integrate nodes
+                debug!(
+                    name = %name,
+                    running_pods = running_pods,
+                    ready_replicas = ready_replicas,
+                    "Pods running but not ready, attempting cluster healing"
+                );
+
+                // Execute CLUSTER MEET to re-integrate any orphan nodes
+                if let Err(e) = execute_cluster_init(&obj, &ctx, &namespace).await {
+                    debug!(
+                        name = %name,
+                        error = %e,
+                        "Cluster healing failed, will retry"
+                    );
+                }
+
+                ClusterPhase::Degraded
             } else {
                 ClusterPhase::Degraded
             }
@@ -525,6 +545,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
         ready_replicas,
         None,
         health_status.as_ref(),
+        current_gen,
     )
     .await?;
 
@@ -980,6 +1001,11 @@ async fn check_cluster_health(
 }
 
 /// Update the status of a ValkeyCluster
+///
+/// IMPORTANT: The `reconcile_generation` parameter should be the generation
+/// from the object at the START of reconciliation, not re-fetched. This prevents
+/// race conditions where a spec change during reconciliation could cause the
+/// observed_generation to be set to the new value before we've processed the change.
 async fn update_status(
     api: &Api<ValkeyCluster>,
     name: &str,
@@ -987,9 +1013,12 @@ async fn update_status(
     ready_replicas: i32,
     error_message: Option<&str>,
     health_status: Option<&ClusterHealthStatus>,
+    reconcile_generation: Option<i64>,
 ) -> Result<(), Error> {
     let obj = api.get(name).await?;
-    let generation = obj.metadata.generation;
+    // Use the generation from reconcile start, not the current generation
+    // This prevents race conditions when spec changes during reconciliation
+    let generation = reconcile_generation.or(obj.metadata.generation);
     let namespace = obj.namespace().unwrap_or_else(|| "default".to_string());
 
     // Calculate expected totals

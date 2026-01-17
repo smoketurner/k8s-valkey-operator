@@ -2,10 +2,9 @@
 //!
 //! Utilities used by both ValkeyCluster and ValkeyUpgrade controllers.
 
-use kube::{Api, Resource, api::PatchParams};
+use kube::{Api, Resource, ResourceExt, api::PatchParams};
 use serde::de::DeserializeOwned;
 
-use crate::controller::context::FIELD_MANAGER;
 use crate::controller::error::Error;
 
 /// Add a finalizer to a resource.
@@ -14,17 +13,26 @@ where
     T: Resource + Clone + DeserializeOwned + std::fmt::Debug,
     <T as Resource>::DynamicType: Default,
 {
-    let patch = serde_json::json!({
-        "metadata": {
-            "finalizers": [finalizer]
-        }
-    });
-    api.patch(
-        name,
-        &PatchParams::apply(FIELD_MANAGER),
-        &kube::api::Patch::Merge(&patch),
-    )
-    .await?;
+    // Get current resource to check existing finalizers
+    let resource = api.get(name).await?;
+    let mut finalizers = resource.finalizers().to_vec();
+
+    // Only add if not already present
+    if !finalizers.contains(&finalizer.to_string()) {
+        finalizers.push(finalizer.to_string());
+
+        let patch = serde_json::json!({
+            "metadata": {
+                "finalizers": finalizers
+            }
+        });
+        api.patch(
+            name,
+            &PatchParams::default(),
+            &kube::api::Patch::Merge(&patch),
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -34,14 +42,15 @@ where
     T: Resource + Clone + DeserializeOwned + std::fmt::Debug,
     <T as Resource>::DynamicType: Default,
 {
+    // Use merge patch to clear all finalizers
     let patch = serde_json::json!({
         "metadata": {
-            "finalizers": null
+            "finalizers": []
         }
     });
     api.patch(
         name,
-        &PatchParams::apply(FIELD_MANAGER),
+        &PatchParams::default(),
         &kube::api::Patch::Merge(&patch),
     )
     .await?;
