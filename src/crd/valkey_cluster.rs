@@ -578,6 +578,16 @@ pub struct ValkeyClusterStatus {
     /// Used for stuck detection (alert if stuck in same phase too long).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_phase_transition: Option<String>,
+
+    /// Number of recovery attempts in current Failed state.
+    /// Used for exponential backoff during automatic stale IP recovery.
+    #[serde(default)]
+    pub recovery_attempts: i32,
+
+    /// Timestamp of last recovery attempt (RFC3339 format).
+    /// Used for calculating backoff before next recovery attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_recovery_attempt: Option<String>,
 }
 
 /// ClusterPhase represents the current lifecycle phase of a ValkeyCluster.

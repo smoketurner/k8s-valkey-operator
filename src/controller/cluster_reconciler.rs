@@ -505,9 +505,172 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             handle_verifying_cluster(&obj, &ctx, &api, &namespace).await?
         }
         ClusterPhase::Failed => {
-            // Manual intervention required
-            warn!(name = %name, "Resource in Failed state, waiting for intervention");
-            ClusterPhase::Failed
+            // Attempt automatic recovery for stale IP conditions
+            // Recovery conditions:
+            // 1. All pods Running but not Ready (indicates cluster health issue, not pod issue)
+            // 2. Under max attempts (5)
+            // 3. Backoff elapsed (30s * 2^attempts)
+            let running_pods = check_running_pods(&obj, &ctx, &namespace).await.unwrap_or(0);
+            let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await.unwrap_or(0);
+            let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+
+            // Get recovery state from status
+            let recovery_attempts = obj
+                .status
+                .as_ref()
+                .map(|s| s.recovery_attempts)
+                .unwrap_or(0);
+            let last_recovery = obj
+                .status
+                .as_ref()
+                .and_then(|s| s.last_recovery_attempt.as_ref());
+
+            // Constants for recovery behavior
+            const MAX_RECOVERY_ATTEMPTS: i32 = 5;
+            const BASE_BACKOFF_SECS: i64 = 30;
+
+            // Check if we can attempt recovery
+            let can_attempt = running_pods >= desired_replicas
+                && ready_replicas < desired_replicas
+                && recovery_attempts < MAX_RECOVERY_ATTEMPTS;
+
+            // Check backoff elapsed
+            let backoff_elapsed = if let Some(last_attempt) = last_recovery {
+                if let Ok(ts) = std::str::FromStr::from_str(last_attempt)
+                    .map(|t: jiff::Timestamp| t)
+                {
+                    let backoff_secs = BASE_BACKOFF_SECS * (1i64 << recovery_attempts.min(10));
+                    let elapsed = jiff::Timestamp::now().duration_since(ts).as_secs();
+                    elapsed >= backoff_secs
+                } else {
+                    true // Invalid timestamp, allow attempt
+                }
+            } else {
+                true // No previous attempt, allow
+            };
+
+            if can_attempt && backoff_elapsed {
+                info!(
+                    name = %name,
+                    running_pods = running_pods,
+                    ready_replicas = ready_replicas,
+                    recovery_attempts = recovery_attempts,
+                    "Attempting automatic stale IP recovery"
+                );
+
+                ctx.publish_normal_event(
+                    &obj,
+                    "RecoveryAttempt",
+                    "Recovering",
+                    Some(format!(
+                        "Attempting automatic recovery (attempt {}/{})",
+                        recovery_attempts + 1,
+                        MAX_RECOVERY_ATTEMPTS
+                    )),
+                )
+                .await;
+
+                // Execute recovery via CLUSTER MEET
+                let recovery_result = execute_stale_ip_recovery(&obj, &ctx, &namespace).await;
+
+                // Update recovery tracking in status
+                let mut status = obj.status.clone().unwrap_or_default();
+                status.recovery_attempts = recovery_attempts + 1;
+                status.last_recovery_attempt = Some(jiff::Timestamp::now().to_string());
+
+                let patch = serde_json::json!({
+                    "status": {
+                        "recovery_attempts": status.recovery_attempts,
+                        "last_recovery_attempt": status.last_recovery_attempt,
+                    }
+                });
+                let _ = api
+                    .patch_status(
+                        &name,
+                        &PatchParams::apply(FIELD_MANAGER),
+                        &Patch::Merge(&patch),
+                    )
+                    .await;
+
+                match recovery_result {
+                    Ok(()) => {
+                        info!(name = %name, "Stale IP recovery successful, transitioning to Degraded");
+                        ctx.publish_normal_event(
+                            &obj,
+                            "RecoverySucceeded",
+                            "Recovered",
+                            Some("Automatic stale IP recovery successful".to_string()),
+                        )
+                        .await;
+                        ClusterPhase::Degraded
+                    }
+                    Err(e) => {
+                        warn!(name = %name, error = %e, "Stale IP recovery failed, will retry");
+                        ctx.publish_warning_event(
+                            &obj,
+                            "RecoveryFailed",
+                            "Recovering",
+                            Some(format!("Recovery attempt failed: {}", e)),
+                        )
+                        .await;
+                        ClusterPhase::Failed
+                    }
+                }
+            } else if recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+                warn!(
+                    name = %name,
+                    recovery_attempts = recovery_attempts,
+                    "Max recovery attempts reached, manual intervention required"
+                );
+                ClusterPhase::Failed
+            } else if ready_replicas >= desired_replicas {
+                // All replicas are Ready but we're still in Failed state
+                // This can happen after successful recovery - check actual cluster health
+                info!(
+                    name = %name,
+                    ready_replicas = ready_replicas,
+                    "All replicas ready in Failed state, checking cluster health"
+                );
+
+                match check_cluster_health(&obj, &ctx, &namespace).await {
+                    Ok(health) if health.is_healthy => {
+                        info!(name = %name, "Cluster is healthy, transitioning to Running");
+                        ctx.publish_normal_event(
+                            &obj,
+                            "Recovered",
+                            "Running",
+                            Some("Cluster recovered and healthy".to_string()),
+                        )
+                        .await;
+                        ClusterPhase::Running
+                    }
+                    Ok(health) => {
+                        info!(
+                            name = %name,
+                            healthy_masters = health.healthy_masters,
+                            slots_assigned = health.slots_assigned,
+                            "Cluster not fully healthy yet, transitioning to Degraded"
+                        );
+                        ClusterPhase::Degraded
+                    }
+                    Err(e) => {
+                        debug!(name = %name, error = %e, "Failed to check cluster health");
+                        ClusterPhase::Failed
+                    }
+                }
+            } else {
+                // Not ready for recovery attempt yet
+                debug!(
+                    name = %name,
+                    running_pods = running_pods,
+                    ready_replicas = ready_replicas,
+                    desired = desired_replicas,
+                    can_attempt = can_attempt,
+                    backoff_elapsed = backoff_elapsed,
+                    "Waiting for recovery conditions"
+                );
+                ClusterPhase::Failed
+            }
         }
         ClusterPhase::Deleting => {
             // Should be handled by deletion branch above
@@ -851,6 +1014,32 @@ async fn execute_slot_assignment(
     Ok(())
 }
 
+/// Execute stale IP recovery via CLUSTER MEET.
+///
+/// This is called when the cluster is in Failed state with all pods Running
+/// but not Ready, indicating a potential stale IP condition where nodes.conf
+/// has old IP addresses after pod restarts.
+async fn execute_stale_ip_recovery(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<(), Error> {
+    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
+
+    // Execute recovery via CLUSTER MEET
+    cluster_init::recover_stale_ips(
+        &ctx.client,
+        obj,
+        password.as_deref(),
+        tls_certs.as_ref(),
+        &strategy,
+    )
+    .await
+    .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    Ok(())
+}
+
 /// Health check result containing cluster state information.
 pub struct ClusterHealthStatus {
     /// Whether the cluster is healthy (state=ok, all slots assigned).
@@ -1103,6 +1292,20 @@ async fn update_status(
         last_phase_transition
     };
 
+    // Handle recovery tracking fields
+    // Reset recovery_attempts when transitioning away from Failed state
+    // Preserve them when staying in Failed state
+    let (recovery_attempts, last_recovery_attempt) = if phase != ClusterPhase::Failed {
+        // Transitioning away from Failed (or never in Failed) - reset recovery state
+        (0, None)
+    } else {
+        // Staying in Failed state - preserve existing recovery state
+        (
+            existing_status.map(|s| s.recovery_attempts).unwrap_or(0),
+            existing_status.and_then(|s| s.last_recovery_attempt.clone()),
+        )
+    };
+
     let status = ValkeyClusterStatus {
         phase,
         ready_nodes: format!("{}/{}", ready_replicas, desired_replicas),
@@ -1123,6 +1326,8 @@ async fn update_status(
         message,
         reconcile_count,
         last_phase_transition,
+        recovery_attempts,
+        last_recovery_attempt,
     };
 
     let patch = serde_json::json!({
@@ -2181,9 +2386,72 @@ async fn handle_removing_nodes(
     Ok(ClusterPhase::ScalingStatefulSet)
 }
 
+/// Detect and clean up orphaned nodes (masters with no slots beyond expected count).
+///
+/// This handles the case where a node dies during scale-down before CLUSTER FORGET
+/// can be executed. The orphaned node will still appear in CLUSTER NODES with fail/pfail
+/// flags, causing the health check to fail.
+///
+/// Returns the list of node IDs that were successfully cleaned up.
+async fn detect_and_cleanup_orphans(
+    cluster: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<Vec<String>, Error> {
+    let expected_masters = cluster.spec.masters;
+    let name = cluster.name_any();
+
+    // Get connection context
+    let (password, tls_certs, strategy) = ctx.connection_context(cluster, namespace).await?;
+
+    // Connect to get cluster state
+    let (host, port) = strategy
+        .get_connection(0)
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let client =
+        crate::client::ValkeyClient::connect_single(&host, port, password.as_deref(), tls_certs.as_ref())
+            .await
+            .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let orphans = cluster_init::detect_orphaned_nodes(&client, expected_masters)
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let _ = client.close().await;
+
+    if orphans.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let orphan_ids: Vec<String> = orphans.iter().map(|n| n.node_id.clone()).collect();
+
+    info!(
+        cluster = %name,
+        orphan_count = orphans.len(),
+        orphan_ids = ?orphan_ids,
+        "Detected orphaned nodes, cleaning up via CLUSTER FORGET"
+    );
+
+    // Execute CLUSTER FORGET with retry across pods
+    let forgotten = cluster_init::forget_nodes_with_retry(
+        cluster,
+        &orphan_ids,
+        password.as_deref(),
+        tls_certs.as_ref(),
+        &strategy,
+    )
+    .await
+    .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    Ok(forgotten)
+}
+
 /// Handle VerifyingCluster phase.
 ///
 /// Performs final health check before transitioning to Running.
+/// Also detects and cleans up orphaned nodes that may remain from failed scale-down operations.
 async fn handle_verifying_cluster(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -2193,7 +2461,39 @@ async fn handle_verifying_cluster(
     let name = obj.name_any();
     info!(name = %name, "Verifying cluster health");
 
-    // Check cluster health
+    // Step 1: Check for orphaned nodes (masters with no slots beyond expected count)
+    // This handles the case where CLUSTER FORGET failed during scale-down
+    match detect_and_cleanup_orphans(obj, ctx, namespace).await {
+        Ok(forgotten) if !forgotten.is_empty() => {
+            info!(
+                name = %name,
+                orphan_count = forgotten.len(),
+                "Cleaned up orphaned nodes, will re-verify"
+            );
+            ctx.publish_normal_event(
+                obj,
+                "OrphanedNodesRemoved",
+                "Cleanup",
+                Some(format!(
+                    "Removed {} orphaned nodes from cluster",
+                    forgotten.len()
+                )),
+            )
+            .await;
+
+            // Give gossip time to propagate, then re-verify
+            return Ok(ClusterPhase::VerifyingCluster);
+        }
+        Ok(_) => {
+            // No orphaned nodes found
+        }
+        Err(e) => {
+            // Log but continue with health check - orphan cleanup is best-effort
+            warn!(name = %name, error = %e, "Failed to check for orphaned nodes, continuing");
+        }
+    }
+
+    // Step 2: Check cluster health
     match check_cluster_health(obj, ctx, namespace).await {
         Ok(health) if health.is_healthy => {
             info!(

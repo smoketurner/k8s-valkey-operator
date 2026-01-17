@@ -130,6 +130,265 @@ pub async fn get_pod_ips(
     Ok(pod_ips)
 }
 
+/// Information about stale IP detection results.
+#[derive(Debug)]
+pub struct StaleIpInfo {
+    /// Whether stale IPs were detected.
+    pub has_stale_ips: bool,
+    /// Number of nodes with stale/mismatched IPs.
+    pub stale_count: i32,
+    /// Current pod IPs from Kubernetes API.
+    pub current_ips: Vec<(String, String, u16)>,
+    /// IPs stored in cluster nodes.conf.
+    pub stored_ips: Vec<String>,
+}
+
+/// Detect if cluster nodes have stale IP addresses.
+///
+/// This occurs when pods restart and get new IPs but the persisted nodes.conf
+/// still contains old IPs. Returns information about any stale IPs detected.
+///
+/// Detection logic:
+/// - Fetches current pod IPs from Kubernetes API
+/// - Connects to a running pod via port-forward
+/// - Queries CLUSTER NODES to get stored IPs
+/// - Compares and identifies mismatches
+pub async fn detect_stale_ips(
+    k8s_client: &Client,
+    cluster: &ValkeyCluster,
+    password: Option<&str>,
+    tls_certs: Option<&TlsCertData>,
+    strategy: &ConnectionStrategy,
+) -> Result<StaleIpInfo, ValkeyError> {
+    let namespace = cluster.namespace().unwrap_or_else(|| "default".to_string());
+    let cluster_name = cluster.name_any();
+    let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
+
+    // Get current pod IPs from Kubernetes API
+    let current_ips = get_pod_ips(k8s_client, &namespace, &cluster_name, total_pods).await?;
+
+    if current_ips.is_empty() {
+        return Ok(StaleIpInfo {
+            has_stale_ips: false,
+            stale_count: 0,
+            current_ips: Vec::new(),
+            stored_ips: Vec::new(),
+        });
+    }
+
+    // Build a set of current IPs
+    let current_ip_set: std::collections::HashSet<&str> =
+        current_ips.iter().map(|(_, ip, _)| ip.as_str()).collect();
+
+    // Try to connect to the first available pod
+    let (connect_host, connect_port) = strategy.get_connection(0).await?;
+
+    let client = match ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(error = %e, "Failed to connect for stale IP detection, will retry later");
+            return Ok(StaleIpInfo {
+                has_stale_ips: false,
+                stale_count: 0,
+                current_ips,
+                stored_ips: Vec::new(),
+            });
+        }
+    };
+
+    // Get stored IPs from CLUSTER NODES
+    let cluster_nodes = match client.cluster_nodes().await {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            let _ = client.close().await;
+            debug!(error = %e, "Failed to get cluster nodes for stale IP detection");
+            return Ok(StaleIpInfo {
+                has_stale_ips: false,
+                stale_count: 0,
+                current_ips,
+                stored_ips: Vec::new(),
+            });
+        }
+    };
+
+    let _ = client.close().await;
+
+    // Extract IPs from cluster nodes
+    let stored_ips: Vec<String> = cluster_nodes
+        .nodes
+        .iter()
+        .map(|n| n.ip.clone())
+        .collect();
+
+    // Count how many stored IPs are not in the current set
+    let stale_count = stored_ips
+        .iter()
+        .filter(|ip| !current_ip_set.contains(ip.as_str()))
+        .count() as i32;
+
+    let has_stale_ips = stale_count > 0;
+
+    if has_stale_ips {
+        info!(
+            cluster = %cluster_name,
+            stale_count = stale_count,
+            total_nodes = stored_ips.len(),
+            "Detected stale IPs in cluster nodes"
+        );
+    }
+
+    Ok(StaleIpInfo {
+        has_stale_ips,
+        stale_count,
+        current_ips,
+        stored_ips,
+    })
+}
+
+/// Recover a cluster with stale IP addresses by executing CLUSTER MEET.
+///
+/// When pods restart and get new IPs, the nodes can't communicate via gossip
+/// because nodes.conf contains stale IPs. This function:
+/// 1. Gets current pod IPs from Kubernetes API
+/// 2. Iterates through all pods
+/// 3. Executes CLUSTER MEET from each pod to all others with current IPs
+/// 4. Waits for gossip propagation
+///
+/// CLUSTER MEET is idempotent - it safely updates addresses for known nodes.
+#[instrument(skip(k8s_client, cluster, password, tls_certs, strategy))]
+pub async fn recover_stale_ips(
+    k8s_client: &Client,
+    cluster: &ValkeyCluster,
+    password: Option<&str>,
+    tls_certs: Option<&TlsCertData>,
+    strategy: &ConnectionStrategy,
+) -> Result<(), ValkeyError> {
+    let namespace = cluster.namespace().unwrap_or_else(|| "default".to_string());
+    let cluster_name = cluster.name_any();
+    let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
+
+    info!(
+        cluster = %cluster_name,
+        total_pods = total_pods,
+        "Attempting stale IP recovery via CLUSTER MEET"
+    );
+
+    // Get current pod IPs from Kubernetes API
+    let pod_ips = get_pod_ips(k8s_client, &namespace, &cluster_name, total_pods).await?;
+
+    if pod_ips.is_empty() {
+        return Err(ValkeyError::ClusterNotReady(
+            "No pods available for recovery".to_string(),
+        ));
+    }
+
+    // Execute CLUSTER MEET from each pod to all other pods
+    // This ensures all nodes know about each other with fresh IPs
+    let mut successful_meets = 0;
+    let mut failed_meets = 0;
+
+    for ordinal in 0..total_pods {
+        // Connect to this pod
+        let (connect_host, connect_port) = match strategy.get_connection(ordinal).await {
+            Ok(addr) => addr,
+            Err(e) => {
+                warn!(
+                    ordinal = ordinal,
+                    error = %e,
+                    "Failed to get connection for pod, skipping"
+                );
+                failed_meets += 1;
+                continue;
+            }
+        };
+
+        let client = match ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    ordinal = ordinal,
+                    error = %e,
+                    "Failed to connect to pod for recovery, skipping"
+                );
+                failed_meets += 1;
+                continue;
+            }
+        };
+
+        // Execute CLUSTER MEET to all other pods from this one
+        for (target_pod_name, target_ip, target_port) in &pod_ips {
+            // Extract target ordinal from pod name
+            let target_ordinal = target_pod_name
+                .rsplit('-')
+                .next()
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(-1);
+
+            // Skip meeting self
+            if target_ordinal == ordinal {
+                continue;
+            }
+
+            match client.cluster_meet(target_ip, *target_port).await {
+                Ok(()) => {
+                    debug!(
+                        from_ordinal = ordinal,
+                        to_pod = %target_pod_name,
+                        to_ip = %target_ip,
+                        "CLUSTER MEET successful"
+                    );
+                    successful_meets += 1;
+                }
+                Err(e) => {
+                    // CLUSTER MEET errors for already-known nodes are OK
+                    let error_str = e.to_string().to_lowercase();
+                    if error_str.contains("already") || error_str.contains("known") {
+                        debug!(
+                            from_ordinal = ordinal,
+                            to_pod = %target_pod_name,
+                            "Node already known, continuing"
+                        );
+                        successful_meets += 1;
+                    } else {
+                        debug!(
+                            from_ordinal = ordinal,
+                            to_pod = %target_pod_name,
+                            error = %e,
+                            "CLUSTER MEET failed"
+                        );
+                        failed_meets += 1;
+                    }
+                }
+            }
+        }
+
+        let _ = client.close().await;
+    }
+
+    info!(
+        cluster = %cluster_name,
+        successful_meets = successful_meets,
+        failed_meets = failed_meets,
+        "Stale IP recovery CLUSTER MEET complete"
+    );
+
+    // Wait for gossip to propagate the new addresses
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Partial success is OK - as long as some nodes can communicate,
+    // gossip will eventually propagate to all nodes
+    if successful_meets > 0 {
+        Ok(())
+    } else {
+        Err(ValkeyError::Connection(format!(
+            "All CLUSTER MEET attempts failed ({} failures)",
+            failed_meets
+        )))
+    }
+}
+
 /// Connection strategy for connecting to Valkey pods
 ///
 /// We always use port forwarding as it works both in-cluster and locally.
@@ -719,6 +978,153 @@ pub fn create_connection_strategy(
 ) -> ConnectionStrategy {
     info!(namespace = %namespace, cluster = %cluster_name, "Creating connection strategy with port forwarding");
     ConnectionStrategy::new(client, namespace, cluster_name)
+}
+
+/// Detect orphaned nodes - masters with no slots that exceed expected master count.
+///
+/// These can occur when CLUSTER FORGET fails during scale-down (e.g., if a node dies
+/// before CLUSTER FORGET can be executed). Orphaned nodes are identified as:
+/// - Master nodes (has master flag)
+/// - No slots assigned
+/// - Total master count exceeds expected masters
+///
+/// Returns a list of orphaned node IDs that should be removed via CLUSTER FORGET.
+#[instrument(skip(client))]
+pub async fn detect_orphaned_nodes(
+    client: &ValkeyClient,
+    expected_masters: i32,
+) -> Result<Vec<crate::client::ClusterNode>, ValkeyError> {
+    let cluster_nodes = client.cluster_nodes().await?;
+    let masters: Vec<_> = cluster_nodes.nodes.iter().filter(|n| n.flags.master).collect();
+
+    // If we have more masters than expected, find the ones with no slots
+    if masters.len() as i32 > expected_masters {
+        let orphans: Vec<_> = masters
+            .into_iter()
+            .filter(|m| m.slots.is_empty()) // No slots assigned
+            .cloned()
+            .collect();
+
+        if !orphans.is_empty() {
+            info!(
+                orphan_count = orphans.len(),
+                expected_masters = expected_masters,
+                "Detected orphaned nodes (masters with no slots)"
+            );
+            for orphan in &orphans {
+                debug!(
+                    node_id = %orphan.node_id,
+                    address = %orphan.address,
+                    flags_fail = orphan.flags.fail,
+                    flags_pfail = orphan.flags.pfail,
+                    "Orphaned node details"
+                );
+            }
+        }
+        return Ok(orphans);
+    }
+
+    Ok(vec![])
+}
+
+/// Execute CLUSTER FORGET for nodes, trying multiple source nodes if needed.
+///
+/// This function attempts to forget the specified nodes by connecting to each
+/// pod in the cluster and issuing CLUSTER FORGET. This is necessary because:
+/// - CLUSTER FORGET must be issued from every node in the cluster
+/// - Some nodes may be unreachable (the ones we're trying to forget)
+/// - We need to try from multiple nodes in case some are down
+///
+/// Returns the list of successfully forgotten node IDs.
+#[instrument(skip(cluster, password, tls_certs, strategy))]
+pub async fn forget_nodes_with_retry(
+    cluster: &ValkeyCluster,
+    nodes_to_forget: &[String], // Node IDs
+    password: Option<&str>,
+    tls_certs: Option<&TlsCertData>,
+    strategy: &ConnectionStrategy,
+) -> Result<Vec<String>, ValkeyError> {
+    let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
+    let mut forgotten = Vec::new();
+    let cluster_name = cluster.name_any();
+
+    for node_id in nodes_to_forget {
+        let mut success = false;
+
+        // Try from each pod until one succeeds
+        for ordinal in 0..total_pods {
+            let (host, port) = match strategy.get_connection(ordinal).await {
+                Ok(addr) => addr,
+                Err(e) => {
+                    debug!(
+                        ordinal = ordinal,
+                        error = %e,
+                        "Failed to get connection for pod, trying next"
+                    );
+                    continue;
+                }
+            };
+
+            let client = match ValkeyClient::connect_single(&host, port, password, tls_certs).await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!(
+                        ordinal = ordinal,
+                        error = %e,
+                        "Failed to connect to pod, trying next"
+                    );
+                    continue;
+                }
+            };
+
+            match client.cluster_forget(node_id).await {
+                Ok(()) => {
+                    info!(
+                        node_id = %node_id,
+                        from_ordinal = ordinal,
+                        cluster = %cluster_name,
+                        "Successfully forgot node"
+                    );
+                    forgotten.push(node_id.clone());
+                    success = true;
+                    let _ = client.close().await;
+                    break;
+                }
+                Err(e) => {
+                    let error_str = e.to_string().to_lowercase();
+                    // Node might already be forgotten or is the current node
+                    if error_str.contains("unknown node") || error_str.contains("myself") {
+                        debug!(
+                            node_id = %node_id,
+                            from_ordinal = ordinal,
+                            "Node already forgotten or is self, considering success"
+                        );
+                        success = true;
+                        let _ = client.close().await;
+                        break;
+                    }
+                    debug!(
+                        node_id = %node_id,
+                        from_ordinal = ordinal,
+                        error = %e,
+                        "CLUSTER FORGET failed, trying next pod"
+                    );
+                    let _ = client.close().await;
+                }
+            }
+        }
+
+        if !success {
+            warn!(
+                node_id = %node_id,
+                cluster = %cluster_name,
+                "Failed to forget node from any pod"
+            );
+        }
+    }
+
+    Ok(forgotten)
 }
 
 #[cfg(test)]

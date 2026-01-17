@@ -17,7 +17,7 @@ mod crd_tests {
         assert_eq!(ClusterPhase::Pending.to_string(), "Pending");
         assert_eq!(ClusterPhase::Creating.to_string(), "Creating");
         assert_eq!(ClusterPhase::Running.to_string(), "Running");
-        assert_eq!(ClusterPhase::Updating.to_string(), "Updating");
+        assert_eq!(ClusterPhase::DetectingChanges.to_string(), "DetectingChanges");
         assert_eq!(ClusterPhase::Degraded.to_string(), "Degraded");
         assert_eq!(ClusterPhase::Failed.to_string(), "Failed");
         assert_eq!(ClusterPhase::Deleting.to_string(), "Deleting");
@@ -79,10 +79,8 @@ mod state_machine_tests {
     #[test]
     fn test_valid_events_from_creating() {
         let sm = ClusterStateMachine::new();
-        // Creating can transition via AllReplicasReady -> Initializing (for cluster formation)
-        assert!(sm.can_transition(&ClusterPhase::Creating, &ClusterEvent::AllReplicasReady));
-        // Creating can transition via ReplicasDegraded -> Degraded
-        assert!(sm.can_transition(&ClusterPhase::Creating, &ClusterEvent::ReplicasDegraded));
+        // Creating can transition via PodsRunning -> Initializing (for cluster formation)
+        assert!(sm.can_transition(&ClusterPhase::Creating, &ClusterEvent::PodsRunning));
         // Creating can transition via ReconcileError -> Failed
         assert!(sm.can_transition(&ClusterPhase::Creating, &ClusterEvent::ReconcileError));
         // Creating can transition via DeletionRequested -> Deleting
@@ -103,16 +101,18 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn test_valid_events_from_updating() {
+    fn test_valid_events_from_detecting_changes() {
         let sm = ClusterStateMachine::new();
-        // Updating can transition via AllReplicasReady -> Running
-        assert!(sm.can_transition(&ClusterPhase::Updating, &ClusterEvent::AllReplicasReady));
-        // Updating can transition via ReplicasDegraded -> Degraded
-        assert!(sm.can_transition(&ClusterPhase::Updating, &ClusterEvent::ReplicasDegraded));
-        // Updating can transition via ReconcileError -> Failed
-        assert!(sm.can_transition(&ClusterPhase::Updating, &ClusterEvent::ReconcileError));
-        // Updating can transition via DeletionRequested -> Deleting
-        assert!(sm.can_transition(&ClusterPhase::Updating, &ClusterEvent::DeletionRequested));
+        // DetectingChanges can transition via NoChangesNeeded -> Running
+        assert!(sm.can_transition(&ClusterPhase::DetectingChanges, &ClusterEvent::NoChangesNeeded));
+        // DetectingChanges can transition via ChangesDetected -> ScalingStatefulSet
+        assert!(sm.can_transition(&ClusterPhase::DetectingChanges, &ClusterEvent::ChangesDetected));
+        // DetectingChanges can transition via SlotsMigrated -> MigratingSlots (for scale-down)
+        assert!(sm.can_transition(&ClusterPhase::DetectingChanges, &ClusterEvent::SlotsMigrated));
+        // DetectingChanges can transition via ReconcileError -> Failed
+        assert!(sm.can_transition(&ClusterPhase::DetectingChanges, &ClusterEvent::ReconcileError));
+        // DetectingChanges can transition via DeletionRequested -> Deleting
+        assert!(sm.can_transition(&ClusterPhase::DetectingChanges, &ClusterEvent::DeletionRequested));
     }
 
     #[test]
@@ -161,8 +161,12 @@ mod state_machine_tests {
             ClusterPhase::Initializing,
             ClusterPhase::AssigningSlots,
             ClusterPhase::Running,
-            ClusterPhase::Updating,
-            ClusterPhase::Resharding,
+            ClusterPhase::DetectingChanges,
+            ClusterPhase::ScalingStatefulSet,
+            ClusterPhase::AddingNodes,
+            ClusterPhase::MigratingSlots,
+            ClusterPhase::RemovingNodes,
+            ClusterPhase::VerifyingCluster,
             ClusterPhase::Degraded,
             ClusterPhase::Failed,
         ];
