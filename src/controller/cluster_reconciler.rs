@@ -34,6 +34,19 @@ pub const FIELD_MANAGER: &str = "valkey-operator";
 /// Finalizer name for graceful deletion
 pub const FINALIZER: &str = "valkey-operator.smoketurner.com/finalizer";
 
+/// Annotation key indicating an upgrade is in progress.
+const UPGRADE_IN_PROGRESS_ANNOTATION: &str = "valkey-operator.smoketurner.com/upgrade-in-progress";
+
+/// Check if an upgrade is in progress for this cluster.
+fn is_upgrade_in_progress(cluster: &ValkeyCluster) -> bool {
+    cluster
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(UPGRADE_IN_PROGRESS_ANNOTATION))
+        .is_some_and(|v| v == "true")
+}
+
 /// Get the requeue duration for a given phase.
 ///
 /// These are fallback intervals - the controller primarily reacts to watch events
@@ -144,9 +157,23 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                 current_phase, reconcile_count, MAX_RECONCILE_COUNT
             );
             error!(name = %name, phase = %current_phase, reconcile_count = reconcile_count, "Stuck detection triggered");
-            ctx.publish_warning_event(&obj, "StuckDetected", "Reconciling", Some(error_msg.clone()))
-                .await;
-            update_status(&api, &name, ClusterPhase::Failed, 0, Some(&error_msg), None, current_gen).await?;
+            ctx.publish_warning_event(
+                &obj,
+                "StuckDetected",
+                "Reconciling",
+                Some(error_msg.clone()),
+            )
+            .await;
+            update_status(
+                &api,
+                &name,
+                ClusterPhase::Failed,
+                0,
+                Some(&error_msg),
+                None,
+                current_gen,
+            )
+            .await?;
             return Ok(Action::requeue(requeue_duration(ClusterPhase::Failed)));
         }
 
@@ -161,9 +188,23 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     current_phase, elapsed, MAX_STUCK_DURATION_SECS
                 );
                 error!(name = %name, phase = %current_phase, elapsed_secs = elapsed, "Stuck detection triggered");
-                ctx.publish_warning_event(&obj, "StuckDetected", "Reconciling", Some(error_msg.clone()))
-                    .await;
-                update_status(&api, &name, ClusterPhase::Failed, 0, Some(&error_msg), None, current_gen).await?;
+                ctx.publish_warning_event(
+                    &obj,
+                    "StuckDetected",
+                    "Reconciling",
+                    Some(error_msg.clone()),
+                )
+                .await;
+                update_status(
+                    &api,
+                    &name,
+                    ClusterPhase::Failed,
+                    0,
+                    Some(&error_msg),
+                    None,
+                    current_gen,
+                )
+                .await?;
                 return Ok(Action::requeue(requeue_duration(ClusterPhase::Failed)));
             }
         }
@@ -237,6 +278,16 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
         ClusterPhase::Running => {
             // Check if update needed
             if spec_changed {
+                // Log if spec changed while upgrade is in progress
+                // Note: Spec changes during upgrade are expected when upgrade reconciler
+                // updates the image tag. This is informational logging only.
+                if is_upgrade_in_progress(&obj) {
+                    info!(
+                        name = %name,
+                        "Spec changed while upgrade is in progress - processing changes initiated by upgrade reconciler"
+                    );
+                }
+
                 ctx.publish_normal_event(
                     &obj,
                     "SpecChanged",
@@ -510,8 +561,12 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             // 1. All pods Running but not Ready (indicates cluster health issue, not pod issue)
             // 2. Under max attempts (5)
             // 3. Backoff elapsed (30s * 2^attempts)
-            let running_pods = check_running_pods(&obj, &ctx, &namespace).await.unwrap_or(0);
-            let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await.unwrap_or(0);
+            let running_pods = check_running_pods(&obj, &ctx, &namespace)
+                .await
+                .unwrap_or(0);
+            let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace)
+                .await
+                .unwrap_or(0);
             let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
 
             // Get recovery state from status
@@ -536,8 +591,8 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
 
             // Check backoff elapsed
             let backoff_elapsed = if let Some(last_attempt) = last_recovery {
-                if let Ok(ts) = std::str::FromStr::from_str(last_attempt)
-                    .map(|t: jiff::Timestamp| t)
+                if let Ok(ts) =
+                    std::str::FromStr::from_str(last_attempt).map(|t: jiff::Timestamp| t)
                 {
                     let backoff_secs = BASE_BACKOFF_SECS * (1i64 << recovery_attempts.min(10));
                     let elapsed = jiff::Timestamp::now().duration_since(ts).as_secs();
@@ -981,6 +1036,56 @@ async fn check_running_pods(
     Ok(running_count as i32)
 }
 
+/// Check if the cluster image differs from the current StatefulSet image.
+///
+/// Returns `true` if the desired image differs from what's currently in the StatefulSet,
+/// indicating that a rolling update is needed.
+async fn check_image_changed(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<bool, Error> {
+    let name = obj.name_any();
+    let sts_api: Api<k8s_openapi::api::apps::v1::StatefulSet> =
+        Api::namespaced(ctx.client.clone(), namespace);
+
+    // Get current StatefulSet
+    let sts = match sts_api.get(&name).await {
+        Ok(sts) => sts,
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            // StatefulSet doesn't exist yet, not an image change scenario
+            return Ok(false);
+        }
+        Err(e) => return Err(Error::Kube(e)),
+    };
+
+    // Extract current image from StatefulSet (first container is valkey)
+    let current_image = sts
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|s| s.containers.first())
+        .and_then(|c| c.image.as_ref())
+        .cloned()
+        .unwrap_or_default();
+
+    // Build desired image from cluster spec
+    let desired_image = format!("{}:{}", obj.spec.image.repository, obj.spec.image.tag);
+
+    let changed = current_image != desired_image;
+
+    if changed {
+        debug!(
+            name = %name,
+            current_image = %current_image,
+            desired_image = %desired_image,
+            "Image change detected"
+        );
+    }
+
+    Ok(changed)
+}
+
 /// Execute cluster initialization (CLUSTER MEET)
 async fn execute_cluster_init(
     obj: &ValkeyCluster,
@@ -1286,11 +1391,15 @@ async fn update_status(
     // Preserve new status fields if present
     let pending_changes = existing_status.and_then(|s| s.pending_changes.clone());
     let operation_progress = existing_status.and_then(|s| s.operation_progress.clone());
-    let message = existing_status.map(|s| s.message.clone()).unwrap_or_default();
+    let message = existing_status
+        .map(|s| s.message.clone())
+        .unwrap_or_default();
     let last_phase_transition = existing_status.and_then(|s| s.last_phase_transition.clone());
 
     // Track reconcile count for stuck detection
-    let prev_phase = existing_status.map(|s| s.phase).unwrap_or(ClusterPhase::Pending);
+    let prev_phase = existing_status
+        .map(|s| s.phase)
+        .unwrap_or(ClusterPhase::Pending);
     let reconcile_count = if phase == prev_phase {
         existing_status.map(|s| s.reconcile_count).unwrap_or(0) + 1
     } else {
@@ -1318,6 +1427,36 @@ async fn update_status(
         )
     };
 
+    // Set last_error and summary based on phase and health
+    let (last_error, summary) = if phase == ClusterPhase::Running {
+        // Healthy - clear error and set healthy summary
+        let slots = health_status.map(|h| h.slots_assigned).unwrap_or(16384);
+        let healthy_replicas = health_status.map(|h| h.healthy_replicas).unwrap_or(0);
+        (
+            None,
+            Some(format!(
+                "Healthy: {} masters, {} replicas, {}/16384 slots",
+                ready_masters, healthy_replicas, slots
+            )),
+        )
+    } else if phase == ClusterPhase::Failed {
+        // Failed - preserve or set error message
+        let err = error_message
+            .map(|e| e.to_string())
+            .or_else(|| existing_status.and_then(|s| s.last_error.clone()));
+        (
+            err,
+            Some(format!(
+                "Failed: {}",
+                error_message.unwrap_or("unknown error")
+            )),
+        )
+    } else {
+        // In progress - preserve existing error if any
+        let err = existing_status.and_then(|s| s.last_error.clone());
+        (err, Some(format!("Phase: {}", phase)))
+    };
+
     let status = ValkeyClusterStatus {
         phase,
         ready_nodes: format!("{}/{}", ready_replicas, desired_replicas),
@@ -1340,6 +1479,8 @@ async fn update_status(
         last_phase_transition,
         recovery_attempts,
         last_recovery_attempt,
+        last_error,
+        summary,
     };
 
     let patch = serde_json::json!({
@@ -1690,9 +1831,12 @@ async fn wait_for_slot_migration(
         }
 
         // Connect to check cluster state
-        let client = ctx.connect_to_cluster(obj, namespace, 0).await.map_err(|e| {
-            ValkeyError::Connection(format!("Failed to connect for migration check: {}", e))
-        })?;
+        let client = ctx
+            .connect_to_cluster(obj, namespace, 0)
+            .await
+            .map_err(|e| {
+                ValkeyError::Connection(format!("Failed to connect for migration check: {}", e))
+            })?;
 
         let nodes_result = client.cluster_nodes().await;
         let _ = client.close().await;
@@ -1942,6 +2086,10 @@ async fn add_new_replicas_to_cluster(
 ///
 /// Computes what changes are needed (scale direction, nodes to add/remove)
 /// and stores them in `pending_changes` status field.
+///
+/// Annotation key storing the name of the active upgrade.
+const UPGRADE_NAME_ANNOTATION: &str = "valkey-operator.smoketurner.com/upgrade-name";
+
 async fn handle_detecting_changes(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -1970,6 +2118,9 @@ async fn handle_detecting_changes(
         "none"
     };
 
+    // Check if image changed by comparing with current StatefulSet
+    let image_changed = check_image_changed(obj, ctx, namespace).await?;
+
     info!(
         name = %name,
         current_masters = current_masters,
@@ -1977,8 +2128,55 @@ async fn handle_detecting_changes(
         running_pods = running_pods,
         target_replicas = target_replicas,
         scale_direction = scale_direction,
+        image_changed = image_changed,
         "Change detection complete"
     );
+
+    // Defense in depth: Block non-image changes during an active upgrade
+    // The webhook should have blocked this, but we check here as well
+    if is_upgrade_in_progress(obj) && scale_direction != "none" {
+        let upgrade_name = obj
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(UPGRADE_NAME_ANNOTATION))
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let error_msg = format!(
+            "Cannot {} cluster while upgrade '{}' is in progress. \
+             Wait for the upgrade to complete or roll it back first. \
+             Check status: kubectl get valkeyupgrade {} -n {}",
+            scale_direction, upgrade_name, upgrade_name, namespace
+        );
+
+        warn!(name = %name, upgrade = %upgrade_name, "Blocking scale operation during upgrade");
+
+        // Update status with error
+        let mut status = obj.status.clone().unwrap_or_default();
+        status.last_error = Some(error_msg.clone());
+        status.message = format!("Blocked: {}", error_msg);
+
+        let patch = serde_json::json!({ "status": status });
+        let _ = api
+            .patch_status(
+                &name,
+                &kube::api::PatchParams::apply(FIELD_MANAGER),
+                &kube::api::Patch::Merge(&patch),
+            )
+            .await;
+
+        ctx.publish_warning_event(
+            obj,
+            "UpgradeInProgress",
+            "DetectingChanges",
+            Some(error_msg),
+        )
+        .await;
+
+        // Return to Running phase - the spec change is effectively ignored
+        return Ok(ClusterPhase::Running);
+    }
 
     // Compute nodes to add/remove
     let (nodes_to_add, nodes_to_remove) = if scale_direction == "up" {
@@ -2003,14 +2201,20 @@ async fn handle_detecting_changes(
         nodes_to_add: nodes_to_add.clone(),
         nodes_to_remove: nodes_to_remove.clone(),
         slot_migrations: Vec::new(), // Will be populated during MigratingSlots
-        requires_rolling_update: false,
+        requires_rolling_update: image_changed,
         for_generation: obj.metadata.generation.unwrap_or(0),
     };
 
     // Update status with pending changes
     let mut status = obj.status.clone().unwrap_or_default();
     status.pending_changes = Some(pending_changes);
-    status.message = format!("Detected {} operation", scale_direction);
+    status.message = if image_changed && scale_direction == "none" {
+        "Detected image change".to_string()
+    } else if image_changed {
+        format!("Detected {} operation with image change", scale_direction)
+    } else {
+        format!("Detected {} operation", scale_direction)
+    };
 
     // Update status via patch
     let patch = serde_json::json!({
@@ -2026,7 +2230,8 @@ async fn handle_detecting_changes(
     // Check if operation is allowed
     if scale_direction != "none"
         && let Err(e) =
-            operation_coordination::check_operation_allowed(api, &name, OperationType::Scaling).await
+            operation_coordination::check_operation_allowed(api, &name, OperationType::Scaling)
+                .await
     {
         warn!(name = %name, error = %e, "Cannot start scaling operation due to conflict");
         ctx.publish_warning_event(
@@ -2051,7 +2256,7 @@ async fn handle_detecting_changes(
     )
     .await;
 
-    // Determine next phase based on scale direction
+    // Determine next phase based on scale direction and image changes
     match scale_direction {
         "down" => {
             // Scale-down: must migrate slots BEFORE removing pods
@@ -2059,6 +2264,21 @@ async fn handle_detecting_changes(
         }
         "up" | "replica_change" => {
             // Scale-up or replica change: update StatefulSet first
+            Ok(ClusterPhase::ScalingStatefulSet)
+        }
+        _ if image_changed => {
+            // Image changed but no scaling needed - still need to update StatefulSet
+            info!(
+                name = %name,
+                "Image change detected, transitioning to ScalingStatefulSet to apply update"
+            );
+            ctx.publish_normal_event(
+                obj,
+                "ImageChangeDetected",
+                "DetectingChanges",
+                Some("Image change detected, updating StatefulSet".to_string()),
+            )
+            .await;
             Ok(ClusterPhase::ScalingStatefulSet)
         }
         _ => {
@@ -2084,18 +2304,36 @@ async fn handle_scaling_statefulset(
     create_owned_resources(obj, ctx, namespace).await?;
 
     // Get pending changes to determine what we're doing
-    let pending_changes = obj
-        .status
-        .as_ref()
-        .and_then(|s| s.pending_changes.as_ref());
+    let pending_changes = obj.status.as_ref().and_then(|s| s.pending_changes.as_ref());
 
     let scale_direction = pending_changes
         .map(|p| p.scale_direction.as_str())
         .unwrap_or("none");
+    let requires_rolling_update = pending_changes
+        .map(|p| p.requires_rolling_update)
+        .unwrap_or(false);
 
     // Check running pods
     let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
     let running_pods = check_running_pods(obj, ctx, namespace).await?;
+
+    // Handle image-only change (no scaling, just rolling update)
+    if scale_direction == "none" && requires_rolling_update {
+        info!(
+            name = %name,
+            "Image change applied to StatefulSet, transitioning to VerifyingCluster"
+        );
+        ctx.publish_normal_event(
+            obj,
+            "StatefulSetUpdated",
+            "ScalingStatefulSet",
+            Some("StatefulSet template updated with new image".to_string()),
+        )
+        .await;
+        // Go to VerifyingCluster to check cluster health
+        // Kubernetes will handle the rolling update automatically
+        return Ok(ClusterPhase::VerifyingCluster);
+    }
 
     if scale_direction == "down" {
         // For scale-down, we're reducing replicas AFTER slot migration
@@ -2169,10 +2407,7 @@ async fn handle_adding_nodes(
     info!(name = %name, "Adding new nodes to cluster");
 
     // Get pending changes to see what nodes to add
-    let pending_changes = obj
-        .status
-        .as_ref()
-        .and_then(|s| s.pending_changes.as_ref());
+    let pending_changes = obj.status.as_ref().and_then(|s| s.pending_changes.as_ref());
 
     let nodes_to_add = pending_changes
         .map(|p| p.nodes_to_add.clone())
@@ -2305,10 +2540,7 @@ async fn handle_migrating_slots(
                 .await;
 
                 // Determine next phase based on operation type
-                let pending_changes = obj
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.pending_changes.as_ref());
+                let pending_changes = obj.status.as_ref().and_then(|s| s.pending_changes.as_ref());
 
                 let scale_direction = pending_changes
                     .map(|p| p.scale_direction.as_str())
@@ -2362,10 +2594,7 @@ async fn handle_removing_nodes(
     info!(name = %name, "Removing nodes from cluster");
 
     // Get pending changes to see what nodes to remove
-    let pending_changes = obj
-        .status
-        .as_ref()
-        .and_then(|s| s.pending_changes.as_ref());
+    let pending_changes = obj.status.as_ref().and_then(|s| s.pending_changes.as_ref());
 
     let nodes_to_remove = pending_changes
         .map(|p| p.nodes_to_remove.clone())
@@ -2390,7 +2619,10 @@ async fn handle_removing_nodes(
         obj,
         "NodesRemoved",
         "RemovingNodes",
-        Some(format!("Removed {} nodes from cluster", nodes_to_remove.len())),
+        Some(format!(
+            "Removed {} nodes from cluster",
+            nodes_to_remove.len()
+        )),
     )
     .await;
 
@@ -2422,10 +2654,14 @@ async fn detect_and_cleanup_orphans(
         .await
         .map_err(|e| Error::Valkey(e.to_string()))?;
 
-    let client =
-        crate::client::ValkeyClient::connect_single(&host, port, password.as_deref(), tls_certs.as_ref())
-            .await
-            .map_err(|e| Error::Valkey(e.to_string()))?;
+    let client = crate::client::ValkeyClient::connect_single(
+        &host,
+        port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
+    .map_err(|e| Error::Valkey(e.to_string()))?;
 
     let orphans = cluster_init::detect_orphaned_nodes(&client, expected_masters)
         .await
@@ -2458,6 +2694,299 @@ async fn detect_and_cleanup_orphans(
     .map_err(|e| Error::Valkey(e.to_string()))?;
 
     Ok(forgotten)
+}
+
+/// Rebalance replicas across masters to ensure even distribution.
+///
+/// After scaling operations, replicas may become unevenly distributed. This function
+/// detects masters with too many replicas and moves excess replicas to masters with
+/// too few replicas.
+///
+/// Returns the number of replicas moved.
+async fn rebalance_replicas(
+    cluster: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<i32, Error> {
+    let expected_masters = cluster.spec.masters;
+    let expected_replicas_per_master = cluster.spec.replicas_per_master;
+
+    if expected_replicas_per_master == 0 {
+        return Ok(0);
+    }
+
+    // Get connection context
+    let (password, tls_certs, strategy) = ctx.connection_context(cluster, namespace).await?;
+
+    // Connect to get cluster state
+    let (host, port) = strategy
+        .get_connection(0)
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let client = crate::client::ValkeyClient::connect_single(
+        &host,
+        port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
+    .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let cluster_nodes = client
+        .cluster_nodes()
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let _ = client.close().await;
+
+    // Build map of master node_id -> (ordinal, replica_count, replica_node_ids)
+    let masters = cluster_nodes.masters();
+    let mut master_info: Vec<(String, i32, i32, Vec<String>)> = Vec::new();
+
+    for master in &masters {
+        let ordinal = crate::slots::planner::extract_ordinal_from_address(&master.address)
+            .map(|o| o as i32)
+            .unwrap_or(-1);
+
+        // Only consider masters within expected range
+        if ordinal < 0 || ordinal >= expected_masters {
+            continue;
+        }
+
+        let replicas = cluster_nodes.replicas_of(&master.node_id);
+        let replica_ids: Vec<String> = replicas.iter().map(|r| r.node_id.clone()).collect();
+
+        master_info.push((
+            master.node_id.clone(),
+            ordinal,
+            replicas.len() as i32,
+            replica_ids,
+        ));
+    }
+
+    // Sort by ordinal to ensure consistent ordering
+    master_info.sort_by_key(|(_, ordinal, _, _)| *ordinal);
+
+    // Find masters with too many and too few replicas
+    let mut masters_with_excess: Vec<(String, i32, Vec<String>)> = Vec::new();
+    let mut masters_needing_replicas: Vec<(String, i32)> = Vec::new();
+
+    for (node_id, ordinal, replica_count, replica_ids) in master_info {
+        if replica_count > expected_replicas_per_master {
+            // Calculate excess replicas
+            let excess = replica_count - expected_replicas_per_master;
+            // Take the last `excess` replicas to move
+            let excess_replica_ids: Vec<String> = replica_ids
+                .into_iter()
+                .rev()
+                .take(excess as usize)
+                .collect();
+            masters_with_excess.push((node_id, ordinal, excess_replica_ids));
+        } else if replica_count < expected_replicas_per_master {
+            for _ in 0..(expected_replicas_per_master - replica_count) {
+                masters_needing_replicas.push((node_id.clone(), ordinal));
+            }
+        }
+    }
+
+    if masters_with_excess.is_empty() || masters_needing_replicas.is_empty() {
+        // No rebalancing needed
+        return Ok(0);
+    }
+
+    info!(
+        masters_with_excess = masters_with_excess.len(),
+        masters_needing_replicas = masters_needing_replicas.len(),
+        "Rebalancing replicas across masters"
+    );
+
+    let mut replicas_moved = 0;
+
+    // For each master needing replicas, take one from a master with excess
+    for (target_master_id, target_ordinal) in masters_needing_replicas {
+        // Find a master with excess replicas
+        let Some((source_idx, (_, source_ordinal, excess_replicas))) = masters_with_excess
+            .iter_mut()
+            .enumerate()
+            .find(|(_, (_, _, replicas))| !replicas.is_empty())
+        else {
+            // No more excess replicas available
+            break;
+        };
+
+        let Some(replica_to_move) = excess_replicas.pop() else {
+            continue;
+        };
+
+        info!(
+            replica_id = %replica_to_move,
+            from_master_ordinal = source_ordinal,
+            to_master_ordinal = target_ordinal,
+            "Moving replica to rebalance cluster"
+        );
+
+        // Find the replica's ordinal to connect to it
+        let replica_ordinal = cluster_nodes
+            .nodes
+            .iter()
+            .find(|n| n.node_id == replica_to_move)
+            .and_then(|n| crate::slots::planner::extract_ordinal_from_address(&n.address))
+            .map(|o| o as i32);
+
+        let Some(replica_ordinal) = replica_ordinal else {
+            warn!(
+                replica_id = %replica_to_move,
+                "Could not find ordinal for replica, skipping"
+            );
+            continue;
+        };
+
+        // Connect to the replica and execute CLUSTER REPLICATE
+        let (replica_host, replica_port) = strategy
+            .get_connection(replica_ordinal)
+            .await
+            .map_err(|e| Error::Valkey(e.to_string()))?;
+
+        let replica_client = crate::client::ValkeyClient::connect_single(
+            &replica_host,
+            replica_port,
+            password.as_deref(),
+            tls_certs.as_ref(),
+        )
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+        match replica_client.cluster_replicate(&target_master_id).await {
+            Ok(()) => {
+                info!(
+                    replica_ordinal = replica_ordinal,
+                    target_master_ordinal = target_ordinal,
+                    "Replica reassigned to new master"
+                );
+                replicas_moved += 1;
+            }
+            Err(e) => {
+                warn!(
+                    replica_ordinal = replica_ordinal,
+                    target_master_ordinal = target_ordinal,
+                    error = %e,
+                    "Failed to reassign replica"
+                );
+            }
+        }
+
+        let _ = replica_client.close().await;
+
+        // Clean up empty entries
+        if excess_replicas.is_empty() {
+            masters_with_excess.remove(source_idx);
+        }
+    }
+
+    if replicas_moved > 0 {
+        info!(
+            replicas_moved = replicas_moved,
+            "Replica rebalancing complete"
+        );
+    }
+
+    Ok(replicas_moved)
+}
+
+/// Set up replicas for new masters if they don't have the expected number of replicas.
+///
+/// This function detects masters that have fewer replicas than expected and configures
+/// the missing replicas. This handles the scale-up case where CLUSTER MEET succeeded
+/// for new masters but their replicas weren't configured.
+async fn setup_replicas_for_new_masters_if_needed(
+    cluster: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<i32, Error> {
+    let expected_masters = cluster.spec.masters;
+    let expected_replicas_per_master = cluster.spec.replicas_per_master;
+
+    if expected_replicas_per_master == 0 {
+        return Ok(0);
+    }
+
+    // Get connection context
+    let (password, tls_certs, strategy) = ctx.connection_context(cluster, namespace).await?;
+
+    // Connect to get cluster state
+    let (host, port) = strategy
+        .get_connection(0)
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let client = crate::client::ValkeyClient::connect_single(
+        &host,
+        port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
+    .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let cluster_nodes = client
+        .cluster_nodes()
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let _ = client.close().await;
+
+    // Find masters and count their replicas
+    let masters = cluster_nodes.masters();
+    let mut new_master_ordinals: Vec<i32> = Vec::new();
+
+    for master in &masters {
+        // Extract ordinal from master address
+        let ordinal = match crate::slots::planner::extract_ordinal_from_address(&master.address) {
+            Some(o) => o as i32,
+            None => continue,
+        };
+
+        // Only check masters within the expected range
+        if ordinal >= expected_masters {
+            continue;
+        }
+
+        // Count replicas for this master
+        let replica_count = cluster_nodes.replicas_of(&master.node_id).len() as i32;
+
+        if replica_count < expected_replicas_per_master {
+            debug!(
+                master_ordinal = ordinal,
+                current_replicas = replica_count,
+                expected_replicas = expected_replicas_per_master,
+                "Master has fewer replicas than expected"
+            );
+            new_master_ordinals.push(ordinal);
+        }
+    }
+
+    if new_master_ordinals.is_empty() {
+        return Ok(0);
+    }
+
+    info!(
+        masters_needing_replicas = ?new_master_ordinals,
+        "Setting up replicas for masters with missing replicas"
+    );
+
+    // Set up replicas for the masters that need them
+    let configured = cluster_init::setup_replicas_for_new_masters(
+        cluster,
+        password.as_deref(),
+        tls_certs.as_ref(),
+        &strategy,
+        &new_master_ordinals,
+    )
+    .await
+    .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    Ok(configured)
 }
 
 /// Handle VerifyingCluster phase.
@@ -2505,7 +3034,66 @@ async fn handle_verifying_cluster(
         }
     }
 
-    // Step 2: Check cluster health
+    // Step 2: Ensure replicas are configured for any new masters (scale-up scenario)
+    // This handles the case where CLUSTER MEET succeeded but replicas weren't set up
+    if obj.spec.replicas_per_master > 0 {
+        match setup_replicas_for_new_masters_if_needed(obj, ctx, namespace).await {
+            Ok(configured) if configured > 0 => {
+                info!(
+                    name = %name,
+                    replicas_configured = configured,
+                    "Configured replicas for new masters"
+                );
+                ctx.publish_normal_event(
+                    obj,
+                    "ReplicasConfigured",
+                    "VerifyingCluster",
+                    Some(format!(
+                        "Configured {} replicas for new masters",
+                        configured
+                    )),
+                )
+                .await;
+            }
+            Ok(_) => {
+                // No new replicas needed
+            }
+            Err(e) => {
+                warn!(name = %name, error = %e, "Failed to configure replicas for new masters, continuing");
+            }
+        }
+    }
+
+    // Step 3: Rebalance replicas if needed (after scale cycles)
+    // This handles the case where replicas are unevenly distributed
+    if obj.spec.replicas_per_master > 0 {
+        match rebalance_replicas(obj, ctx, namespace).await {
+            Ok(moved) if moved > 0 => {
+                info!(
+                    name = %name,
+                    replicas_moved = moved,
+                    "Rebalanced replicas across masters"
+                );
+                ctx.publish_normal_event(
+                    obj,
+                    "ReplicasRebalanced",
+                    "VerifyingCluster",
+                    Some(format!("Rebalanced {} replicas across masters", moved)),
+                )
+                .await;
+                // Give cluster time to stabilize before health check
+                return Ok(ClusterPhase::VerifyingCluster);
+            }
+            Ok(_) => {
+                // No rebalancing needed
+            }
+            Err(e) => {
+                warn!(name = %name, error = %e, "Failed to rebalance replicas, continuing");
+            }
+        }
+    }
+
+    // Step 4: Check cluster health
     match check_cluster_health(obj, ctx, namespace).await {
         Ok(health) if health.is_healthy => {
             info!(
@@ -2832,12 +3420,18 @@ mod tests {
 
     #[test]
     fn test_requeue_duration_detecting_changes_phase() {
-        assert_eq!(requeue_duration(ClusterPhase::DetectingChanges).as_secs(), 2);
+        assert_eq!(
+            requeue_duration(ClusterPhase::DetectingChanges).as_secs(),
+            2
+        );
     }
 
     #[test]
     fn test_requeue_duration_scaling_statefulset_phase() {
-        assert_eq!(requeue_duration(ClusterPhase::ScalingStatefulSet).as_secs(), 2);
+        assert_eq!(
+            requeue_duration(ClusterPhase::ScalingStatefulSet).as_secs(),
+            2
+        );
     }
 
     #[test]
@@ -2852,7 +3446,10 @@ mod tests {
 
     #[test]
     fn test_requeue_duration_verifying_cluster_phase() {
-        assert_eq!(requeue_duration(ClusterPhase::VerifyingCluster).as_secs(), 2);
+        assert_eq!(
+            requeue_duration(ClusterPhase::VerifyingCluster).as_secs(),
+            2
+        );
     }
 
     #[test]
@@ -2920,5 +3517,83 @@ mod tests {
     fn test_finalizer_constant() {
         assert_eq!(FINALIZER, "valkey-operator.smoketurner.com/finalizer");
         assert!(FINALIZER.contains("valkey-operator"));
+    }
+
+    // ==========================================================================
+    // Upgrade protection tests
+    // ==========================================================================
+
+    /// Helper to create a cluster with upgrade annotation
+    fn create_cluster_with_upgrade(name: &str, upgrade_name: &str) -> ValkeyCluster {
+        let mut cluster = create_test_cluster(name, 3, 1);
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            UPGRADE_IN_PROGRESS_ANNOTATION.to_string(),
+            "true".to_string(),
+        );
+        annotations.insert(
+            UPGRADE_NAME_ANNOTATION.to_string(),
+            upgrade_name.to_string(),
+        );
+        cluster.metadata.annotations = Some(annotations);
+        cluster
+    }
+
+    #[test]
+    fn test_is_upgrade_in_progress_no_annotations() {
+        let cluster = create_test_cluster("test", 3, 1);
+        assert!(!is_upgrade_in_progress(&cluster));
+    }
+
+    #[test]
+    fn test_is_upgrade_in_progress_empty_annotations() {
+        let mut cluster = create_test_cluster("test", 3, 1);
+        cluster.metadata.annotations = Some(BTreeMap::new());
+        assert!(!is_upgrade_in_progress(&cluster));
+    }
+
+    #[test]
+    fn test_is_upgrade_in_progress_annotation_false() {
+        let mut cluster = create_test_cluster("test", 3, 1);
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            UPGRADE_IN_PROGRESS_ANNOTATION.to_string(),
+            "false".to_string(),
+        );
+        cluster.metadata.annotations = Some(annotations);
+        assert!(!is_upgrade_in_progress(&cluster));
+    }
+
+    #[test]
+    fn test_is_upgrade_in_progress_annotation_true() {
+        let cluster = create_cluster_with_upgrade("test", "my-upgrade");
+        assert!(is_upgrade_in_progress(&cluster));
+    }
+
+    #[test]
+    fn test_upgrade_annotation_constants() {
+        assert_eq!(
+            UPGRADE_IN_PROGRESS_ANNOTATION,
+            "valkey-operator.smoketurner.com/upgrade-in-progress"
+        );
+        assert_eq!(
+            UPGRADE_NAME_ANNOTATION,
+            "valkey-operator.smoketurner.com/upgrade-name"
+        );
+    }
+
+    #[test]
+    fn test_is_upgrade_in_progress_preserves_upgrade_name() {
+        let cluster = create_cluster_with_upgrade("test", "production-upgrade-v2");
+        assert!(is_upgrade_in_progress(&cluster));
+
+        // Verify the upgrade name is accessible
+        let upgrade_name = cluster
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(UPGRADE_NAME_ANNOTATION))
+            .cloned();
+        assert_eq!(upgrade_name, Some("production-upgrade-v2".to_string()));
     }
 }

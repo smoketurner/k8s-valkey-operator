@@ -183,8 +183,13 @@ pub async fn detect_stale_ips(
     // Try to connect to the first available pod
     let (connect_host, connect_port) = strategy.get_connection(0).await?;
 
-    let client = match ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs)
-        .await
+    let client = match ValkeyClient::connect_single(
+        &connect_host,
+        connect_port,
+        password,
+        tls_certs,
+    )
+    .await
     {
         Ok(c) => c,
         Err(e) => {
@@ -216,11 +221,7 @@ pub async fn detect_stale_ips(
     let _ = client.close().await;
 
     // Extract IPs from cluster nodes
-    let stored_ips: Vec<String> = cluster_nodes
-        .nodes
-        .iter()
-        .map(|n| n.ip.clone())
-        .collect();
+    let stored_ips: Vec<String> = cluster_nodes.nodes.iter().map(|n| n.ip.clone()).collect();
 
     // Count how many stored IPs are not in the current set
     let stale_count = stored_ips
@@ -304,18 +305,21 @@ pub async fn recover_stale_ips(
             }
         };
 
-        let client = match ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    ordinal = ordinal,
-                    error = %e,
-                    "Failed to connect to pod for recovery, skipping"
-                );
-                failed_meets += 1;
-                continue;
-            }
-        };
+        let client =
+            match ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        ordinal = ordinal,
+                        error = %e,
+                        "Failed to connect to pod for recovery, skipping"
+                    );
+                    failed_meets += 1;
+                    continue;
+                }
+            };
 
         // Execute CLUSTER MEET to all other pods from this one
         for (target_pod_name, target_ip, target_port) in &pod_ips {
@@ -995,7 +999,11 @@ pub async fn detect_orphaned_nodes(
     expected_masters: i32,
 ) -> Result<Vec<crate::client::ClusterNode>, ValkeyError> {
     let cluster_nodes = client.cluster_nodes().await?;
-    let masters: Vec<_> = cluster_nodes.nodes.iter().filter(|n| n.flags.master).collect();
+    let masters: Vec<_> = cluster_nodes
+        .nodes
+        .iter()
+        .filter(|n| n.flags.master)
+        .collect();
 
     // If we have more masters than expected, find the ones with no slots
     if masters.len() as i32 > expected_masters {
@@ -1125,6 +1133,161 @@ pub async fn forget_nodes_with_retry(
     }
 
     Ok(forgotten)
+}
+
+/// Set up replicas for new masters that were added during scale-up.
+///
+/// This function finds masters that don't have the expected number of replicas
+/// and sets up the missing replicas via CLUSTER REPLICATE.
+///
+/// # Arguments
+/// * `cluster` - The ValkeyCluster resource
+/// * `password` - Optional password for authentication
+/// * `tls_certs` - Optional TLS certificates
+/// * `strategy` - Connection strategy for reaching pods
+/// * `new_master_ordinals` - Ordinals of the new master pods that need replicas
+#[instrument(skip(cluster, password, tls_certs, strategy))]
+pub async fn setup_replicas_for_new_masters(
+    cluster: &ValkeyCluster,
+    password: Option<&str>,
+    tls_certs: Option<&TlsCertData>,
+    strategy: &ConnectionStrategy,
+    new_master_ordinals: &[i32],
+) -> Result<i32, ValkeyError> {
+    if cluster.spec.replicas_per_master == 0 {
+        info!("No replicas configured, skipping replica setup for new masters");
+        return Ok(0);
+    }
+
+    if new_master_ordinals.is_empty() {
+        debug!("No new masters specified, skipping replica setup");
+        return Ok(0);
+    }
+
+    let masters = cluster.spec.masters;
+    let replicas_per_master = cluster.spec.replicas_per_master;
+    let cluster_name = cluster.name_any();
+
+    info!(
+        new_masters = ?new_master_ordinals,
+        replicas_per_master = replicas_per_master,
+        "Setting up replicas for new masters"
+    );
+
+    // Get connection to the cluster to fetch topology
+    let (connect_host, connect_port) = strategy.get_connection(0).await?;
+    let client =
+        ValkeyClient::connect_single(&connect_host, connect_port, password, tls_certs).await?;
+
+    // Get cluster nodes to find master node IDs
+    let cluster_nodes = client.cluster_nodes().await?;
+    client.close().await?;
+
+    // Build a map of ordinal -> node_id for masters
+    let mut ordinal_to_master_id: std::collections::HashMap<i32, String> =
+        std::collections::HashMap::new();
+
+    for node in &cluster_nodes.nodes {
+        if node.is_master()
+            || (!node.is_replica() && node.master_id.as_ref().is_none_or(|id| id == "-"))
+        {
+            // Extract ordinal from address
+            if let Some(ordinal) = extract_ordinal_from_address(&node.address) {
+                ordinal_to_master_id.insert(ordinal as i32, node.node_id.clone());
+            }
+        }
+    }
+
+    let mut replicas_configured = 0;
+
+    // For each new master, set up its replicas
+    for &master_ordinal in new_master_ordinals {
+        let Some(master_node_id) = ordinal_to_master_id.get(&master_ordinal) else {
+            warn!(
+                master_ordinal = master_ordinal,
+                "Could not find node ID for new master, skipping"
+            );
+            continue;
+        };
+
+        info!(
+            master_ordinal = master_ordinal,
+            master_node_id = %master_node_id,
+            "Setting up replicas for new master"
+        );
+
+        // Calculate replica ordinals for this master
+        // Replica layout: replicas for master i are at ordinals masters + i*replicas_per_master + [0..replicas_per_master)
+        for replica_index in 0..replicas_per_master {
+            let replica_ordinal = masters + (master_ordinal * replicas_per_master) + replica_index;
+
+            debug!(
+                master_ordinal = master_ordinal,
+                replica_ordinal = replica_ordinal,
+                replica_index = replica_index,
+                "Configuring replica"
+            );
+
+            // Get connection to the replica pod
+            let (replica_host, replica_port) = strategy.get_connection(replica_ordinal).await?;
+            let replica_client =
+                ValkeyClient::connect_single(&replica_host, replica_port, password, tls_certs)
+                    .await?;
+
+            // Check if replica is already replicating this master (idempotent operation)
+            let replica_nodes = replica_client.cluster_nodes().await?;
+            let replica_node = replica_nodes.nodes.iter().find(|n| {
+                let expected_pod = pod_name(&cluster_name, replica_ordinal);
+                n.address.contains(&expected_pod)
+            });
+
+            let already_replicating = replica_node
+                .and_then(|n| n.master_id.as_ref())
+                .is_some_and(|mid| mid == master_node_id);
+
+            if already_replicating {
+                debug!(
+                    master_ordinal = master_ordinal,
+                    replica_ordinal = replica_ordinal,
+                    "Replica already replicating master, skipping"
+                );
+                replica_client.close().await?;
+                continue;
+            }
+
+            // Execute CLUSTER REPLICATE
+            match replica_client.cluster_replicate(master_node_id).await {
+                Ok(()) => {
+                    info!(
+                        master_ordinal = master_ordinal,
+                        replica_ordinal = replica_ordinal,
+                        "Replica configured to replicate new master"
+                    );
+                    replicas_configured += 1;
+                }
+                Err(e) => {
+                    let error_str = e.to_string().to_lowercase();
+                    if error_str.contains("already") || error_str.contains("replicating") {
+                        debug!(
+                            master_ordinal = master_ordinal,
+                            replica_ordinal = replica_ordinal,
+                            "Replica already replicating, continuing"
+                        );
+                    } else {
+                        replica_client.close().await?;
+                        return Err(e);
+                    }
+                }
+            }
+            replica_client.close().await?;
+        }
+    }
+
+    info!(
+        replicas_configured = replicas_configured,
+        "Finished setting up replicas for new masters"
+    );
+    Ok(replicas_configured)
 }
 
 #[cfg(test)]

@@ -2,10 +2,11 @@
 //!
 //! Policies are organized into tiers:
 //! - Tier 1 (Critical): Always enforced (replica validation)
-//! - Tier 2 (Update): Only enforced on UPDATE operations (immutability)
+//! - Tier 2 (Update): Only enforced on UPDATE operations (immutability, upgrade protection)
 
 pub mod immutability;
 pub mod replicas;
+pub mod upgrade_protection;
 
 use crate::crd::ValkeyCluster;
 
@@ -69,6 +70,13 @@ pub fn validate_all(ctx: &ValidationContext<'_>) -> ValidationResult {
 
     // Tier 2: Update validations (only for UPDATE operations)
     if ctx.is_update() {
+        // Check upgrade protection first - this is the most important check
+        // to prevent changes during an active upgrade
+        let result = upgrade_protection::validate(ctx);
+        if !result.allowed {
+            return result;
+        }
+
         let result = immutability::validate(ctx);
         if !result.allowed {
             return result;

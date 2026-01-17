@@ -164,6 +164,12 @@ pub struct ImageSpec {
     /// Image pull secrets.
     #[serde(default)]
     pub pull_secrets: Vec<String>,
+
+    /// Allow downgrading to an older version.
+    /// Required when changing to a lower version number.
+    /// Default: false
+    #[serde(default)]
+    pub allow_downgrade: bool,
 }
 
 impl Default for ImageSpec {
@@ -173,6 +179,7 @@ impl Default for ImageSpec {
             tag: default_image_tag(),
             pull_policy: default_image_pull_policy(),
             pull_secrets: Vec::new(),
+            allow_downgrade: false,
         }
     }
 }
@@ -838,6 +845,16 @@ pub struct ValkeyClusterStatus {
     /// Used for calculating backoff before next recovery attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_recovery_attempt: Option<String>,
+
+    /// Last error message with actionable remediation steps.
+    /// Cleared when the cluster returns to healthy state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+
+    /// Human-readable summary of cluster health.
+    /// Example: "Healthy: 3 masters, 3 replicas, 16384/16384 slots"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// ClusterPhase represents the current lifecycle phase of a ValkeyCluster.
@@ -955,6 +972,11 @@ impl Condition {
     /// Create a "Degraded" condition.
     pub fn degraded(degraded: bool, reason: &str, message: &str, generation: Option<i64>) -> Self {
         Self::new("Degraded", degraded, reason, message, generation)
+    }
+
+    /// Create an "Error" condition with actionable message.
+    pub fn error(reason: &str, message: &str, generation: Option<i64>) -> Self {
+        Self::new("Error", true, reason, message, generation)
     }
 }
 
@@ -1132,12 +1154,21 @@ mod tests {
         assert_eq!(ClusterPhase::Initializing.to_string(), "Initializing");
         assert_eq!(ClusterPhase::AssigningSlots.to_string(), "AssigningSlots");
         assert_eq!(ClusterPhase::Running.to_string(), "Running");
-        assert_eq!(ClusterPhase::DetectingChanges.to_string(), "DetectingChanges");
-        assert_eq!(ClusterPhase::ScalingStatefulSet.to_string(), "ScalingStatefulSet");
+        assert_eq!(
+            ClusterPhase::DetectingChanges.to_string(),
+            "DetectingChanges"
+        );
+        assert_eq!(
+            ClusterPhase::ScalingStatefulSet.to_string(),
+            "ScalingStatefulSet"
+        );
         assert_eq!(ClusterPhase::AddingNodes.to_string(), "AddingNodes");
         assert_eq!(ClusterPhase::MigratingSlots.to_string(), "MigratingSlots");
         assert_eq!(ClusterPhase::RemovingNodes.to_string(), "RemovingNodes");
-        assert_eq!(ClusterPhase::VerifyingCluster.to_string(), "VerifyingCluster");
+        assert_eq!(
+            ClusterPhase::VerifyingCluster.to_string(),
+            "VerifyingCluster"
+        );
         assert_eq!(ClusterPhase::Degraded.to_string(), "Degraded");
         assert_eq!(ClusterPhase::Failed.to_string(), "Failed");
         assert_eq!(ClusterPhase::Deleting.to_string(), "Deleting");

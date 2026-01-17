@@ -225,10 +225,10 @@ pub async fn handle_detecting_changes(
             (new_masters, Vec::new())
         }
         ScaleDirection::Down => {
-            let removed_masters: Vec<String> =
-                (phase_ctx.target_masters..phase_ctx.current_masters)
-                    .map(|i| format!("{}-{}", name, i))
-                    .collect();
+            let removed_masters: Vec<String> = (phase_ctx.target_masters
+                ..phase_ctx.current_masters)
+                .map(|i| format!("{}-{}", name, i))
+                .collect();
             (Vec::new(), removed_masters)
         }
         _ => (Vec::new(), Vec::new()),
@@ -267,8 +267,13 @@ pub async fn handle_detecting_changes(
             operation_coordination::check_operation_allowed(api, name, OperationType::Scaling).await
     {
         warn!(name = %name, error = %e, "Cannot start scaling operation due to conflict");
-        ctx.publish_warning_event(obj, "ScalingBlocked", "DetectingChanges", Some(e.to_string()))
-            .await;
+        ctx.publish_warning_event(
+            obj,
+            "ScalingBlocked",
+            "DetectingChanges",
+            Some(e.to_string()),
+        )
+        .await;
         return Ok(PhaseResult::with_message(
             ClusterPhase::DetectingChanges,
             "Waiting for operation lock",
@@ -768,9 +773,8 @@ pub async fn handle_initializing(
 
     // Release operation lock if initialization fails (success releases in next phase)
     if init_result.is_err() {
-        let _ =
-            operation_coordination::complete_operation(api, name, OperationType::Initializing)
-                .await;
+        let _ = operation_coordination::complete_operation(api, name, OperationType::Initializing)
+            .await;
     }
 
     match init_result {
@@ -921,8 +925,7 @@ pub async fn handle_migrating_slots(
     info!(name = %name, direction = %scale_direction, "Migrating slots for rebalancing");
 
     // Acquire operation lock
-    if let Err(e) =
-        operation_coordination::start_operation(api, name, OperationType::Scaling).await
+    if let Err(e) = operation_coordination::start_operation(api, name, OperationType::Scaling).await
     {
         warn!(name = %name, error = %e, "Failed to acquire operation lock");
         return Ok(ClusterPhase::MigratingSlots.into());
@@ -1043,6 +1046,12 @@ pub async fn handle_removing_nodes(
 // ============================================================================
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::get_unwrap
+)]
 mod tests {
     use super::*;
 
@@ -1236,7 +1245,11 @@ mod tests {
             scale_direction: "up".to_string(),
             previous_masters: 3,
             target_masters: 6,
-            nodes_to_add: vec!["test-3".to_string(), "test-4".to_string(), "test-5".to_string()],
+            nodes_to_add: vec![
+                "test-3".to_string(),
+                "test-4".to_string(),
+                "test-5".to_string(),
+            ],
             nodes_to_remove: Vec::new(),
             slot_migrations: Vec::new(),
             requires_rolling_update: false,
@@ -1270,8 +1283,7 @@ mod tests {
 
     #[test]
     fn test_compute_nodes_to_change_scale_up() {
-        let (to_add, to_remove) =
-            compute_nodes_to_change("mycluster", 3, 6, ScaleDirection::Up);
+        let (to_add, to_remove) = compute_nodes_to_change("mycluster", 3, 6, ScaleDirection::Up);
 
         assert_eq!(to_add, vec!["mycluster-3", "mycluster-4", "mycluster-5"]);
         assert!(to_remove.is_empty());
@@ -1279,8 +1291,7 @@ mod tests {
 
     #[test]
     fn test_compute_nodes_to_change_scale_up_single_node() {
-        let (to_add, to_remove) =
-            compute_nodes_to_change("vc", 3, 4, ScaleDirection::Up);
+        let (to_add, to_remove) = compute_nodes_to_change("vc", 3, 4, ScaleDirection::Up);
 
         assert_eq!(to_add, vec!["vc-3"]);
         assert!(to_remove.is_empty());
@@ -1288,8 +1299,7 @@ mod tests {
 
     #[test]
     fn test_compute_nodes_to_change_scale_down() {
-        let (to_add, to_remove) =
-            compute_nodes_to_change("mycluster", 6, 3, ScaleDirection::Down);
+        let (to_add, to_remove) = compute_nodes_to_change("mycluster", 6, 3, ScaleDirection::Down);
 
         assert!(to_add.is_empty());
         assert_eq!(to_remove, vec!["mycluster-3", "mycluster-4", "mycluster-5"]);
@@ -1297,8 +1307,7 @@ mod tests {
 
     #[test]
     fn test_compute_nodes_to_change_scale_down_single_node() {
-        let (to_add, to_remove) =
-            compute_nodes_to_change("test", 4, 3, ScaleDirection::Down);
+        let (to_add, to_remove) = compute_nodes_to_change("test", 4, 3, ScaleDirection::Down);
 
         assert!(to_add.is_empty());
         assert_eq!(to_remove, vec!["test-3"]);
@@ -1315,8 +1324,7 @@ mod tests {
 
     #[test]
     fn test_compute_nodes_to_change_none() {
-        let (to_add, to_remove) =
-            compute_nodes_to_change("mycluster", 3, 3, ScaleDirection::None);
+        let (to_add, to_remove) = compute_nodes_to_change("mycluster", 3, 3, ScaleDirection::None);
 
         assert!(to_add.is_empty());
         assert!(to_remove.is_empty());
@@ -1324,8 +1332,7 @@ mod tests {
 
     #[test]
     fn test_compute_nodes_to_change_large_scale_up() {
-        let (to_add, to_remove) =
-            compute_nodes_to_change("cluster", 3, 10, ScaleDirection::Up);
+        let (to_add, to_remove) = compute_nodes_to_change("cluster", 3, 10, ScaleDirection::Up);
 
         assert_eq!(to_add.len(), 7);
         assert_eq!(to_add[0], "cluster-3");

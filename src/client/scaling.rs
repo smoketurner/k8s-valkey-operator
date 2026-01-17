@@ -304,17 +304,36 @@ impl ValkeyClient {
     /// Rebalance slots across all master nodes.
     ///
     /// This redistributes slots evenly across all masters.
+    /// Note: After CLUSTER MEET, new nodes may not have the "master" flag set yet,
+    /// so we detect masters as nodes that are NOT replicas (have no master_id).
     #[instrument(skip(self))]
     pub async fn rebalance_slots(&self, master_count: i32) -> Result<i32, ValkeyError> {
         let mut slots_moved = 0;
 
         // Get current cluster state
         let nodes = self.cluster_nodes().await?;
-        let masters: Vec<&ClusterNode> = nodes.masters().into_iter().collect();
+
+        // Get masters including newly joined nodes that don't have the master flag yet.
+        // After CLUSTER MEET, nodes start as "myself,master,noaddr" but may briefly
+        // appear without the master flag. We detect masters as nodes that are NOT replicas
+        // (i.e., have no master_id set or master_id is "-").
+        let masters: Vec<&ClusterNode> = nodes
+            .nodes
+            .iter()
+            .filter(|n| {
+                // A master is any node that is NOT a replica
+                // Replicas have master_id set (and slave flag), masters don't
+                !n.is_replica()
+                    && n.master_id
+                        .as_ref()
+                        .map(|id| id == "-" || id.is_empty())
+                        .unwrap_or(true)
+            })
+            .collect();
 
         if masters.len() != master_count as usize {
             return Err(ValkeyError::ClusterNotReady(format!(
-                "Expected {} masters but found {}",
+                "Expected {} masters but found {} (detected by not being replicas)",
                 master_count,
                 masters.len()
             )));

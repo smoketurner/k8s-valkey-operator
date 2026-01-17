@@ -17,7 +17,10 @@ mod crd_tests {
         assert_eq!(ClusterPhase::Pending.to_string(), "Pending");
         assert_eq!(ClusterPhase::Creating.to_string(), "Creating");
         assert_eq!(ClusterPhase::Running.to_string(), "Running");
-        assert_eq!(ClusterPhase::DetectingChanges.to_string(), "DetectingChanges");
+        assert_eq!(
+            ClusterPhase::DetectingChanges.to_string(),
+            "DetectingChanges"
+        );
         assert_eq!(ClusterPhase::Degraded.to_string(), "Degraded");
         assert_eq!(ClusterPhase::Failed.to_string(), "Failed");
         assert_eq!(ClusterPhase::Deleting.to_string(), "Deleting");
@@ -104,15 +107,30 @@ mod state_machine_tests {
     fn test_valid_events_from_detecting_changes() {
         let sm = ClusterStateMachine::new();
         // DetectingChanges can transition via NoChangesNeeded -> Running
-        assert!(sm.can_transition(&ClusterPhase::DetectingChanges, &ClusterEvent::NoChangesNeeded));
+        assert!(sm.can_transition(
+            &ClusterPhase::DetectingChanges,
+            &ClusterEvent::NoChangesNeeded
+        ));
         // DetectingChanges can transition via ChangesDetected -> ScalingStatefulSet
-        assert!(sm.can_transition(&ClusterPhase::DetectingChanges, &ClusterEvent::ChangesDetected));
+        assert!(sm.can_transition(
+            &ClusterPhase::DetectingChanges,
+            &ClusterEvent::ChangesDetected
+        ));
         // DetectingChanges can transition via SlotsMigrated -> MigratingSlots (for scale-down)
-        assert!(sm.can_transition(&ClusterPhase::DetectingChanges, &ClusterEvent::SlotsMigrated));
+        assert!(sm.can_transition(
+            &ClusterPhase::DetectingChanges,
+            &ClusterEvent::SlotsMigrated
+        ));
         // DetectingChanges can transition via ReconcileError -> Failed
-        assert!(sm.can_transition(&ClusterPhase::DetectingChanges, &ClusterEvent::ReconcileError));
+        assert!(sm.can_transition(
+            &ClusterPhase::DetectingChanges,
+            &ClusterEvent::ReconcileError
+        ));
         // DetectingChanges can transition via DeletionRequested -> Deleting
-        assert!(sm.can_transition(&ClusterPhase::DetectingChanges, &ClusterEvent::DeletionRequested));
+        assert!(sm.can_transition(
+            &ClusterPhase::DetectingChanges,
+            &ClusterEvent::DeletionRequested
+        ));
     }
 
     #[test]
@@ -528,6 +546,352 @@ mod resources_common_tests {
         let owner_ref = owner_reference(&resource);
 
         assert_eq!(owner_ref.uid, ""); // Should default to empty string
+    }
+}
+
+#[allow(clippy::unwrap_used)]
+mod upgrade_protection_tests {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use std::collections::BTreeMap;
+    use valkey_operator::crd::{
+        AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyCluster, ValkeyClusterSpec,
+    };
+    use valkey_operator::webhooks::policies::upgrade_protection;
+    use valkey_operator::webhooks::policies::{ValidationContext, validate_all};
+
+    const UPGRADE_IN_PROGRESS_ANNOTATION: &str =
+        "valkey-operator.smoketurner.com/upgrade-in-progress";
+    const UPGRADE_NAME_ANNOTATION: &str = "valkey-operator.smoketurner.com/upgrade-name";
+
+    fn create_test_resource(masters: i32) -> ValkeyCluster {
+        ValkeyCluster {
+            metadata: ObjectMeta {
+                name: Some("test".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: ValkeyClusterSpec {
+                masters,
+                replicas_per_master: 1,
+                tls: TlsSpec {
+                    issuer_ref: IssuerRef {
+                        name: "test-issuer".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                auth: AuthSpec {
+                    secret_ref: SecretKeyRef {
+                        name: "test-secret".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                labels: BTreeMap::new(),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    fn create_resource_with_upgrade(masters: i32, upgrade_name: &str) -> ValkeyCluster {
+        let mut resource = create_test_resource(masters);
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            UPGRADE_IN_PROGRESS_ANNOTATION.to_string(),
+            "true".to_string(),
+        );
+        annotations.insert(
+            UPGRADE_NAME_ANNOTATION.to_string(),
+            upgrade_name.to_string(),
+        );
+        resource.metadata.annotations = Some(annotations);
+        resource
+    }
+
+    // ==========================================================================
+    // Upgrade protection policy tests
+    // ==========================================================================
+
+    #[test]
+    fn test_upgrade_protection_allows_create() {
+        let new = create_test_resource(3);
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: None,
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = upgrade_protection::validate(&ctx);
+        assert!(result.allowed, "CREATE should always be allowed");
+    }
+
+    #[test]
+    fn test_upgrade_protection_allows_update_without_upgrade() {
+        let old = create_test_resource(3);
+        let new = create_test_resource(6);
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = upgrade_protection::validate(&ctx);
+        assert!(
+            result.allowed,
+            "UPDATE without upgrade annotation should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_protection_blocks_scale_during_upgrade() {
+        let old = create_resource_with_upgrade(3, "production-upgrade");
+        let new = create_test_resource(6); // Scale up attempt
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = upgrade_protection::validate(&ctx);
+        assert!(!result.allowed, "Scale during upgrade should be blocked");
+        assert_eq!(result.reason, Some("UpgradeInProgress".to_string()));
+        assert!(
+            result
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("production-upgrade")
+        );
+    }
+
+    #[test]
+    fn test_upgrade_protection_blocks_replica_change_during_upgrade() {
+        let old = create_resource_with_upgrade(3, "test-upgrade");
+        let mut new = create_test_resource(3);
+        new.spec.replicas_per_master = 2; // Change replicas
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = upgrade_protection::validate(&ctx);
+        assert!(
+            !result.allowed,
+            "Replica change during upgrade should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_protection_blocks_resource_change_during_upgrade() {
+        let old = create_resource_with_upgrade(3, "test-upgrade");
+        let mut new = create_test_resource(3);
+        new.spec.resources.requests.cpu = "2".to_string();
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = upgrade_protection::validate(&ctx);
+        assert!(
+            !result.allowed,
+            "Resource change during upgrade should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_protection_allows_no_spec_change_during_upgrade() {
+        let old = create_resource_with_upgrade(3, "test-upgrade");
+        let new = create_test_resource(3); // Same spec
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = upgrade_protection::validate(&ctx);
+        assert!(
+            result.allowed,
+            "No-op update during upgrade should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_protection_error_message_includes_kubectl_command() {
+        let old = create_resource_with_upgrade(3, "my-upgrade");
+        let new = create_test_resource(6);
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = upgrade_protection::validate(&ctx);
+        assert!(!result.allowed);
+        let message = result.message.unwrap();
+        assert!(
+            message.contains("kubectl get valkeyupgrade"),
+            "Error should include kubectl command for checking upgrade status"
+        );
+        assert!(
+            message.contains("my-upgrade"),
+            "Error should include upgrade name"
+        );
+    }
+
+    // ==========================================================================
+    // Full validation chain tests (upgrade protection integrated)
+    // ==========================================================================
+
+    #[test]
+    fn test_validate_all_blocks_upgrade_before_immutability() {
+        // Create old resource with upgrade in progress
+        let old = create_resource_with_upgrade(3, "test-upgrade");
+        let new = create_test_resource(6); // Scale attempt
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = validate_all(&ctx);
+        assert!(!result.allowed);
+        // Should fail on UpgradeInProgress, not some other reason
+        assert_eq!(result.reason, Some("UpgradeInProgress".to_string()));
+    }
+
+    #[test]
+    fn test_validate_all_allows_normal_scale() {
+        let old = create_test_resource(3);
+        let new = create_test_resource(6);
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = validate_all(&ctx);
+        assert!(
+            result.allowed,
+            "Normal scale without upgrade should be allowed"
+        );
+    }
+
+    // ==========================================================================
+    // Edge case tests
+    // ==========================================================================
+
+    #[test]
+    fn test_upgrade_annotation_false_allows_changes() {
+        let mut old = create_test_resource(3);
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            UPGRADE_IN_PROGRESS_ANNOTATION.to_string(),
+            "false".to_string(), // Explicitly false
+        );
+        old.metadata.annotations = Some(annotations);
+
+        let new = create_test_resource(6);
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = upgrade_protection::validate(&ctx);
+        assert!(
+            result.allowed,
+            "Annotation set to 'false' should allow changes"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_annotation_empty_allows_changes() {
+        let mut old = create_test_resource(3);
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            UPGRADE_IN_PROGRESS_ANNOTATION.to_string(),
+            "".to_string(), // Empty value
+        );
+        old.metadata.annotations = Some(annotations);
+
+        let new = create_test_resource(6);
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = upgrade_protection::validate(&ctx);
+        assert!(
+            result.allowed,
+            "Empty annotation value should allow changes"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_blocks_persistence_change() {
+        let old = create_resource_with_upgrade(3, "test-upgrade");
+        let mut new = create_test_resource(3);
+        new.spec.persistence.size = "20Gi".to_string();
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = upgrade_protection::validate(&ctx);
+        assert!(
+            !result.allowed,
+            "Persistence change during upgrade should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_blocks_label_change() {
+        let old = create_resource_with_upgrade(3, "test-upgrade");
+        let mut new = create_test_resource(3);
+        new.spec
+            .labels
+            .insert("env".to_string(), "prod".to_string());
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = upgrade_protection::validate(&ctx);
+        assert!(
+            !result.allowed,
+            "Label change during upgrade should be blocked"
+        );
     }
 }
 

@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jiff::Timestamp;
+use k8s_openapi::api::apps::v1::StatefulSet;
 use kube::{
-    Api, ResourceExt,
+    Api, Client, ResourceExt,
     api::{DeleteParams, ListParams, Patch, PatchParams},
     runtime::controller::Action,
 };
@@ -306,6 +307,33 @@ async fn handle_prechecks_phase(
 
     info!(name = %name, "Pre-upgrade checks passed");
 
+    // Set upgrade-in-progress annotation on the cluster
+    let cluster_namespace = obj
+        .spec
+        .cluster_ref
+        .namespace
+        .as_deref()
+        .unwrap_or(namespace);
+    if let Err(e) =
+        set_upgrade_annotation(&ctx.client, &cluster.name_any(), &name, cluster_namespace).await
+    {
+        warn!(name = %name, error = %e, "Failed to set upgrade annotation on cluster");
+        // Continue anyway - this is not critical for the upgrade
+    }
+
+    // Update the cluster image tag to trigger StatefulSet update
+    let target_tag = resolve_target_tag(&obj.spec);
+    if let Err(e) = update_cluster_image(&ctx.client, cluster, &target_tag, cluster_namespace).await
+    {
+        error!(name = %name, error = %e, "Failed to update cluster image tag");
+        // Clear upgrade annotation on failure
+        let _ = clear_upgrade_annotation(&ctx.client, &cluster.name_any(), cluster_namespace).await;
+        update_phase(api, &name, UpgradePhase::Failed, Some(e.to_string())).await?;
+        return Err(e);
+    }
+
+    info!(name = %name, target_tag = %target_tag, "Updated cluster image tag for upgrade");
+
     // Transition to InProgress
     let mut status = obj.status.clone().unwrap_or_default();
     status.phase = UpgradePhase::InProgress;
@@ -371,6 +399,14 @@ async fn handle_inprogress_phase(
             OperationType::Upgrading,
         )
         .await;
+
+        // Clear upgrade annotation from cluster
+        if let Err(e) =
+            clear_upgrade_annotation(&ctx.client, &cluster.name_any(), cluster_namespace).await
+        {
+            warn!(name = %name, error = %e, "Failed to clear upgrade annotation on completion");
+            // Continue anyway - not critical
+        }
 
         let mut new_status = status.clone();
         new_status.phase = UpgradePhase::Completed;
@@ -480,6 +516,25 @@ async fn handle_inprogress_phase(
             .await;
             // Any shard failure triggers immediate rollback
             info!(name = %name, shard = current_shard, "Shard upgrade failed, initiating rollback");
+
+            // Restore original image before setting RollingBack phase
+            if let Some(original_version) = status.current_version.as_ref()
+                && let Err(e) =
+                    initiate_rollback(&ctx.client, cluster, original_version, cluster_namespace)
+                        .await
+            {
+                warn!(name = %name, error = %e, "Failed to restore original image during rollback initiation");
+                // Continue with rollback anyway - check_rollback_completion will retry
+            }
+
+            // Clear upgrade annotation when entering RollingBack (we're done with the upgrade attempt)
+            if let Err(e) =
+                clear_upgrade_annotation(&ctx.client, &cluster.name_any(), cluster_namespace).await
+            {
+                warn!(name = %name, error = %e, "Failed to clear upgrade annotation during rollback");
+                // Continue anyway - not critical
+            }
+
             let mut new_status = status.clone();
             new_status.phase = UpgradePhase::RollingBack;
             new_status.failed_shards += 1;
@@ -524,6 +579,22 @@ async fn upgrade_shard_replicas(
     let name = obj.name_any();
 
     info!(name = %name, shard = shard_index, "Upgrading replicas for shard");
+
+    // Verify StatefulSet has target image before deleting pods
+    let target_image = resolve_target_image(&obj.spec, cluster);
+    let sts_ready =
+        verify_statefulset_image(&ctx.client, &cluster.name_any(), namespace, &target_image)
+            .await?;
+
+    if !sts_ready {
+        info!(
+            name = %name,
+            shard = shard_index,
+            target_image = %target_image,
+            "Waiting for StatefulSet to be updated with target image"
+        );
+        return Ok(Action::requeue(Duration::from_secs(5)));
+    }
 
     // Get replica pod names for this shard
     let replica_pods = replica_pod_dns_names_for_master(cluster, shard_index);
@@ -1228,7 +1299,13 @@ async fn wait_for_cluster_stable(
         );
         // Don't fail the upgrade, just proceed with a warning
         // The pod deletion might still cause issues, but we don't want to block forever
-        update_shard_status(api, &name, shard_index, ShardUpgradeState::UpgradingOldMaster).await?;
+        update_shard_status(
+            api,
+            &name,
+            shard_index,
+            ShardUpgradeState::UpgradingOldMaster,
+        )
+        .await?;
 
         // Clear sync tracking
         let mut new_status = obj.status.clone().unwrap_or_default();
@@ -1241,9 +1318,10 @@ async fn wait_for_cluster_stable(
 
     // Get master pod DNS names to find the old master
     let master_pods = master_pod_dns_names(cluster);
-    let (old_master_host, old_master_port) = master_pods
-        .get(shard_index as usize)
-        .ok_or_else(|| Error::Validation(format!("No master pod found for shard {}", shard_index)))?;
+    let (old_master_host, old_master_port) =
+        master_pods.get(shard_index as usize).ok_or_else(|| {
+            Error::Validation(format!("No master pod found for shard {}", shard_index))
+        })?;
 
     // Connect to the old master (should now be a replica)
     let client = match ctx
@@ -1400,7 +1478,13 @@ async fn wait_for_cluster_stable(
     new_status.sync_elapsed_seconds = None;
     update_status(api, &name, new_status).await?;
 
-    update_shard_status(api, &name, shard_index, ShardUpgradeState::UpgradingOldMaster).await?;
+    update_shard_status(
+        api,
+        &name,
+        shard_index,
+        ShardUpgradeState::UpgradingOldMaster,
+    )
+    .await?;
 
     ctx.publish_upgrade_event(
         obj,
@@ -1651,6 +1735,21 @@ async fn check_rollback_completion(
 
     // Rollback complete - all pods have original image and cluster is healthy
     info!(name = %name, "Rollback completed successfully");
+
+    // Clear upgrade annotation from cluster
+    let cluster_namespace = obj
+        .spec
+        .cluster_ref
+        .namespace
+        .as_deref()
+        .unwrap_or(namespace);
+    if let Err(e) =
+        clear_upgrade_annotation(&ctx.client, &cluster.name_any(), cluster_namespace).await
+    {
+        warn!(name = %name, error = %e, "Failed to clear upgrade annotation on rollback completion");
+        // Continue anyway - not critical
+    }
+
     let mut status = obj.status.clone().unwrap_or_default();
     status.phase = UpgradePhase::RolledBack;
     status.completed_at = Some(Timestamp::now().to_string());
@@ -1815,6 +1914,174 @@ async fn validate_upgrade_spec(
 fn resolve_target_image(spec: &ValkeyUpgradeSpec, cluster: &ValkeyCluster) -> String {
     let repository = &cluster.spec.image.repository;
     format!("{}:{}-alpine", repository, spec.target_version)
+}
+
+/// Resolve the target tag (version with alpine suffix) from the upgrade spec.
+fn resolve_target_tag(spec: &ValkeyUpgradeSpec) -> String {
+    let target_version = &spec.target_version;
+    if target_version.contains("-alpine") {
+        target_version.clone()
+    } else {
+        format!("{}-alpine", target_version)
+    }
+}
+
+/// Annotation key indicating an upgrade is in progress.
+const UPGRADE_IN_PROGRESS_ANNOTATION: &str = "valkey-operator.smoketurner.com/upgrade-in-progress";
+
+/// Annotation key storing the name of the active upgrade.
+const UPGRADE_NAME_ANNOTATION: &str = "valkey-operator.smoketurner.com/upgrade-name";
+
+/// Update the target cluster's image tag to the upgrade target version.
+/// This triggers the cluster reconciler to update the StatefulSet.
+async fn update_cluster_image(
+    client: &Client,
+    cluster: &ValkeyCluster,
+    target_tag: &str,
+    namespace: &str,
+) -> Result<(), Error> {
+    let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), namespace);
+    let name = cluster.name_any();
+
+    // Check if already at target version
+    if cluster.spec.image.tag == target_tag {
+        debug!(name = %name, tag = %target_tag, "Cluster already has target image tag");
+        return Ok(());
+    }
+
+    info!(
+        name = %name,
+        current_tag = %cluster.spec.image.tag,
+        new_tag = %target_tag,
+        "Updating cluster image tag for upgrade"
+    );
+
+    // Patch the cluster spec
+    let patch = serde_json::json!({
+        "spec": {
+            "image": {
+                "tag": target_tag
+            }
+        }
+    });
+
+    cluster_api
+        .patch(
+            &name,
+            &PatchParams::apply(FIELD_MANAGER),
+            &Patch::Merge(&patch),
+        )
+        .await
+        .map_err(Error::Kube)?;
+
+    Ok(())
+}
+
+/// Verify the StatefulSet has been updated with the target image.
+async fn verify_statefulset_image(
+    client: &Client,
+    cluster_name: &str,
+    namespace: &str,
+    target_image: &str,
+) -> Result<bool, Error> {
+    let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), namespace);
+
+    let sts = match sts_api.get(cluster_name).await {
+        Ok(s) => s,
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            debug!(name = %cluster_name, "StatefulSet not found");
+            return Ok(false);
+        }
+        Err(e) => return Err(Error::Kube(e)),
+    };
+
+    let current_image = sts
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|s| s.containers.first())
+        .and_then(|c| c.image.as_ref())
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(current_image.contains(target_image) || current_image == target_image)
+}
+
+/// Set upgrade-in-progress annotation on the cluster.
+async fn set_upgrade_annotation(
+    client: &Client,
+    cluster_name: &str,
+    upgrade_name: &str,
+    namespace: &str,
+) -> Result<(), Error> {
+    let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), namespace);
+
+    let patch = serde_json::json!({
+        "metadata": {
+            "annotations": {
+                UPGRADE_IN_PROGRESS_ANNOTATION: "true",
+                UPGRADE_NAME_ANNOTATION: upgrade_name
+            }
+        }
+    });
+
+    cluster_api
+        .patch(
+            cluster_name,
+            &PatchParams::apply(FIELD_MANAGER),
+            &Patch::Merge(&patch),
+        )
+        .await
+        .map_err(Error::Kube)?;
+
+    Ok(())
+}
+
+/// Clear upgrade-in-progress annotation from the cluster.
+async fn clear_upgrade_annotation(
+    client: &Client,
+    cluster_name: &str,
+    namespace: &str,
+) -> Result<(), Error> {
+    let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), namespace);
+
+    // Use JSON patch to remove annotations (null values in merge patch)
+    let patch = serde_json::json!({
+        "metadata": {
+            "annotations": {
+                UPGRADE_IN_PROGRESS_ANNOTATION: null,
+                UPGRADE_NAME_ANNOTATION: null
+            }
+        }
+    });
+
+    cluster_api
+        .patch(
+            cluster_name,
+            &PatchParams::apply(FIELD_MANAGER),
+            &Patch::Merge(&patch),
+        )
+        .await
+        .map_err(Error::Kube)?;
+
+    Ok(())
+}
+
+/// Initiate rollback by restoring the original cluster image.
+async fn initiate_rollback(
+    client: &Client,
+    cluster: &ValkeyCluster,
+    original_version: &str,
+    namespace: &str,
+) -> Result<(), Error> {
+    info!(
+        cluster = %cluster.name_any(),
+        original_version = %original_version,
+        "Initiating rollback - restoring original image"
+    );
+
+    // Restore the cluster image to original version
+    update_cluster_image(client, cluster, original_version, namespace).await
 }
 
 /// Initialize shard statuses from cluster topology
@@ -2211,6 +2478,7 @@ mod tests {
                     tag: "8-alpine".to_string(),
                     pull_policy: "IfNotPresent".to_string(),
                     pull_secrets: Vec::new(),
+                    allow_downgrade: false,
                 },
                 auth: AuthSpec {
                     secret_ref: SecretKeyRef {

@@ -430,9 +430,11 @@ fn build_valkey_extra_flags(
 
     // ACL configuration
     if let Some(acl) = &resource.spec.auth.acl
-        && acl.enabled && acl.config_secret_ref.is_some() {
-            flags.push("--aclfile /etc/valkey/acl/acl.conf".to_string());
-        }
+        && acl.enabled
+        && acl.config_secret_ref.is_some()
+    {
+        flags.push("--aclfile /etc/valkey/acl/acl.conf".to_string());
+    }
 
     // TLS configuration
     flags.push("--tls-port 6379".to_string());
@@ -605,7 +607,10 @@ fn generate_metrics_exporter_container(resource: &ValkeyCluster) -> Option<Conta
 
     let port = exporter_spec.port;
     let default_resources = ExporterResourcesSpec::default();
-    let resources = exporter_spec.resources.as_ref().unwrap_or(&default_resources);
+    let resources = exporter_spec
+        .resources
+        .as_ref()
+        .unwrap_or(&default_resources);
 
     // Build environment variables for the exporter
     let mut env = vec![
@@ -752,22 +757,23 @@ fn generate_volumes(resource: &ValkeyCluster) -> Vec<Volume> {
     // ACL configuration volume if enabled
     if let Some(acl) = &resource.spec.auth.acl
         && acl.enabled
-            && let Some(secret_ref) = &acl.config_secret_ref {
-                volumes.push(Volume {
-                    name: "acl-config".to_string(),
-                    secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
-                        secret_name: Some(secret_ref.name.clone()),
-                        default_mode: Some(0o400),
-                        items: Some(vec![k8s_openapi::api::core::v1::KeyToPath {
-                            key: secret_ref.key.clone(),
-                            path: "acl.conf".to_string(),
-                            ..Default::default()
-                        }]),
-                        ..Default::default()
-                    }),
+        && let Some(secret_ref) = &acl.config_secret_ref
+    {
+        volumes.push(Volume {
+            name: "acl-config".to_string(),
+            secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+                secret_name: Some(secret_ref.name.clone()),
+                default_mode: Some(0o400),
+                items: Some(vec![k8s_openapi::api::core::v1::KeyToPath {
+                    key: secret_ref.key.clone(),
+                    path: "acl.conf".to_string(),
                     ..Default::default()
-                });
-            }
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
 
     volumes
 }
@@ -790,14 +796,16 @@ fn generate_volume_mounts(resource: &ValkeyCluster) -> Vec<VolumeMount> {
 
     // ACL configuration mount if enabled
     if let Some(acl) = &resource.spec.auth.acl
-        && acl.enabled && acl.config_secret_ref.is_some() {
-            mounts.push(VolumeMount {
-                name: "acl-config".to_string(),
-                mount_path: "/etc/valkey/acl".to_string(),
-                read_only: Some(true),
-                ..Default::default()
-            });
-        }
+        && acl.enabled
+        && acl.config_secret_ref.is_some()
+    {
+        mounts.push(VolumeMount {
+            name: "acl-config".to_string(),
+            mount_path: "/etc/valkey/acl".to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
 
     mounts
 }

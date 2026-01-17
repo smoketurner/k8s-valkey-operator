@@ -70,6 +70,11 @@ impl ConditionBuilder {
         self.set(Condition::degraded(degraded, reason, message, generation))
     }
 
+    /// Set Error condition with actionable message
+    pub fn error(&mut self, reason: &str, message: &str, generation: Option<i64>) -> &mut Self {
+        self.set(Condition::error(reason, message, generation))
+    }
+
     /// Build the conditions list
     pub fn build(self) -> Vec<Condition> {
         self.conditions

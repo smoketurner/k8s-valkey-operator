@@ -636,7 +636,10 @@ impl ShardStateMachine {
                 ShardUpgradeState::Failed,
             ],
             ShardUpgradeState::WaitingForClusterStable => {
-                vec![ShardUpgradeState::UpgradingOldMaster, ShardUpgradeState::Failed]
+                vec![
+                    ShardUpgradeState::UpgradingOldMaster,
+                    ShardUpgradeState::Failed,
+                ]
             }
             ShardUpgradeState::UpgradingOldMaster => {
                 vec![ShardUpgradeState::Completed, ShardUpgradeState::Failed]

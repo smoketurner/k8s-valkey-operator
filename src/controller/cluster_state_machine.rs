@@ -757,8 +757,11 @@ mod tests {
         let ctx = TransitionContext::new(3, 3);
 
         // Scale-up path
-        let result =
-            sm.transition(&ClusterPhase::DetectingChanges, ClusterEvent::ChangesDetected, &ctx);
+        let result = sm.transition(
+            &ClusterPhase::DetectingChanges,
+            ClusterEvent::ChangesDetected,
+            &ctx,
+        );
         match result {
             TransitionResult::Success { from, to, .. } => {
                 assert_eq!(from, ClusterPhase::DetectingChanges);
@@ -768,8 +771,11 @@ mod tests {
         }
 
         // No changes needed
-        let result =
-            sm.transition(&ClusterPhase::DetectingChanges, ClusterEvent::NoChangesNeeded, &ctx);
+        let result = sm.transition(
+            &ClusterPhase::DetectingChanges,
+            ClusterEvent::NoChangesNeeded,
+            &ctx,
+        );
         match result {
             TransitionResult::Success { from, to, .. } => {
                 assert_eq!(from, ClusterPhase::DetectingChanges);
@@ -785,8 +791,11 @@ mod tests {
         let ctx = TransitionContext::new(6, 6);
 
         // Scale-up: pods running -> AddingNodes
-        let result =
-            sm.transition(&ClusterPhase::ScalingStatefulSet, ClusterEvent::PodsRunning, &ctx);
+        let result = sm.transition(
+            &ClusterPhase::ScalingStatefulSet,
+            ClusterEvent::PodsRunning,
+            &ctx,
+        );
         match result {
             TransitionResult::Success { from, to, .. } => {
                 assert_eq!(from, ClusterPhase::ScalingStatefulSet);
@@ -832,8 +841,11 @@ mod tests {
         let ctx = TransitionContext::new(6, 6);
 
         // Scale-down: slots migrated -> RemovingNodes
-        let result =
-            sm.transition(&ClusterPhase::MigratingSlots, ClusterEvent::SlotsMigrated, &ctx);
+        let result = sm.transition(
+            &ClusterPhase::MigratingSlots,
+            ClusterEvent::SlotsMigrated,
+            &ctx,
+        );
         match result {
             TransitionResult::Success { from, to, .. } => {
                 assert_eq!(from, ClusterPhase::MigratingSlots);
@@ -843,8 +855,11 @@ mod tests {
         }
 
         // Scale-up: cluster healthy -> VerifyingCluster
-        let result =
-            sm.transition(&ClusterPhase::MigratingSlots, ClusterEvent::ClusterHealthy, &ctx);
+        let result = sm.transition(
+            &ClusterPhase::MigratingSlots,
+            ClusterEvent::ClusterHealthy,
+            &ctx,
+        );
         match result {
             TransitionResult::Success { from, to, .. } => {
                 assert_eq!(from, ClusterPhase::MigratingSlots);
@@ -860,8 +875,11 @@ mod tests {
         let ctx = TransitionContext::new(3, 3);
 
         // Nodes removed -> ScalingStatefulSet
-        let result =
-            sm.transition(&ClusterPhase::RemovingNodes, ClusterEvent::NodesRemoved, &ctx);
+        let result = sm.transition(
+            &ClusterPhase::RemovingNodes,
+            ClusterEvent::NodesRemoved,
+            &ctx,
+        );
         match result {
             TransitionResult::Success { from, to, .. } => {
                 assert_eq!(from, ClusterPhase::RemovingNodes);
@@ -877,8 +895,11 @@ mod tests {
         let ctx = TransitionContext::new(6, 6);
 
         // Cluster healthy -> Running
-        let result =
-            sm.transition(&ClusterPhase::VerifyingCluster, ClusterEvent::ClusterHealthy, &ctx);
+        let result = sm.transition(
+            &ClusterPhase::VerifyingCluster,
+            ClusterEvent::ClusterHealthy,
+            &ctx,
+        );
         match result {
             TransitionResult::Success { from, to, .. } => {
                 assert_eq!(from, ClusterPhase::VerifyingCluster);
@@ -967,10 +988,16 @@ mod tests {
     #[test]
     fn test_event_display() {
         assert_eq!(format!("{}", ClusterEvent::PodsRunning), "PodsRunning");
-        assert_eq!(format!("{}", ClusterEvent::ChangesDetected), "ChangesDetected");
+        assert_eq!(
+            format!("{}", ClusterEvent::ChangesDetected),
+            "ChangesDetected"
+        );
         assert_eq!(format!("{}", ClusterEvent::NodesAdded), "NodesAdded");
         assert_eq!(format!("{}", ClusterEvent::SlotsMigrated), "SlotsMigrated");
         assert_eq!(format!("{}", ClusterEvent::NodesRemoved), "NodesRemoved");
-        assert_eq!(format!("{}", ClusterEvent::ClusterHealthy), "ClusterHealthy");
+        assert_eq!(
+            format!("{}", ClusterEvent::ClusterHealthy),
+            "ClusterHealthy"
+        );
     }
 }
