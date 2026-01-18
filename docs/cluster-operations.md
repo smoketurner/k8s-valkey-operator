@@ -180,27 +180,64 @@ stateDiagram-v2
 
 ---
 
-### 2.4 Replica-Only Changes (e.g., 3m/1r → 3m/2r)
+### 2.4 Replica-Only Changes
 
-**Path:** Uses Scale-Up path but with no slot movement
+#### 2.4.1 Replica Scale-Up (e.g., 3m/1r → 3m/2r)
+
+**Path:** Uses Scale-Up path with no slot movement
 
 ```
 Running → ScalingUpStatefulSet → WaitingForNewPods → AddingNodesToCluster →
 RebalancingSlots (no-op) → ConfiguringNewReplicas → VerifyingClusterHealth → Running
 ```
 
-**Detection Logic (cluster_phases.rs:527-534):**
+**Key Insight:** Replica additions go through the scale-up path because:
+- StatefulSet handles replica count increase
+- AddingNodesToCluster adds new replica nodes via CLUSTER MEET
+- RebalancingSlots is a no-op (no new masters)
+- ConfiguringNewReplicas configures replica relationships
+
+#### 2.4.2 Replica Scale-Down (e.g., 3m/2r → 3m/1r)
+
+**Path:** Goes directly to node removal (skipping slot evacuation since replicas don't hold slots)
+
+```
+Running → RemovingNodesFromCluster → ScalingDownStatefulSet → VerifyingClusterHealth → Running
+```
+
+**Text Diagram:**
+```
+┌─────────┐  ReplicaScaleDownDetected  ┌───────────────────────────┐
+│ Running │ ─────────────────────────► │ RemovingNodesFromCluster  │
+└─────────┘                            └───────────────────────────┘
+     ▲                                             │
+     │                                      PhaseComplete
+     │                                             ▼
+     │  ClusterHealthy  ┌───────────────────────┐  PhaseComplete  ┌─────────────────────────┐
+     └──────────────────│VerifyingClusterHealth │◄────────────────│ ScalingDownStatefulSet  │
+                        └───────────────────────┘                 └─────────────────────────┘
+```
+
+| Step | Phase | Handler | Valkey Commands |
+|------|-------|---------|-----------------|
+| 1 | Running | `handle_running` | - (detects `running_pods > desired_replicas`) |
+| 2 | RemovingNodesFromCluster | `handle_removing_nodes_from_cluster` | `CLUSTER FORGET` for orphaned replicas |
+| 3 | ScalingDownStatefulSet | `handle_scaling_down_statefulset` | - (patches StatefulSet) |
+| 4 | VerifyingClusterHealth | `handle_verifying_cluster_health` | `CLUSTER INFO` |
+
+**Detection Logic (cluster_phases.rs:527-557):**
 ```rust
 if phase_ctx.running_pods != desired_replicas && phase_ctx.current_masters > 0 {
+    if phase_ctx.running_pods > desired_replicas {
+        // Replica scale-DOWN: go directly to node removal (skip slot evacuation)
+        return Ok(ClusterPhase::RemovingNodesFromCluster.into());
+    }
+    // Replica scale-UP: existing path
     return Ok(ClusterPhase::ScalingUpStatefulSet.into());
 }
 ```
 
-**Key Insight:** Replica changes go through the "ScalingUpStatefulSet" path regardless of direction (add or remove). This works because:
-- StatefulSet handles replica count changes automatically
-- AddingNodesToCluster skips if `nodes_in_cluster >= desired_replicas`
-- RebalancingSlots is a no-op (no new masters)
-- ConfiguringNewReplicas configures replica relationships
+**Key Insight:** Replica scale-down bypasses EvacuatingSlots because replicas don't hold slots. The `execute_forget_removed_nodes` function uses `ClusterTopology.orphaned_nodes()` to identify nodes whose IPs no longer match running pods, then issues `CLUSTER FORGET` for each orphaned node
 
 ---
 
@@ -336,7 +373,7 @@ is_cluster_failed(ready) = ready == 0
 | Scale masters up | 3m/1r | 6m/1r | +6 (vc-6..vc-11) | ~8192 | Scale-Up |
 | Scale masters down | 6m/1r | 3m/1r | -6 (vc-6..vc-11) | ~8192 | Scale-Down |
 | Add replicas | 3m/1r | 3m/2r | +3 (vc-6..vc-8) | 0 | Scale-Up (no slot move) |
-| Remove replicas | 3m/2r | 3m/1r | -3 (vc-6..vc-8) | 0 | Scale-Up (confusing!) |
+| Remove replicas | 3m/2r | 3m/1r | -3 (vc-6..vc-8) | 0 | Replica Scale-Down |
 | Combined up | 3m/1r | 6m/2r | +12 | ~8192 | Scale-Up |
 | Combined down | 6m/2r | 3m/1r | -12 | ~8192 | Scale-Down |
 
@@ -344,29 +381,15 @@ is_cluster_failed(ready) = ready == 0
 
 | Issue | Scenario | Current Behavior | Concern |
 |-------|----------|------------------|---------|
-| **Replica removal path** | 3m/2r → 3m/1r | Goes through ScalingUpStatefulSet | Naming is confusing but works |
-| **Missing CLUSTER FORGET** | Replica-only removal | No FORGET called | Stale node entries remain until Valkey auto-removes |
 | **Scale during degraded** | Degraded + scale-down | Allowed via state machine | May complicate recovery |
 | **Rapid scale changes** | 3→6→3 masters quickly | Each transition sequential | Could leave partial state |
 
-### 3.4 Issue Detail: Missing CLUSTER FORGET for Replica Removal
+**Resolved Issues:**
 
-**Scenario:** 3m/2r → 3m/1r (removing replicas only)
-
-**Current Path:**
-1. Running detects `running_pods (9) != desired_replicas (6)`
-2. Goes to ScalingUpStatefulSet (patches StatefulSet to 6)
-3. WaitingForNewPods passes (9 >= 6)
-4. AddingNodesToCluster passes (9 >= 6)
-5. RebalancingSlots - no-op (no new masters)
-6. ConfiguringNewReplicas - configures existing replicas
-7. VerifyingClusterHealth → Running
-
-**Problem:** The removed replica pods (vc-6, vc-7, vc-8) are deleted by StatefulSet, but their node entries remain in the cluster. `CLUSTER FORGET` is only called in `RemovingNodesFromCluster` phase, which is only reached via the Scale-Down master path.
-
-**Impact:** Stale node entries until Valkey's automatic node removal (cluster-node-timeout * 2 = ~30 sec default).
-
-**Code Location:** `cluster_phases.rs:527-534` routes all replica count changes to ScalingUpStatefulSet.
+| Issue | Resolution |
+|-------|------------|
+| **Replica removal path** | Replica scale-down now uses dedicated path: Running → RemovingNodesFromCluster → ScalingDownStatefulSet |
+| **Missing CLUSTER FORGET** | ReplicaScaleDownDetected event routes to RemovingNodesFromCluster, which calls CLUSTER FORGET |
 
 ---
 

@@ -10,6 +10,7 @@
 // Shared modules
 pub mod common;
 pub mod context;
+pub mod diagnostic_hints;
 pub mod error;
 pub mod status;
 
@@ -21,6 +22,7 @@ pub mod cluster_state_machine;
 pub mod cluster_topology;
 pub mod cluster_validation;
 pub mod operation_coordination;
+pub mod operation_lock;
 
 // ValkeyUpgrade controller
 pub mod upgrade_reconciler;

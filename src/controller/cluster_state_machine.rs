@@ -48,6 +48,8 @@ pub enum ClusterEvent {
     ScaleUpDetected,
     /// Scale-down operation detected (masters decreased)
     ScaleDownDetected,
+    /// Replica-only scale-down detected (masters unchanged, replicas decreased)
+    ReplicaScaleDownDetected,
     /// Cluster health verification passed
     ClusterHealthy,
 }
@@ -65,6 +67,7 @@ impl fmt::Display for ClusterEvent {
             ClusterEvent::PhaseComplete => write!(f, "PhaseComplete"),
             ClusterEvent::ScaleUpDetected => write!(f, "ScaleUpDetected"),
             ClusterEvent::ScaleDownDetected => write!(f, "ScaleDownDetected"),
+            ClusterEvent::ReplicaScaleDownDetected => write!(f, "ReplicaScaleDownDetected"),
             ClusterEvent::ClusterHealthy => write!(f, "ClusterHealthy"),
         }
     }
@@ -344,6 +347,12 @@ impl ClusterStateMachine {
                 ),
                 Transition::new(
                     ClusterPhase::Running,
+                    ClusterPhase::RemovingNodesFromCluster,
+                    ClusterEvent::ReplicaScaleDownDetected,
+                    "Replica scale-down detected, removing nodes from cluster",
+                ),
+                Transition::new(
+                    ClusterPhase::Running,
                     ClusterPhase::Degraded,
                     ClusterEvent::ReplicasDegraded,
                     "Resource health degraded",
@@ -593,6 +602,12 @@ impl ClusterStateMachine {
                     ClusterPhase::EvacuatingSlots,
                     ClusterEvent::ScaleDownDetected,
                     "Scale-down detected while degraded",
+                ),
+                Transition::new(
+                    ClusterPhase::Degraded,
+                    ClusterPhase::RemovingNodesFromCluster,
+                    ClusterEvent::ReplicaScaleDownDetected,
+                    "Replica scale-down detected while degraded",
                 ),
                 Transition::new(
                     ClusterPhase::Degraded,
@@ -1181,8 +1196,106 @@ mod tests {
             "ScaleDownDetected"
         );
         assert_eq!(
+            format!("{}", ClusterEvent::ReplicaScaleDownDetected),
+            "ReplicaScaleDownDetected"
+        );
+        assert_eq!(
             format!("{}", ClusterEvent::ClusterHealthy),
             "ClusterHealthy"
         );
+    }
+
+    #[test]
+    fn test_running_to_removing_nodes_replica_scale_down() {
+        let sm = ClusterStateMachine::new();
+        let ctx = TransitionContext::new(9, 9); // 9 pods (3m/2r), scaling to 6 (3m/1r)
+
+        let result = sm.transition(
+            &ClusterPhase::Running,
+            ClusterEvent::ReplicaScaleDownDetected,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { from, to, .. } => {
+                assert_eq!(from, ClusterPhase::Running);
+                assert_eq!(to, ClusterPhase::RemovingNodesFromCluster);
+            }
+            _ => panic!("Expected successful transition to RemovingNodesFromCluster"),
+        }
+    }
+
+    #[test]
+    fn test_degraded_to_removing_nodes_replica_scale_down() {
+        let sm = ClusterStateMachine::new();
+        let ctx = TransitionContext::new(7, 9); // 7/9 pods ready, scaling down
+
+        let result = sm.transition(
+            &ClusterPhase::Degraded,
+            ClusterEvent::ReplicaScaleDownDetected,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { from, to, .. } => {
+                assert_eq!(from, ClusterPhase::Degraded);
+                assert_eq!(to, ClusterPhase::RemovingNodesFromCluster);
+            }
+            _ => panic!("Expected successful transition from Degraded to RemovingNodesFromCluster"),
+        }
+    }
+
+    #[test]
+    fn test_replica_scale_down_path() {
+        let sm = ClusterStateMachine::new();
+        let ctx = TransitionContext::new(6, 6);
+
+        // Running -> RemovingNodesFromCluster (via ReplicaScaleDownDetected)
+        let result = sm.transition(
+            &ClusterPhase::Running,
+            ClusterEvent::ReplicaScaleDownDetected,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { to, .. } => {
+                assert_eq!(to, ClusterPhase::RemovingNodesFromCluster)
+            }
+            _ => panic!("Expected transition to RemovingNodesFromCluster"),
+        }
+
+        // RemovingNodesFromCluster -> ScalingDownStatefulSet
+        let result = sm.transition(
+            &ClusterPhase::RemovingNodesFromCluster,
+            ClusterEvent::PhaseComplete,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { to, .. } => {
+                assert_eq!(to, ClusterPhase::ScalingDownStatefulSet)
+            }
+            _ => panic!("Expected transition to ScalingDownStatefulSet"),
+        }
+
+        // ScalingDownStatefulSet -> VerifyingClusterHealth
+        let result = sm.transition(
+            &ClusterPhase::ScalingDownStatefulSet,
+            ClusterEvent::PhaseComplete,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { to, .. } => {
+                assert_eq!(to, ClusterPhase::VerifyingClusterHealth)
+            }
+            _ => panic!("Expected transition to VerifyingClusterHealth"),
+        }
+
+        // VerifyingClusterHealth -> Running
+        let result = sm.transition(
+            &ClusterPhase::VerifyingClusterHealth,
+            ClusterEvent::ClusterHealthy,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { to, .. } => assert_eq!(to, ClusterPhase::Running),
+            _ => panic!("Expected transition to Running"),
+        }
     }
 }

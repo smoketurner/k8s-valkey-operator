@@ -138,6 +138,47 @@ fn test_replica_change_sequence() {
     assert_eq!(state.running_pods, 3); // 3 masters only
 }
 
+/// Test replica-only scale-down uses the correct path.
+/// Should skip EvacuatingSlots since replicas don't hold slots.
+#[test]
+fn test_replica_scale_down_path() {
+    let mut state = MockClusterState::running("replica-scale-down", 3, 2);
+    assert_eq!(state.running_pods, 9); // 3 masters + 6 replicas
+
+    // Remove replicas: 3m/2r → 3m/1r
+    state.set_scale_down(3, 1);
+    let phases = state.run_until_running(20);
+
+    // Verify the correct path was taken (skipping EvacuatingSlots)
+    assert_eq!(phases, expected_sequences::replica_scale_down());
+    assert_eq!(state.running_pods, 6); // 3 masters + 3 replicas
+    assert_eq!(state.current_masters, 3); // Masters unchanged
+}
+
+/// Test replica scale-down from degraded state.
+#[test]
+fn test_replica_scale_down_from_degraded() {
+    let mut state = MockClusterState::degraded("replica-down-degraded", 3, 2, 7);
+
+    // While degraded, request replica scale-down: 3m/2r → 3m/1r
+    state.set_scale_down(3, 1);
+
+    // Apply ReplicaScaleDownDetected from Degraded
+    let result = state.apply_event(ClusterEvent::ReplicaScaleDownDetected);
+    match result {
+        TransitionResult::Success { to, .. } => {
+            assert_eq!(to, ClusterPhase::RemovingNodesFromCluster);
+        }
+        _ => panic!("Expected transition to RemovingNodesFromCluster"),
+    }
+
+    // Complete the scale-down
+    state.simulate_cluster_healthy();
+    state.run_until_running(20);
+    assert_eq!(state.phase, ClusterPhase::Running);
+    assert_eq!(state.running_pods, 6);
+}
+
 /// Test combined master and replica changes.
 #[test]
 fn test_combined_master_and_replica_changes() {

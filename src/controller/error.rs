@@ -39,6 +39,22 @@ pub enum Error {
     /// Timeout error
     #[error("Timeout: {0}")]
     Timeout(String),
+
+    /// Operation lock conflict - another operation holds the lock
+    #[error("Operation blocked: {current_holder} operation is in progress")]
+    OperationLocked { current_holder: String },
+
+    /// Quorum check failed - not enough nodes reachable
+    #[error("Insufficient quorum: {reachable} nodes reachable, need {required}")]
+    InsufficientQuorum { reachable: i32, required: i32 },
+
+    /// CLUSTER FORGET quorum failed
+    #[error("CLUSTER FORGET failed to reach quorum: {successes}/{required} nodes acknowledged")]
+    ForgetQuorumFailed { successes: i32, required: i32 },
+
+    /// Failover verification failed
+    #[error("Failover verification timed out after {elapsed_secs}s")]
+    FailoverVerificationTimeout { elapsed_secs: u64 },
 }
 
 impl Error {
@@ -61,6 +77,12 @@ impl Error {
             Error::Valkey(_) | Error::Timeout(_) => true, // Valkey errors are typically transient
             Error::Validation(_) | Error::Permanent(_) | Error::MissingField(_) => false,
             Error::Serialization(_) => false,
+            // Lock contention is transient - can retry after lock is released
+            Error::OperationLocked { .. } => true,
+            // Quorum errors are permanent - require manual intervention
+            Error::InsufficientQuorum { .. } | Error::ForgetQuorumFailed { .. } => false,
+            // Failover verification timeout requires investigation
+            Error::FailoverVerificationTimeout { .. } => false,
         }
     }
 
@@ -251,6 +273,50 @@ mod tests {
         assert_eq!(error.to_string(), "Timeout: operation exceeded 30s");
     }
 
+    #[test]
+    fn test_error_display_operation_locked() {
+        let error = Error::OperationLocked {
+            current_holder: "scaling".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Operation blocked: scaling operation is in progress"
+        );
+    }
+
+    #[test]
+    fn test_error_display_insufficient_quorum() {
+        let error = Error::InsufficientQuorum {
+            reachable: 1,
+            required: 2,
+        };
+        assert_eq!(
+            error.to_string(),
+            "Insufficient quorum: 1 nodes reachable, need 2"
+        );
+    }
+
+    #[test]
+    fn test_error_display_forget_quorum_failed() {
+        let error = Error::ForgetQuorumFailed {
+            successes: 1,
+            required: 2,
+        };
+        assert_eq!(
+            error.to_string(),
+            "CLUSTER FORGET failed to reach quorum: 1/2 nodes acknowledged"
+        );
+    }
+
+    #[test]
+    fn test_error_display_failover_verification_timeout() {
+        let error = Error::FailoverVerificationTimeout { elapsed_secs: 60 };
+        assert_eq!(
+            error.to_string(),
+            "Failover verification timed out after 60s"
+        );
+    }
+
     // ==========================================================================
     // Error classification comprehensive tests
     // ==========================================================================
@@ -265,6 +331,36 @@ mod tests {
             (Error::Validation("test".to_string()), false, false),
             (Error::Permanent("test".to_string()), false, false),
             (Error::MissingField("test".to_string()), false, false),
+            // Operation lock is retryable (can retry after lock released)
+            (
+                Error::OperationLocked {
+                    current_holder: "test".to_string(),
+                },
+                true,
+                false,
+            ),
+            // Quorum errors are non-retryable (require intervention)
+            (
+                Error::InsufficientQuorum {
+                    reachable: 1,
+                    required: 2,
+                },
+                false,
+                false,
+            ),
+            (
+                Error::ForgetQuorumFailed {
+                    successes: 1,
+                    required: 2,
+                },
+                false,
+                false,
+            ),
+            (
+                Error::FailoverVerificationTimeout { elapsed_secs: 60 },
+                false,
+                false,
+            ),
         ];
 
         for (error, expected_retryable, expected_not_found) in test_cases {

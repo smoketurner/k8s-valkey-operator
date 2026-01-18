@@ -662,12 +662,84 @@ async fn check_replicas_upgraded(
     shard_index: i32,
 ) -> Result<Action, Error> {
     let name = obj.name_any();
+    let status = obj.status.as_ref();
+
+    // Initialize pod ready tracking if not set
+    let pod_ready_started_at = status.and_then(|s| s.pod_ready_started_at.clone());
+    if pod_ready_started_at.is_none() {
+        let obj_fresh = api.get(&name).await?;
+        let mut new_status = obj_fresh.status.unwrap_or_default();
+        new_status.pod_ready_started_at = Some(Timestamp::now().to_string());
+        new_status.pod_ready_elapsed_seconds = Some(0);
+        update_status(api, &name, new_status).await?;
+        return Ok(Action::requeue(Duration::from_secs(1)));
+    }
+
+    // Check for pod ready timeout
+    let pod_ready_timeout = obj.spec.pod_ready_timeout_seconds;
+    if let Some(started_at_str) = &pod_ready_started_at
+        && let Ok(started_at) = Timestamp::from_str(started_at_str)
+    {
+        let elapsed = Timestamp::now().duration_since(started_at).as_secs() as u64;
+
+        // Update elapsed time in status
+        let obj_fresh = api.get(&name).await?;
+        let mut new_status = obj_fresh.status.unwrap_or_default();
+        new_status.pod_ready_elapsed_seconds = Some(elapsed);
+        update_status(api, &name, new_status).await?;
+
+        if elapsed > pod_ready_timeout {
+            warn!(
+                name = %name,
+                shard = shard_index,
+                elapsed_secs = elapsed,
+                timeout_secs = pod_ready_timeout,
+                "Pod ready timeout exceeded, initiating rollback"
+            );
+            ctx.publish_upgrade_event(
+                obj,
+                "PodReadyTimeout",
+                "Upgrading",
+                Some(format!(
+                    "Shard {} pods not ready after {}s (timeout: {}s). Initiating rollback.",
+                    shard_index, elapsed, pod_ready_timeout
+                )),
+            )
+            .await;
+
+            // Transition to RollingBack phase
+            let obj_fresh = api.get(&name).await?;
+            let mut new_status = obj_fresh.status.unwrap_or_default();
+            new_status.phase = UpgradePhase::RollingBack;
+            new_status.error_message = Some(format!(
+                "Pod ready timeout exceeded for shard {} after {}s",
+                shard_index, elapsed
+            ));
+            new_status.conditions = compute_upgrade_conditions(
+                UpgradePhase::RollingBack,
+                new_status.total_shards,
+                new_status.upgraded_shards,
+                new_status.failed_shards,
+                new_status.error_message.as_deref(),
+                obj.metadata.generation,
+            );
+            update_status(api, &name, new_status).await?;
+
+            return Ok(Action::requeue(Duration::from_secs(5)));
+        }
+    }
 
     // Get replica pod names for this shard
     let replica_pods = replica_pod_dns_names_for_master(cluster, shard_index);
 
     if replica_pods.is_empty() {
         // No replicas, proceed to failover
+        // Clear pod ready tracking
+        let obj_fresh = api.get(&name).await?;
+        let mut new_status = obj_fresh.status.unwrap_or_default();
+        new_status.pod_ready_started_at = None;
+        new_status.pod_ready_elapsed_seconds = None;
+        update_status(api, &name, new_status).await?;
         update_shard_status(api, &name, shard_index, ShardUpgradeState::WaitingForSync).await?;
         return Ok(Action::requeue(Duration::from_secs(1)));
     }
@@ -725,17 +797,18 @@ async fn check_replicas_upgraded(
     }
 
     info!(name = %name, shard = shard_index, "All replicas upgraded and ready");
-    update_shard_status(api, &name, shard_index, ShardUpgradeState::WaitingForSync).await?;
 
-    // Clear sync tracking from previous shard if any
-    let obj = api.get(&name).await?;
-    if let Some(mut status) = obj.status
-        && status.sync_started_at.is_some()
-    {
-        status.sync_started_at = None;
-        status.sync_elapsed_seconds = None;
-        update_status(api, &name, status).await?;
-    }
+    // Clear pod ready tracking
+    let obj_fresh = api.get(&name).await?;
+    let mut new_status = obj_fresh.status.unwrap_or_default();
+    new_status.pod_ready_started_at = None;
+    new_status.pod_ready_elapsed_seconds = None;
+    // Also clear sync tracking from previous shard if any
+    new_status.sync_started_at = None;
+    new_status.sync_elapsed_seconds = None;
+    update_status(api, &name, new_status).await?;
+
+    update_shard_status(api, &name, shard_index, ShardUpgradeState::WaitingForSync).await?;
 
     Ok(Action::requeue(Duration::from_secs(1)))
 }
@@ -1163,13 +1236,28 @@ async fn execute_failover(
             let _ = client.close().await;
 
             if !failover_verified {
-                // Failover not verified - this is a warning but we'll proceed
-                // The cluster should still be functional, but we log the concern
-                warn!(
+                // Failover not verified - this is an error, not just a warning
+                // Proceeding without verified failover risks data loss if we delete the wrong pod
+                let error_msg = format!(
+                    "Failover verification failed for shard {} after {}s. Cannot proceed without confirmed failover to avoid data loss.",
+                    shard_index,
+                    FAILOVER_VERIFY_TIMEOUT.as_secs()
+                );
+                error!(
                     name = %name,
                     shard = shard_index,
-                    "Failover verification incomplete - upgrade may proceed with risk"
+                    "Failover verification failed - cannot safely proceed"
                 );
+                ctx.publish_upgrade_event(
+                    obj,
+                    "FailoverVerificationFailed",
+                    "Upgrading",
+                    Some(error_msg.clone()),
+                )
+                .await;
+                return Err(Error::FailoverVerificationTimeout {
+                    elapsed_secs: FAILOVER_VERIFY_TIMEOUT.as_secs(),
+                });
             }
 
             // Update shard status with promoted replica
@@ -1834,6 +1922,15 @@ async fn validate_upgrade_spec(
             "Cluster '{}' must be in Running state before upgrade can proceed, but it is currently in {} phase. Wait for the cluster to become healthy or check cluster status for issues.",
             cluster.name_any(),
             cluster_phase
+        )));
+    }
+
+    // Upgrades require at least 1 replica per master for safe failover
+    // Without replicas, failover cannot be performed and data loss is possible
+    if cluster.spec.replicas_per_master < 1 {
+        return Err(Error::Validation(format!(
+            "Cannot upgrade cluster '{}' with 0 replicas per master. Upgrades require failover which needs at least 1 replica per master to avoid data loss. Increase replicasPerMaster to at least 1 before upgrading.",
+            cluster.name_any()
         )));
     }
 
@@ -2519,6 +2616,7 @@ mod tests {
             },
             target_version: target_version.to_string(),
             replication_sync_timeout_seconds: 300,
+            pod_ready_timeout_seconds: 600,
         }
     }
 
@@ -2602,6 +2700,22 @@ mod tests {
         let cluster = create_test_cluster("test", ClusterPhase::ScalingUpStatefulSet);
         let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_upgrade_spec_zero_replicas() {
+        let spec = create_test_upgrade_spec("9");
+        // Create cluster with zero replicas
+        let mut cluster = create_test_cluster("test", ClusterPhase::Running);
+        cluster.spec.replicas_per_master = 0;
+        let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("0 replicas per master")
+        );
     }
 
     // ==========================================================================
@@ -3032,6 +3146,7 @@ mod upgrade_reconciler_function_tests {
             },
             target_version: target_version.to_string(),
             replication_sync_timeout_seconds: 300,
+            pod_ready_timeout_seconds: 600,
         }
     }
 }

@@ -214,7 +214,7 @@ fn test_scale_down_9_to_3_masters() {
 }
 
 /// Test removing replicas (3m/2r → 3m/1r).
-/// This follows the scale-down path since the StatefulSet needs fewer pods.
+/// This follows the replica scale-down path (skips EvacuatingSlots since replicas don't hold slots).
 #[test]
 fn test_remove_replicas() {
     let mut state = MockClusterState::running("remove-replicas", 3, 2);
@@ -224,8 +224,8 @@ fn test_remove_replicas() {
 
     let phases = state.run_until_running(20);
 
-    // Removing replicas follows the scale-down path
-    assert_eq!(phases, expected_sequences::scale_down());
+    // Removing replicas follows the replica scale-down path (no slot evacuation needed)
+    assert_eq!(phases, expected_sequences::replica_scale_down());
     assert_eq!(state.phase, ClusterPhase::Running);
     assert_eq!(state.running_pods, 6); // 3 masters + 3 replicas
 }
@@ -240,8 +240,8 @@ fn test_remove_all_replicas() {
 
     let phases = state.run_until_running(20);
 
-    // Removing replicas follows the scale-down path
-    assert_eq!(phases, expected_sequences::scale_down());
+    // Removing replicas follows the replica scale-down path (no slot evacuation needed)
+    assert_eq!(phases, expected_sequences::replica_scale_down());
     assert_eq!(state.phase, ClusterPhase::Running);
     assert_eq!(state.running_pods, 3); // 3 masters, 0 replicas
 }

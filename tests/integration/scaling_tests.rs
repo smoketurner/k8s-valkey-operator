@@ -204,6 +204,85 @@ async fn test_scale_up_replicas() {
     );
 }
 
+/// Test scaling down replicas per master.
+/// Verifies replica removal uses the optimized path (skipping slot evacuation).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Kubernetes cluster with operator running"]
+async fn test_scale_down_replicas() {
+    let (cluster, _permit) = init_test().await;
+    let client = cluster.new_client().await.expect("create client");
+    let test_ns = TestNamespace::create(client.clone(), "scale-down-replicas").await;
+    let _operator = ScopedOperator::start(client.clone(), test_ns.name()).await;
+    let ns_name = test_ns.name().to_string();
+    create_auth_secret(client.clone(), &ns_name).await;
+
+    let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
+
+    // Create resource with 3 masters and 1 replica per master = 6 total pods
+    let resource = test_cluster_with_config("scale-down-replicas-test", 3, 1);
+    api.create(&PostParams::default(), &resource)
+        .await
+        .expect("Failed to create ValkeyCluster");
+
+    // Wait for initial deployment
+    wait_for_operational(&api, "scale-down-replicas-test", LONG_TIMEOUT)
+        .await
+        .expect("Resource should become operational");
+
+    // Verify initial state: 6 pods (3 masters + 3 replicas)
+    let initial_pods = total_pods(3, 1);
+    assert_statefulset_replicas(
+        client.clone(),
+        &ns_name,
+        "scale-down-replicas-test",
+        initial_pods,
+    )
+    .await;
+
+    // Scale down to 0 replicas per master (3 total pods)
+    let patch = serde_json::json!({
+        "spec": {
+            "replicasPerMaster": 0
+        }
+    });
+    api.patch(
+        "scale-down-replicas-test",
+        &PatchParams::default(),
+        &Patch::Merge(&patch),
+    )
+    .await
+    .expect("Failed to remove replicas");
+
+    // Wait for resource to be operational again after removing replicas
+    // The operator will go through RemovingNodesFromCluster → ScalingDownStatefulSet
+    // (skipping EvacuatingSlots since replicas don't hold slots)
+    wait_for_operational(&api, "scale-down-replicas-test", LONG_TIMEOUT)
+        .await
+        .expect("Resource should become operational after removing replicas");
+
+    // Verify statefulset has 3 pods (3 masters + 0 replicas)
+    let expected_pods = total_pods(3, 0);
+    assert_statefulset_replicas(
+        client.clone(),
+        &ns_name,
+        "scale-down-replicas-test",
+        expected_pods,
+    )
+    .await;
+
+    // Verify ValkeyCluster status
+    let resource = api
+        .get("scale-down-replicas-test")
+        .await
+        .expect("Should get resource");
+    let status = resource.status.expect("Should have status");
+    assert_eq!(
+        status.ready_replicas, expected_pods,
+        "Should have {} ready replicas",
+        expected_pods
+    );
+}
+
 /// Test that a ValkeyCluster enters Degraded state when replicas are unhealthy.
 ///
 /// Note: This test requires the ability to make pods unhealthy.

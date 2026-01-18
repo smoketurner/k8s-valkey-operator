@@ -107,6 +107,10 @@ The ValkeyCluster lifecycle is managed through a formal FSM with explicit state 
                            └──────────────────────┘
 ```
 
+**Note:** The diagram above shows the primary paths. Additionally:
+- **Replica-only scale-down** has a direct path: `Running` → `RemovingNodesFromCluster` (via `ReplicaScaleDownDetected`), skipping `EvacuatingSlots` since replicas don't hold slots.
+- **Deletion** can occur from any phase (except `Deleting`) via `DeletionRequested`.
+
 ### Events
 
 | Event | Description |
@@ -118,12 +122,16 @@ The ValkeyCluster lifecycle is managed through a formal FSM with explicit state 
 | `SlotsAssigned` | Hash slots assigned to masters |
 | `ReplicasConfigured` | Replicas connected to masters via CLUSTER REPLICATE |
 | `SpecChanged` | Resource spec has changed |
+| `ScaleUpDetected` | Scale-up detected (masters increased) |
+| `ScaleDownDetected` | Scale-down detected (masters decreased) |
+| `ReplicaScaleDownDetected` | Replica-only scale-down detected (masters unchanged, replicas decreased) |
 | `StatefulSetScaled` | StatefulSet replica count updated |
 | `NodesAdded` | New nodes added via CLUSTER MEET |
 | `SlotsRebalanced` | Hash slots migrated to new masters |
 | `SlotsMigrated` | Slots evacuated from nodes being removed |
 | `NodesRemoved` | Nodes removed via CLUSTER FORGET |
 | `ClusterHealthy` | Cluster health verification passed |
+| `ReplicasDegraded` | Cluster degraded (0 < ready < desired) |
 | `ReconcileError` | Error occurred during reconciliation |
 | `DeletionRequested` | Deletion timestamp set on resource |
 | `RecoveryInitiated` | Recovery from failed state started |
@@ -139,9 +147,9 @@ Some transitions have guard conditions:
 | `* → Degraded` | `0 < ready_replicas < desired_replicas` |
 | `Degraded → Running` | `ready_replicas >= desired_replicas` |
 
-### Scale-Up Flow
+### Scale-Up Flow (Masters)
 
-1. `Running` → `ScalingUpStatefulSet` (SpecChanged with increased masters)
+1. `Running` → `ScalingUpStatefulSet` (ScaleUpDetected with increased masters)
 2. `ScalingUpStatefulSet` → `WaitingForNewPods` (StatefulSetScaled)
 3. `WaitingForNewPods` → `AddingNodesToCluster` (PodsRunning)
 4. `AddingNodesToCluster` → `RebalancingSlots` (NodesAdded)
@@ -149,13 +157,46 @@ Some transitions have guard conditions:
 6. `ConfiguringNewReplicas` → `VerifyingClusterHealth` (ReplicasConfigured)
 7. `VerifyingClusterHealth` → `Running` (ClusterHealthy)
 
-### Scale-Down Flow
+### Replica-Only Scale-Up Flow
 
-1. `Running` → `EvacuatingSlots` (SpecChanged with decreased masters)
+When only replicas are being added (masters unchanged), the flow reuses the scale-up path but slot rebalancing is a no-op:
+
+1. `Running` → `ScalingUpStatefulSet` (ScaleUpDetected with increased replicas)
+2. `ScalingUpStatefulSet` → `WaitingForNewPods` (StatefulSetScaled)
+3. `WaitingForNewPods` → `AddingNodesToCluster` (PodsRunning)
+4. `AddingNodesToCluster` → `RebalancingSlots` (NodesAdded)
+5. `RebalancingSlots` → `ConfiguringNewReplicas` (SlotsRebalanced - no-op, no new masters)
+6. `ConfiguringNewReplicas` → `VerifyingClusterHealth` (ReplicasConfigured)
+7. `VerifyingClusterHealth` → `Running` (ClusterHealthy)
+
+### Scale-Down Flow (Masters)
+
+1. `Running` → `EvacuatingSlots` (ScaleDownDetected with decreased masters)
 2. `EvacuatingSlots` → `RemovingNodesFromCluster` (SlotsMigrated)
 3. `RemovingNodesFromCluster` → `ScalingDownStatefulSet` (NodesRemoved)
 4. `ScalingDownStatefulSet` → `VerifyingClusterHealth` (StatefulSetScaled)
 5. `VerifyingClusterHealth` → `Running` (ClusterHealthy)
+
+### Replica-Only Scale-Down Flow
+
+When only replicas are being removed (masters unchanged), the flow skips slot evacuation since replicas don't hold slots:
+
+1. `Running` → `RemovingNodesFromCluster` (ReplicaScaleDownDetected)
+2. `RemovingNodesFromCluster` → `ScalingDownStatefulSet` (NodesRemoved)
+3. `ScalingDownStatefulSet` → `VerifyingClusterHealth` (StatefulSetScaled)
+4. `VerifyingClusterHealth` → `Running` (ClusterHealthy)
+
+```
+┌─────────┐  ReplicaScaleDownDetected  ┌───────────────────────────┐
+│ Running │ ──────────────────────────►│ RemovingNodesFromCluster  │
+└─────────┘                            └───────────────────────────┘
+     ▲                                             │
+     │                                      NodesRemoved
+     │                                             ▼
+     │  ClusterHealthy  ┌───────────────────────┐  StatefulSetScaled  ┌─────────────────────────┐
+     └──────────────────│VerifyingClusterHealth │◄────────────────────│ ScalingDownStatefulSet  │
+                        └───────────────────────┘                     └─────────────────────────┘
+```
 
 ### Initial Creation Flow
 

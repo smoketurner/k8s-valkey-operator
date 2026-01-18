@@ -324,6 +324,7 @@ impl ValkeyUpgradeBuilder {
                 },
                 target_version: self.target_version,
                 replication_sync_timeout_seconds: self.replication_sync_timeout.unwrap_or(300),
+                pod_ready_timeout_seconds: 600,
             },
             status: None,
         }

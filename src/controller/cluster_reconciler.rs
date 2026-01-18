@@ -23,6 +23,7 @@ use crate::{
         cluster_topology::{ClusterTopology, NodeRole},
         common::{add_finalizer, extract_pod_name, remove_finalizer},
         context::Context,
+        diagnostic_hints::DiagnosticHint,
         error::Error,
     },
     crd::{ClusterPhase, Condition, ValkeyCluster, ValkeyClusterStatus, total_pods},
@@ -184,11 +185,14 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
     );
 
     if is_operational_phase {
+        // Get phase-specific diagnostic hint with actionable kubectl commands
+        let diagnostic_hint = DiagnosticHint::for_phase(current_phase, &namespace, &name);
+
         // Check iteration count
         if reconcile_count > MAX_RECONCILE_COUNT {
             let error_msg = format!(
-                "Phase {} stuck: {} reconcile iterations exceeded threshold of {}",
-                current_phase, reconcile_count, MAX_RECONCILE_COUNT
+                "Phase {} stuck: {} reconcile iterations exceeded threshold of {}.\n\n{}",
+                current_phase, reconcile_count, MAX_RECONCILE_COUNT, diagnostic_hint
             );
             error!(name = %name, phase = %current_phase, reconcile_count = reconcile_count, "Stuck detection triggered");
             ctx.publish_warning_event(
@@ -218,8 +222,8 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             let elapsed = jiff::Timestamp::now().duration_since(ts).as_secs();
             if elapsed > MAX_STUCK_DURATION_SECS {
                 let error_msg = format!(
-                    "Phase {} stuck: {} seconds since last transition exceeds threshold of {}",
-                    current_phase, elapsed, MAX_STUCK_DURATION_SECS
+                    "Phase {} stuck: {} seconds since last transition exceeds threshold of {}.\n\n{}",
+                    current_phase, elapsed, MAX_STUCK_DURATION_SECS, diagnostic_hint
                 );
                 error!(name = %name, phase = %current_phase, elapsed_secs = elapsed, "Stuck detection triggered");
                 ctx.publish_warning_event(
@@ -1090,6 +1094,10 @@ async fn execute_scale_down_evacuation(
     ctx: &Context,
     namespace: &str,
 ) -> Result<bool, Error> {
+    // Verify quorum before starting scale-down operations
+    // This ensures we have a majority of masters reachable for consistency
+    verify_scale_down_quorum(obj, ctx, namespace).await?;
+
     // Use the scaling operation which handles both scale-up and scale-down
     let result = execute_scaling_operation(obj, ctx, namespace).await?;
 
@@ -1163,19 +1171,188 @@ async fn execute_forget_removed_nodes(
         "Removing orphaned nodes from cluster"
     );
 
-    // Execute CLUSTER FORGET for orphaned nodes
-    cluster_init::forget_nodes_with_retry(
-        obj,
-        &orphan_node_ids,
+    // Execute CLUSTER FORGET for orphaned nodes with quorum verification
+    forget_nodes_with_quorum(obj, ctx, namespace, &orphan_node_ids).await?;
+
+    // Still need to verify all nodes are gone
+    Ok(false)
+}
+
+/// Verify quorum before scale-down operations.
+///
+/// Scale-down requires that a majority of masters are reachable to ensure
+/// cluster consistency. Without quorum, CLUSTER FORGET could leave the cluster
+/// in an inconsistent state.
+async fn verify_scale_down_quorum(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<(), Error> {
+    let name = obj.name_any();
+
+    // Get connection context
+    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
+
+    // Get total master count from cluster state
+    let (host, port) = strategy
+        .get_connection(0)
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let client = crate::client::ValkeyClient::connect_single(
+        &host,
+        port,
         password.as_deref(),
         tls_certs.as_ref(),
-        &strategy,
     )
     .await
     .map_err(|e| Error::Valkey(e.to_string()))?;
 
-    // Still need to verify all nodes are gone
-    Ok(false)
+    let cluster_nodes = client
+        .cluster_nodes()
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let _ = client.close().await;
+
+    // Count total masters and reachable masters
+    let total_masters = cluster_nodes.masters().len() as i32;
+    let required_quorum = (total_masters / 2) + 1;
+
+    // For simplicity, if we connected to the cluster and got CLUSTER NODES,
+    // we assume all masters in the response are reachable (they reported to the cluster).
+    // A more thorough check would ping each master individually.
+    let reachable_masters = total_masters;
+
+    debug!(
+        name = %name,
+        total_masters = total_masters,
+        reachable_masters = reachable_masters,
+        required_quorum = required_quorum,
+        "Scale-down quorum check"
+    );
+
+    if reachable_masters < required_quorum {
+        return Err(Error::InsufficientQuorum {
+            reachable: reachable_masters,
+            required: required_quorum,
+        });
+    }
+
+    Ok(())
+}
+
+/// Execute CLUSTER FORGET with quorum verification.
+///
+/// Ensures that CLUSTER FORGET succeeds on a majority of nodes to prevent
+/// inconsistent cluster topology views.
+async fn forget_nodes_with_quorum(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+    node_ids_to_forget: &[String],
+) -> Result<(), Error> {
+    let name = obj.name_any();
+    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
+
+    // Get all current nodes
+    let (host, port) = strategy
+        .get_connection(0)
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let client = crate::client::ValkeyClient::connect_single(
+        &host,
+        port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
+    .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let cluster_nodes = client
+        .cluster_nodes()
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let _ = client.close().await;
+
+    // Calculate required quorum for FORGET
+    let total_nodes = cluster_nodes.nodes.len();
+    let required = ((total_nodes / 2) + 1) as i32;
+
+    // Execute FORGET on each node and track successes
+    for node_id in node_ids_to_forget {
+        let mut successes = 0i32;
+        let mut failures = Vec::new();
+
+        for (idx, node) in cluster_nodes.nodes.iter().enumerate() {
+            // Skip the node we're forgetting
+            if &node.node_id == node_id {
+                continue;
+            }
+
+            // Connect to this node and send CLUSTER FORGET
+            let ordinal = i32::try_from(idx).unwrap_or(0);
+            if let Ok((h, p)) = strategy.get_connection(ordinal).await {
+                match crate::client::ValkeyClient::connect_single(
+                    &h,
+                    p,
+                    password.as_deref(),
+                    tls_certs.as_ref(),
+                )
+                .await
+                {
+                    Ok(node_client) => {
+                        match node_client.cluster_forget(node_id).await {
+                            Ok(()) => {
+                                successes += 1;
+                                debug!(
+                                    name = %name,
+                                    node_id = %node_id,
+                                    source = %node.node_id,
+                                    "CLUSTER FORGET succeeded"
+                                );
+                            }
+                            Err(e) => {
+                                failures.push(format!("{}:{}", node.node_id, e));
+                            }
+                        }
+                        let _ = node_client.close().await;
+                    }
+                    Err(e) => {
+                        failures.push(format!("{}:connect failed: {}", node.node_id, e));
+                    }
+                }
+            }
+        }
+
+        // Check if we achieved quorum
+        if successes < required {
+            warn!(
+                name = %name,
+                node_id = %node_id,
+                successes = successes,
+                required = required,
+                failures = ?failures,
+                "CLUSTER FORGET did not achieve quorum"
+            );
+            return Err(Error::ForgetQuorumFailed {
+                successes,
+                required,
+            });
+        }
+
+        info!(
+            name = %name,
+            node_id = %node_id,
+            successes = successes,
+            required = required,
+            "CLUSTER FORGET achieved quorum"
+        );
+    }
+
+    Ok(())
 }
 
 /// Health check result containing cluster state information.

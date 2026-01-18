@@ -522,14 +522,36 @@ pub async fn handle_running(
         _ => {}
     }
 
-    // Check for replica count changes
+    // Check for replica count changes (masters unchanged)
     let desired_replicas = phase_ctx.desired_replicas();
     if phase_ctx.running_pods != desired_replicas && phase_ctx.current_masters > 0 {
+        if phase_ctx.running_pods > desired_replicas {
+            // Replica scale-DOWN: go directly to node removal (skip slot evacuation)
+            // Replicas don't hold slots, so EvacuatingSlots is unnecessary
+            debug!(
+                name = %name,
+                running = phase_ctx.running_pods,
+                desired = desired_replicas,
+                "Replica scale-down detected"
+            );
+            ctx.publish_normal_event(
+                obj,
+                "ReplicaScaleDownDetected",
+                "Running",
+                Some(format!(
+                    "Scaling down replicas from {} to {} pods",
+                    phase_ctx.running_pods, desired_replicas
+                )),
+            )
+            .await;
+            return Ok(ClusterPhase::RemovingNodesFromCluster.into());
+        }
+        // Replica scale-UP: existing path
         debug!(
             name = %name,
             running = phase_ctx.running_pods,
             desired = desired_replicas,
-            "Replica count change detected"
+            "Replica scale-up detected"
         );
         return Ok(ClusterPhase::ScalingUpStatefulSet.into());
     }
@@ -1041,7 +1063,12 @@ pub async fn handle_degraded(
             Ordering::Less => {
                 return Ok(ClusterPhase::EvacuatingSlots.into());
             }
-            Ordering::Equal => {}
+            Ordering::Equal => {
+                // Check for replica-only scale-down (masters unchanged)
+                if phase_ctx.running_pods > desired_replicas {
+                    return Ok(ClusterPhase::RemovingNodesFromCluster.into());
+                }
+            }
         }
     }
 

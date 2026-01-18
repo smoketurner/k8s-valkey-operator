@@ -388,6 +388,15 @@ impl MockClusterState {
     /// - `PhaseContext::scale_direction()` for scale detection (production code)
     /// - `determine_event` for replica-status-driven events (production code)
     /// - Phase-specific knowledge for phase-driven events (matches state machine design)
+    ///
+    /// **IMPORTANT: Keep in sync with production code!**
+    ///
+    /// The scale detection logic here must mirror the detection logic in:
+    /// - `cluster_phases.rs:handle_running()` - Running state scale detection
+    /// - `cluster_phases.rs:handle_degraded()` - Degraded state scale detection
+    ///
+    /// When adding new events or changing detection logic in production,
+    /// update this function accordingly. See CLAUDE.md for details.
     fn determine_next_event(&self) -> ClusterEvent {
         // For Running and Degraded phases, use production scale_direction() for scale detection
         match self.phase {
@@ -399,13 +408,15 @@ impl MockClusterState {
                     ScaleDirection::Down => return ClusterEvent::ScaleDownDetected,
                     ScaleDirection::ReplicaChange => {
                         // Replica change without master change - determine direction by pod count
-                        // This follows the same scale path as master changes
                         let current_pods = self.running_pods;
                         let desired_pods = phase_ctx.desired_replicas();
                         if desired_pods > current_pods {
+                            // Replica scale-UP: uses the scale-up path
                             return ClusterEvent::ScaleUpDetected;
                         } else if desired_pods < current_pods {
-                            return ClusterEvent::ScaleDownDetected;
+                            // Replica scale-DOWN: goes directly to RemovingNodesFromCluster
+                            // (skips EvacuatingSlots since replicas don't hold slots)
+                            return ClusterEvent::ReplicaScaleDownDetected;
                         }
                         // If pods match, fall through to determine_event
                     }
@@ -515,11 +526,23 @@ pub mod expected_sequences {
         ]
     }
 
-    /// Expected phases for scale-down.
+    /// Expected phases for scale-down (masters changing).
     pub fn scale_down() -> Vec<ClusterPhase> {
         vec![
             ClusterPhase::Running,
             ClusterPhase::EvacuatingSlots,
+            ClusterPhase::RemovingNodesFromCluster,
+            ClusterPhase::ScalingDownStatefulSet,
+            ClusterPhase::VerifyingClusterHealth,
+            ClusterPhase::Running,
+        ]
+    }
+
+    /// Expected phases for replica-only scale-down (masters unchanged).
+    /// Skips EvacuatingSlots since replicas don't hold slots.
+    pub fn replica_scale_down() -> Vec<ClusterPhase> {
+        vec![
+            ClusterPhase::Running,
             ClusterPhase::RemovingNodesFromCluster,
             ClusterPhase::ScalingDownStatefulSet,
             ClusterPhase::VerifyingClusterHealth,

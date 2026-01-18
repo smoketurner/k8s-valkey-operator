@@ -53,10 +53,20 @@ pub struct ValkeyUpgradeSpec {
     /// This timeout applies per shard during the upgrade process.
     #[serde(default = "default_replication_sync_timeout")]
     pub replication_sync_timeout_seconds: u64,
+
+    /// Timeout in seconds for waiting for pods to become ready after deletion.
+    /// Defaults to 600 seconds (10 minutes) if not specified.
+    /// If exceeded, the upgrade transitions to RollingBack phase.
+    #[serde(default = "default_pod_ready_timeout")]
+    pub pod_ready_timeout_seconds: u64,
 }
 
 fn default_replication_sync_timeout() -> u64 {
     300 // 5 minutes default
+}
+
+fn default_pod_ready_timeout() -> u64 {
+    600 // 10 minutes default
 }
 
 /// Reference to a ValkeyCluster resource.
@@ -144,6 +154,16 @@ pub struct ValkeyUpgradeStatus {
     /// Updated during WaitingForSync phase to show timeout progress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_elapsed_seconds: Option<u64>,
+
+    /// Timestamp when pod ready check started for the current shard.
+    /// Used to track timeout progress during UpgradingReplicas and UpgradingOldMaster phases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_ready_started_at: Option<String>,
+
+    /// Elapsed time in seconds since pod ready check started.
+    /// Updated during pod ready wait to show timeout progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_ready_elapsed_seconds: Option<u64>,
 }
 
 fn default_current_shard() -> i32 {
@@ -302,6 +322,7 @@ mod tests {
             },
             target_version: "9.0.1".to_string(),
             replication_sync_timeout_seconds: 300,
+            pod_ready_timeout_seconds: 600,
         };
 
         assert_eq!(spec.cluster_ref.name, "my-cluster");
