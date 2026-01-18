@@ -188,13 +188,15 @@ pub fn is_cluster_ready_for_operation(cluster: &ValkeyCluster, operation: Operat
 
     match operation {
         OperationType::Initializing => {
-            // Initialization can happen from Pending, Creating, Initializing, AssigningSlots
+            // Initialization can happen from initial creation phases
             matches!(
                 phase,
                 crate::crd::ClusterPhase::Pending
                     | crate::crd::ClusterPhase::Creating
-                    | crate::crd::ClusterPhase::Initializing
+                    | crate::crd::ClusterPhase::WaitingForPods
+                    | crate::crd::ClusterPhase::InitializingCluster
                     | crate::crd::ClusterPhase::AssigningSlots
+                    | crate::crd::ClusterPhase::ConfiguringReplicas
             )
         }
         OperationType::Scaling => {

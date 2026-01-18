@@ -7,6 +7,7 @@
 //! When a `PortForward` goes out of scope, it will automatically stop
 //! the forwarding (RAII pattern).
 
+use crate::controller::cluster_topology::Endpoint;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::ListParams;
 use kube::{Api, Client};
@@ -155,6 +156,11 @@ impl PortForward {
     /// Get the local port that is forwarding to the remote target
     pub fn local_port(&self) -> u16 {
         self.local_port
+    }
+
+    /// Get the local endpoint (127.0.0.1:local_port) for this port forward
+    pub fn local_endpoint(&self) -> Endpoint {
+        Endpoint::new("127.0.0.1", self.local_port)
     }
 
     /// Stop the port-forward
@@ -353,19 +359,19 @@ impl PodPortForwards {
         Ok(Self { forwards })
     }
 
-    /// Get the local address (127.0.0.1:port) for a pod by name
-    pub fn local_address(&self, pod_name: &str) -> Option<(String, u16)> {
+    /// Get the local endpoint (127.0.0.1:port) for a pod by name
+    pub fn local_endpoint(&self, pod_name: &str) -> Option<Endpoint> {
         self.forwards
             .iter()
             .find(|(name, _)| name == pod_name)
-            .map(|(_, pf)| ("127.0.0.1".to_string(), pf.local_port()))
+            .map(|(_, pf)| Endpoint::new("127.0.0.1", pf.local_port()))
     }
 
-    /// Get all local addresses as a map from pod name to (host, port)
-    pub fn all_local_addresses(&self) -> Vec<(String, String, u16)> {
+    /// Get all local endpoints as a map from pod name to Endpoint
+    pub fn all_local_endpoints(&self) -> Vec<(String, Endpoint)> {
         self.forwards
             .iter()
-            .map(|(name, pf)| (name.clone(), "127.0.0.1".to_string(), pf.local_port()))
+            .map(|(name, pf)| (name.clone(), Endpoint::new("127.0.0.1", pf.local_port())))
             .collect()
     }
 

@@ -12,15 +12,20 @@ The ValkeyCluster lifecycle is managed through a formal FSM with explicit state 
 |-------|-------------|
 | `Pending` | Initial state, waiting for reconciliation |
 | `Creating` | Kubernetes resources (StatefulSet, Services, etc.) are being created |
-| `Initializing` | Pods are running, executing `CLUSTER MEET` to form cluster |
+| `WaitingForPods` | Waiting for StatefulSet pods to become Running |
+| `InitializingCluster` | Pods are running, executing `CLUSTER MEET` to form cluster |
 | `AssigningSlots` | Initial hash slot assignment via `CLUSTER ADDSLOTS` |
+| `ConfiguringReplicas` | Setting up replica nodes via `CLUSTER REPLICATE` |
 | `Running` | Cluster is healthy and operational |
-| `DetectingChanges` | Spec changed, analyzing required changes |
-| `ScalingStatefulSet` | Updating StatefulSet replica count |
-| `AddingNodes` | New nodes joining cluster via `CLUSTER MEET` |
-| `MigratingSlots` | Hash slot migration for rebalancing |
-| `RemovingNodes` | Nodes leaving cluster via `CLUSTER FORGET` |
-| `VerifyingCluster` | Health verification after changes |
+| `ScalingUpStatefulSet` | Increasing StatefulSet replica count for scale-up |
+| `WaitingForNewPods` | Waiting for new pods to become Running after scale-up |
+| `AddingNodesToCluster` | New nodes joining cluster via `CLUSTER MEET` |
+| `RebalancingSlots` | Hash slot migration to new masters after scale-up |
+| `ConfiguringNewReplicas` | Setting up replicas for new masters after scale-up |
+| `EvacuatingSlots` | Migrating slots away from nodes before scale-down |
+| `RemovingNodesFromCluster` | Nodes leaving cluster via `CLUSTER FORGET` |
+| `ScalingDownStatefulSet` | Decreasing StatefulSet replica count for scale-down |
+| `VerifyingClusterHealth` | Health verification after changes |
 | `Degraded` | Cluster operational but with reduced capacity |
 | `Failed` | Error state requiring intervention |
 | `Deleting` | Resource deletion in progress (terminal) |
@@ -33,57 +38,73 @@ The ValkeyCluster lifecycle is managed through a formal FSM with explicit state 
                                     │  DeletionRequested (from any state)     │
                                     │                                         │
                                     ▼                                         │
-┌─────────┐  ResourcesApplied   ┌──────────┐  PodsRunning   ┌──────────────┐  │
-│ Pending │────────────────────▶│ Creating │───────────────▶│ Initializing │  │
-└─────────┘                     └──────────┘                └──────────────┘  │
-     │                               │                            │           │
-     │ ReconcileError                │ ReconcileError             │ CLUSTER   │
-     ▼                               ▼                            │ MEET      │
-┌─────────┐◀─────────────────────────────────────────────────────┘           │
-│ Failed  │                          │ ResourcesApplied                       │
-└─────────┘                          ▼                                        │
-     │                         ┌───────────────┐  ClusterHealthy  ┌─────────┐ │
-     │ RecoveryInitiated       │ AssigningSlots│─────────────────▶│ Running │◀┘
-     │                         └───────────────┘                  └─────────┘
-     │                                                                 │
-     └─────────────────────────────▶ Pending                          │ SpecChanged
-                                                                       │
-                                                                       ▼
-                                                              ┌─────────────────┐
-                                                              │ DetectingChanges│
-                                                              └─────────────────┘
-                                                                       │
-                                    ┌──────────────────────────────────┼─────────────────────┐
-                                    │                                  │                     │
-                                    │ ChangesDetected (scale-up)       │ NoChangesNeeded     │ SlotsMigrated (scale-down)
-                                    ▼                                  ▼                     ▼
-                           ┌───────────────────┐              ┌─────────┐            ┌───────────────┐
-                           │ ScalingStatefulSet│              │ Running │            │ MigratingSlots│
-                           └───────────────────┘              └─────────┘            └───────────────┘
-                                    │                                                        │
-                                    │ PodsRunning                                            │ SlotsMigrated
-                                    ▼                                                        ▼
-                           ┌─────────────┐                                          ┌───────────────┐
-                           │ AddingNodes │                                          │ RemovingNodes │
-                           └─────────────┘                                          └───────────────┘
-                                    │                                                        │
-                                    │ NodesAdded                                             │ NodesRemoved
-                                    ▼                                                        ▼
-                           ┌───────────────┐                                        ┌───────────────────┐
-                           │ MigratingSlots│                                        │ ScalingStatefulSet│
-                           └───────────────┘                                        └───────────────────┘
-                                    │                                                        │
-                                    │ ClusterHealthy                                         │ StatefulSetScaled
-                                    ▼                                                        ▼
-                           ┌──────────────────┐  ClusterHealthy                     ┌──────────────────┐
-                           │ VerifyingCluster │─────────────────────────────────────│ VerifyingCluster │
-                           └──────────────────┘                                     └──────────────────┘
-                                    │                                                        │
-                                    │ ClusterHealthy                                         │
-                                    ▼                                                        ▼
-                           ┌─────────┐                                              ┌─────────┐
-                           │ Running │                                              │ Running │
-                           └─────────┘                                              └─────────┘
+┌─────────┐  ResourcesApplied   ┌──────────┐  StatefulSetReady ┌─────────────────┐
+│ Pending │────────────────────▶│ Creating │──────────────────▶│ WaitingForPods  │
+└─────────┘                     └──────────┘                   └─────────────────┘
+     │                               │                                │
+     │ ReconcileError                │ ReconcileError                 │ PodsRunning
+     ▼                               ▼                                ▼
+┌─────────┐◀──────────────────────────────────────────────┐  ┌────────────────────┐
+│ Failed  │                                                  │ InitializingCluster│
+└─────────┘                                                  └────────────────────┘
+     │                                                                │
+     │ RecoveryInitiated                                              │ ClusterMeetComplete
+     │                                                                ▼
+     └───────────────────────────▶ Pending                   ┌───────────────┐
+                                                             │ AssigningSlots│
+                                                             └───────────────┘
+                                                                      │
+                                                                      │ SlotsAssigned
+                                                                      ▼
+                                                           ┌─────────────────────┐
+                                                           │ ConfiguringReplicas │
+                                                           └─────────────────────┘
+                                                                      │
+                                                                      │ ReplicasConfigured
+                                                                      ▼
+                                                           ┌─────────┐
+                                                           │ Running │◀──────────────────────┐
+                                                           └─────────┘                       │
+                                                                │                            │
+                                                                │ SpecChanged                │
+                                                                ▼                            │
+                                      ┌────────────────────────────────────────────┐         │
+                                      │                                            │         │
+                                      │ ScaleUp                         ScaleDown  │         │
+                                      ▼                                            ▼         │
+                           ┌─────────────────────┐                    ┌────────────────┐     │
+                           │ ScalingUpStatefulSet│                    │ EvacuatingSlots│     │
+                           └─────────────────────┘                    └────────────────┘     │
+                                      │                                            │         │
+                                      │ StatefulSetScaled                          │ SlotsMigrated
+                                      ▼                                            ▼         │
+                           ┌──────────────────┐                    ┌─────────────────────────┐
+                           │ WaitingForNewPods│                    │ RemovingNodesFromCluster│
+                           └──────────────────┘                    └─────────────────────────┘
+                                      │                                            │
+                                      │ PodsRunning                                │ NodesRemoved
+                                      ▼                                            ▼
+                           ┌──────────────────────┐                ┌───────────────────────┐
+                           │ AddingNodesToCluster │                │ ScalingDownStatefulSet│
+                           └──────────────────────┘                └───────────────────────┘
+                                      │                                            │
+                                      │ NodesAdded                                 │ StatefulSetScaled
+                                      ▼                                            ▼
+                           ┌─────────────────┐                        ┌──────────────────────┐
+                           │ RebalancingSlots│                        │ VerifyingClusterHealth│
+                           └─────────────────┘                        └──────────────────────┘
+                                      │                                            │
+                                      │ SlotsRebalanced                            │ ClusterHealthy
+                                      ▼                                            │
+                           ┌───────────────────────┐                               │
+                           │ ConfiguringNewReplicas│                               │
+                           └───────────────────────┘                               │
+                                      │                                            │
+                                      │ ReplicasConfigured                         │
+                                      ▼                                            │
+                           ┌──────────────────────┐                                │
+                           │ VerifyingClusterHealth│───────────────────────────────┘
+                           └──────────────────────┘
 ```
 
 ### Events
@@ -91,21 +112,21 @@ The ValkeyCluster lifecycle is managed through a formal FSM with explicit state 
 | Event | Description |
 |-------|-------------|
 | `ResourcesApplied` | Kubernetes resources have been applied |
+| `StatefulSetReady` | StatefulSet created successfully |
 | `PodsRunning` | All desired pods are in Running state |
-| `AllReplicasReady` | All pods are ready (passing readiness probes) |
-| `ReplicasDegraded` | Some pods are ready but not all |
+| `ClusterMeetComplete` | All nodes connected via CLUSTER MEET |
+| `SlotsAssigned` | Hash slots assigned to masters |
+| `ReplicasConfigured` | Replicas connected to masters via CLUSTER REPLICATE |
 | `SpecChanged` | Resource spec has changed |
+| `StatefulSetScaled` | StatefulSet replica count updated |
+| `NodesAdded` | New nodes added via CLUSTER MEET |
+| `SlotsRebalanced` | Hash slots migrated to new masters |
+| `SlotsMigrated` | Slots evacuated from nodes being removed |
+| `NodesRemoved` | Nodes removed via CLUSTER FORGET |
+| `ClusterHealthy` | Cluster health verification passed |
 | `ReconcileError` | Error occurred during reconciliation |
 | `DeletionRequested` | Deletion timestamp set on resource |
 | `RecoveryInitiated` | Recovery from failed state started |
-| `FullyRecovered` | Resource recovered from degraded state |
-| `ChangesDetected` | Scale or config changes detected |
-| `NoChangesNeeded` | No changes required |
-| `StatefulSetScaled` | StatefulSet replica count updated |
-| `NodesAdded` | New nodes added via CLUSTER MEET |
-| `SlotsMigrated` | Hash slots migrated |
-| `NodesRemoved` | Nodes removed via CLUSTER FORGET |
-| `ClusterHealthy` | Cluster health verification passed |
 
 ### Transition Guards
 
@@ -113,27 +134,55 @@ Some transitions have guard conditions:
 
 | Transition | Guard Condition |
 |------------|-----------------|
-| `* → Running` (AllReplicasReady) | `ready_replicas >= desired_replicas` |
-| `* → Degraded` (ReplicasDegraded) | `0 < ready_replicas < desired_replicas` |
-| `Degraded → Running` (FullyRecovered) | `ready_replicas >= desired_replicas` |
+| `WaitingForPods → InitializingCluster` | All pods Running |
+| `* → Running` | Cluster healthy, all slots assigned |
+| `* → Degraded` | `0 < ready_replicas < desired_replicas` |
+| `Degraded → Running` | `ready_replicas >= desired_replicas` |
 
 ### Scale-Up Flow
 
-1. `Running` → `DetectingChanges` (SpecChanged)
-2. `DetectingChanges` → `ScalingStatefulSet` (ChangesDetected)
-3. `ScalingStatefulSet` → `AddingNodes` (PodsRunning)
-4. `AddingNodes` → `MigratingSlots` (NodesAdded)
-5. `MigratingSlots` → `VerifyingCluster` (ClusterHealthy)
-6. `VerifyingCluster` → `Running` (ClusterHealthy)
+1. `Running` → `ScalingUpStatefulSet` (SpecChanged with increased masters)
+2. `ScalingUpStatefulSet` → `WaitingForNewPods` (StatefulSetScaled)
+3. `WaitingForNewPods` → `AddingNodesToCluster` (PodsRunning)
+4. `AddingNodesToCluster` → `RebalancingSlots` (NodesAdded)
+5. `RebalancingSlots` → `ConfiguringNewReplicas` (SlotsRebalanced)
+6. `ConfiguringNewReplicas` → `VerifyingClusterHealth` (ReplicasConfigured)
+7. `VerifyingClusterHealth` → `Running` (ClusterHealthy)
 
 ### Scale-Down Flow
 
-1. `Running` → `DetectingChanges` (SpecChanged)
-2. `DetectingChanges` → `MigratingSlots` (SlotsMigrated - evacuate nodes first)
-3. `MigratingSlots` → `RemovingNodes` (SlotsMigrated)
-4. `RemovingNodes` → `ScalingStatefulSet` (NodesRemoved)
-5. `ScalingStatefulSet` → `VerifyingCluster` (StatefulSetScaled)
-6. `VerifyingCluster` → `Running` (ClusterHealthy)
+1. `Running` → `EvacuatingSlots` (SpecChanged with decreased masters)
+2. `EvacuatingSlots` → `RemovingNodesFromCluster` (SlotsMigrated)
+3. `RemovingNodesFromCluster` → `ScalingDownStatefulSet` (NodesRemoved)
+4. `ScalingDownStatefulSet` → `VerifyingClusterHealth` (StatefulSetScaled)
+5. `VerifyingClusterHealth` → `Running` (ClusterHealthy)
+
+### Initial Creation Flow
+
+1. `Pending` → `Creating` (Reconciliation started)
+2. `Creating` → `WaitingForPods` (StatefulSetReady)
+3. `WaitingForPods` → `InitializingCluster` (PodsRunning)
+4. `InitializingCluster` → `AssigningSlots` (ClusterMeetComplete)
+5. `AssigningSlots` → `ConfiguringReplicas` (SlotsAssigned)
+6. `ConfiguringReplicas` → `Running` (ReplicasConfigured)
+
+---
+
+## ClusterTopology
+
+The operator uses a centralized `ClusterTopology` struct to correlate Kubernetes pod information with Valkey cluster node state. This provides:
+
+- **IP → ordinal mapping**: Look up pod ordinal by IP address
+- **ordinal → node_id mapping**: Find Valkey node ID by pod ordinal
+- **Node role identification**: Determine if a node is master or replica
+- **Orphan detection**: Find cluster nodes with no matching pod
+- **Scale candidate identification**: Identify nodes for promotion or removal
+
+The topology is rebuilt on each reconciliation by querying:
+1. Kubernetes API for current pod state
+2. Valkey CLUSTER NODES for cluster membership
+
+This eliminates scattered mapping logic and fixes bugs where IP address parsing failed (e.g., extracting ordinal "10" from IP "10.0.0.5").
 
 ---
 

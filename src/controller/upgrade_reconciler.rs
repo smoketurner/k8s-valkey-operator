@@ -2599,7 +2599,7 @@ mod tests {
     async fn test_validate_upgrade_spec_cluster_scaling() {
         let spec = create_test_upgrade_spec("9");
         // Test that upgrade is rejected when cluster is in a scaling operation
-        let cluster = create_test_cluster("test", ClusterPhase::ScalingStatefulSet);
+        let cluster = create_test_cluster("test", ClusterPhase::ScalingUpStatefulSet);
         let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
         assert!(result.is_err());
     }

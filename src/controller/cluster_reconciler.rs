@@ -18,11 +18,12 @@ use crate::{
     client::ScalingContext,
     controller::{
         cluster_init,
+        cluster_phases::{self, ClusterHealthResult, PhaseContext},
         cluster_state_machine::ClusterStateMachine,
+        cluster_topology::{ClusterTopology, NodeRole},
         common::{add_finalizer, extract_pod_name, remove_finalizer},
         context::Context,
         error::Error,
-        operation_coordination::{self, OperationType},
     },
     crd::{ClusterPhase, Condition, ValkeyCluster, ValkeyClusterStatus, total_pods},
     resources::{certificate, common, pdb, services, statefulset},
@@ -35,9 +36,15 @@ pub const FIELD_MANAGER: &str = "valkey-operator";
 pub const FINALIZER: &str = "valkey-operator.smoketurner.com/finalizer";
 
 /// Annotation key indicating an upgrade is in progress.
+#[allow(dead_code)] // Used in tests
 const UPGRADE_IN_PROGRESS_ANNOTATION: &str = "valkey-operator.smoketurner.com/upgrade-in-progress";
 
+/// Annotation key storing the name of the active upgrade.
+#[allow(dead_code)] // Used in tests
+const UPGRADE_NAME_ANNOTATION: &str = "valkey-operator.smoketurner.com/upgrade-name";
+
 /// Check if an upgrade is in progress for this cluster.
+#[allow(dead_code)] // Used in tests
 fn is_upgrade_in_progress(cluster: &ValkeyCluster) -> bool {
     cluster
         .metadata
@@ -56,21 +63,39 @@ fn requeue_duration(phase: ClusterPhase) -> std::time::Duration {
     match phase {
         // Running: periodic health check, can be longer
         ClusterPhase::Running => std::time::Duration::from_secs(30),
-        // Active phases: quick requeue to catch state changes
+
+        // Initial creation phases: quick requeue
         ClusterPhase::Creating
-        | ClusterPhase::Initializing
+        | ClusterPhase::WaitingForPods
+        | ClusterPhase::InitializingCluster
         | ClusterPhase::AssigningSlots
-        | ClusterPhase::DetectingChanges
-        | ClusterPhase::ScalingStatefulSet
-        | ClusterPhase::AddingNodes
-        | ClusterPhase::RemovingNodes
-        | ClusterPhase::VerifyingCluster => std::time::Duration::from_secs(2),
-        // Slot migration: moderate interval (migrations take time)
-        ClusterPhase::MigratingSlots => std::time::Duration::from_secs(5),
+        | ClusterPhase::ConfiguringReplicas => std::time::Duration::from_secs(2),
+
+        // Scale-up phases: quick requeue
+        ClusterPhase::ScalingUpStatefulSet
+        | ClusterPhase::WaitingForNewPods
+        | ClusterPhase::AddingNodesToCluster
+        | ClusterPhase::ConfiguringNewReplicas => std::time::Duration::from_secs(2),
+
+        // Scale-down phases: quick requeue
+        ClusterPhase::RemovingNodesFromCluster | ClusterPhase::ScalingDownStatefulSet => {
+            std::time::Duration::from_secs(2)
+        }
+
+        // Slot operations: moderate interval (migrations take time)
+        ClusterPhase::RebalancingSlots | ClusterPhase::EvacuatingSlots => {
+            std::time::Duration::from_secs(5)
+        }
+
+        // Verification: quick requeue
+        ClusterPhase::VerifyingClusterHealth => std::time::Duration::from_secs(2),
+
         // Recovery phases: moderate interval
         ClusterPhase::Degraded => std::time::Duration::from_secs(10),
+
         // Failed: longer interval, needs manual intervention
         ClusterPhase::Failed => std::time::Duration::from_secs(60),
+
         // Pending/Deleting: moderate interval
         ClusterPhase::Pending | ClusterPhase::Deleting => std::time::Duration::from_secs(5),
     }
@@ -138,15 +163,24 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
     // Check for stuck condition (only in non-terminal, non-running phases)
     let is_operational_phase = matches!(
         current_phase,
+        // Initial creation phases
         ClusterPhase::Creating
-            | ClusterPhase::Initializing
+            | ClusterPhase::WaitingForPods
+            | ClusterPhase::InitializingCluster
             | ClusterPhase::AssigningSlots
-            | ClusterPhase::DetectingChanges
-            | ClusterPhase::ScalingStatefulSet
-            | ClusterPhase::AddingNodes
-            | ClusterPhase::MigratingSlots
-            | ClusterPhase::RemovingNodes
-            | ClusterPhase::VerifyingCluster
+            | ClusterPhase::ConfiguringReplicas
+            // Scale-up phases
+            | ClusterPhase::ScalingUpStatefulSet
+            | ClusterPhase::WaitingForNewPods
+            | ClusterPhase::AddingNodesToCluster
+            | ClusterPhase::RebalancingSlots
+            | ClusterPhase::ConfiguringNewReplicas
+            // Scale-down phases
+            | ClusterPhase::EvacuatingSlots
+            | ClusterPhase::RemovingNodesFromCluster
+            | ClusterPhase::ScalingDownStatefulSet
+            // Verification
+            | ClusterPhase::VerifyingClusterHealth
     );
 
     if is_operational_phase {
@@ -210,6 +244,33 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
         }
     }
 
+    // Build phase context for handlers
+    let running_pods = check_running_pods(&obj, &ctx, &namespace)
+        .await
+        .unwrap_or(0);
+    let ready_pods = check_ready_replicas(&obj, &ctx, &namespace)
+        .await
+        .unwrap_or(0);
+    let current_masters = get_current_master_count(&obj, &ctx, &namespace)
+        .await
+        .unwrap_or(0);
+    let nodes_in_cluster = get_nodes_in_cluster_count(&obj, &ctx, &namespace)
+        .await
+        .unwrap_or(0);
+
+    let phase_ctx = PhaseContext {
+        name: name.clone(),
+        namespace: namespace.clone(),
+        target_masters: obj.spec.masters,
+        target_replicas_per_master: obj.spec.replicas_per_master,
+        current_masters,
+        running_pods,
+        ready_pods,
+        nodes_in_cluster,
+        spec_changed,
+        generation: current_gen.unwrap_or(0),
+    };
+
     // Determine next phase based on current state
     let next_phase = match current_phase {
         ClusterPhase::Pending => {
@@ -245,315 +306,185 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             ClusterPhase::Creating
         }
         ClusterPhase::Creating => {
-            // Create owned resources
-            create_owned_resources(&obj, &ctx, &namespace).await?;
-
-            // Check if pods are running (not Ready - readiness requires cluster to be OK)
-            // We need running pods to start cluster initialization
-            let running_pods = check_running_pods(&obj, &ctx, &namespace).await?;
-            let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
-            if running_pods >= desired_replicas {
-                ctx.publish_normal_event(
-                    &obj,
-                    "PodsRunning",
-                    "Reconciling",
-                    Some(format!(
-                        "All pods running ({}/{}), initializing cluster",
-                        running_pods, desired_replicas
-                    )),
-                )
-                .await;
-                // Transition to Initializing for CLUSTER MEET operations
-                ClusterPhase::Initializing
-            } else {
-                debug!(
-                    name = %name,
-                    running = running_pods,
-                    desired = desired_replicas,
-                    "Waiting for pods to be running"
-                );
-                ClusterPhase::Creating
-            }
+            // Create owned resources and transition to WaitingForPods
+            let result = cluster_phases::handle_creating(
+                &obj,
+                &ctx,
+                &phase_ctx,
+                create_owned_resources(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
         }
-        ClusterPhase::Running => {
-            // Check if update needed
-            if spec_changed {
-                // Log if spec changed while upgrade is in progress
-                // Note: Spec changes during upgrade are expected when upgrade reconciler
-                // updates the image tag. This is informational logging only.
-                if is_upgrade_in_progress(&obj) {
-                    info!(
-                        name = %name,
-                        "Spec changed while upgrade is in progress - processing changes initiated by upgrade reconciler"
-                    );
-                }
-
-                ctx.publish_normal_event(
-                    &obj,
-                    "SpecChanged",
-                    "DetectingChanges",
-                    Some("Resource spec changed, detecting required changes".to_string()),
-                )
-                .await;
-                ClusterPhase::DetectingChanges
-            } else {
-                // Ensure resources are in sync
-                create_owned_resources(&obj, &ctx, &namespace).await?;
-
-                let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
-                let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
-                if ready_replicas < desired_replicas {
-                    ctx.publish_warning_event(
-                        &obj,
-                        "Degraded",
-                        "Reconciling",
-                        Some(format!(
-                            "Resource degraded: {}/{} replicas ready",
-                            ready_replicas, desired_replicas
-                        )),
-                    )
-                    .await;
-                    ClusterPhase::Degraded
-                } else {
-                    ClusterPhase::Running
-                }
-            }
+        ClusterPhase::WaitingForPods => {
+            let result = cluster_phases::handle_waiting_for_pods(
+                &obj,
+                &ctx,
+                &phase_ctx,
+                create_owned_resources(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
         }
-        ClusterPhase::Degraded => {
-            // Ensure resources are in sync (may have been modified externally)
-            // This is important for recovery when StatefulSet replicas were manually reduced
-            create_owned_resources(&obj, &ctx, &namespace).await?;
-
-            // Check if recovered
-            let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace).await?;
-            let running_pods = check_running_pods(&obj, &ctx, &namespace).await?;
-            let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
-
-            if ready_replicas >= desired_replicas {
-                ctx.publish_normal_event(
-                    &obj,
-                    "Recovered",
-                    "Reconciling",
-                    Some(format!(
-                        "Resource recovered: {}/{} replicas ready",
-                        ready_replicas, desired_replicas
-                    )),
-                )
-                .await;
-                ClusterPhase::Running
-            } else if ready_replicas == 0 && running_pods == 0 {
-                ctx.publish_warning_event(
-                    &obj,
-                    "Failed",
-                    "Reconciling",
-                    Some("Resource failed: no replicas available".to_string()),
-                )
-                .await;
-                ClusterPhase::Failed
-            } else if running_pods >= desired_replicas && ready_replicas < desired_replicas {
-                // Pods are running but not ready - likely cluster health issue
-                // Try to heal the cluster by running CLUSTER MEET to re-integrate nodes
-                debug!(
-                    name = %name,
-                    running_pods = running_pods,
-                    ready_replicas = ready_replicas,
-                    "Pods running but not ready, attempting cluster healing"
-                );
-
-                // Execute CLUSTER MEET to re-integrate any orphan nodes
-                if let Err(e) = execute_cluster_init(&obj, &ctx, &namespace).await {
-                    debug!(
-                        name = %name,
-                        error = %e,
-                        "Cluster healing failed, will retry"
-                    );
-                }
-
-                ClusterPhase::Degraded
-            } else {
-                ClusterPhase::Degraded
-            }
-        }
-        ClusterPhase::Initializing => {
-            // Cluster nodes are up, performing CLUSTER MEET
-            // Ensure resources are still in sync
-            create_owned_resources(&obj, &ctx, &namespace).await?;
-
-            // Check running pods (not Ready - readiness requires cluster to be OK)
-            let running_pods = check_running_pods(&obj, &ctx, &namespace).await?;
-            let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
-
-            if running_pods < desired_replicas {
-                // Pods not running yet, wait
-                debug!(
-                    name = %name,
-                    running = running_pods,
-                    desired = desired_replicas,
-                    "Waiting for pods to be running before CLUSTER MEET"
-                );
-                ClusterPhase::Initializing
-            } else {
-                // Execute CLUSTER MEET to connect all nodes
-                info!(name = %name, "Executing CLUSTER MEET to connect all nodes");
-
-                // Acquire operation lock for initialization
-                if let Err(e) = operation_coordination::start_operation(
-                    &api,
-                    &name,
-                    OperationType::Initializing,
-                )
-                .await
-                {
-                    warn!(name = %name, error = %e, "Failed to acquire operation lock for initialization");
-                    // If lock acquisition fails, stay in Initializing to retry
-                    return Ok(Action::requeue(std::time::Duration::from_secs(10)));
-                }
-
-                let init_result = execute_cluster_init(&obj, &ctx, &namespace).await;
-
-                // Release operation lock if initialization fails (success releases in next phase)
-                if init_result.is_err() {
-                    let _ = operation_coordination::complete_operation(
-                        &api,
-                        &name,
-                        OperationType::Initializing,
-                    )
-                    .await;
-                }
-
-                match init_result {
-                    Ok(()) => {
-                        ctx.publish_normal_event(
-                            &obj,
-                            "ClusterMeet",
-                            "Initializing",
-                            Some("Cluster nodes connected via CLUSTER MEET".to_string()),
-                        )
-                        .await;
-                        ClusterPhase::AssigningSlots
-                    }
-                    Err(e) => {
-                        warn!(name = %name, error = %e, "CLUSTER MEET failed, will retry");
-                        ctx.publish_warning_event(
-                            &obj,
-                            "ClusterMeetFailed",
-                            "Initializing",
-                            Some(format!("CLUSTER MEET failed: {}", e)),
-                        )
-                        .await;
-                        // Stay in Initializing and retry
-                        ClusterPhase::Initializing
-                    }
-                }
-            }
+        ClusterPhase::InitializingCluster => {
+            let result = cluster_phases::handle_initializing_cluster(
+                &obj,
+                &ctx,
+                &api,
+                &phase_ctx,
+                execute_cluster_init(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
         }
         ClusterPhase::AssigningSlots => {
-            // Hash slots are being assigned to masters
-            info!(name = %name, "Executing CLUSTER ADDSLOTS and setting up replicas");
+            let result = cluster_phases::handle_assigning_slots(
+                &obj,
+                &ctx,
+                &api,
+                &phase_ctx,
+                execute_slot_assignment_no_replicas(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
+        }
+        ClusterPhase::ConfiguringReplicas => {
+            let result = cluster_phases::handle_configuring_replicas(
+                &obj,
+                &ctx,
+                &api,
+                &phase_ctx,
+                execute_replica_setup(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
+        }
+        ClusterPhase::Running => {
+            // Use handler from cluster_phases
+            let result = cluster_phases::handle_running(
+                &obj,
+                &ctx,
+                &phase_ctx,
+                create_owned_resources(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
+        }
 
-            // Ensure operation lock is still held (should be from Initializing phase)
-            // If not, acquire it (may have been lost)
-            if obj
-                .status
-                .as_ref()
-                .and_then(|s| s.current_operation.as_ref())
-                .map(|op| op != "initializing")
-                .unwrap_or(true)
-                && let Err(e) = operation_coordination::start_operation(
-                    &api,
-                    &name,
-                    OperationType::Initializing,
-                )
-                .await
-            {
-                warn!(name = %name, error = %e, "Failed to acquire operation lock for slot assignment");
-                return Ok(Action::requeue(std::time::Duration::from_secs(10)));
-            }
+        // === Scale-Up Phases ===
+        ClusterPhase::ScalingUpStatefulSet => {
+            let result = cluster_phases::handle_scaling_up_statefulset(
+                &obj,
+                &ctx,
+                &api,
+                &phase_ctx,
+                create_owned_resources(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
+        }
+        ClusterPhase::WaitingForNewPods => {
+            let result =
+                cluster_phases::handle_waiting_for_new_pods(&obj, &ctx, &phase_ctx).await?;
+            result.next_phase
+        }
+        ClusterPhase::AddingNodesToCluster => {
+            let result =
+                cluster_phases::handle_adding_nodes_to_cluster(&obj, &ctx, &phase_ctx, async {
+                    add_new_replicas_to_cluster(&obj, &ctx, &namespace)
+                        .await
+                        .map(|_| ())
+                })
+                .await?;
+            result.next_phase
+        }
+        ClusterPhase::RebalancingSlots => {
+            let result = cluster_phases::handle_rebalancing_slots(
+                &obj,
+                &ctx,
+                &phase_ctx,
+                execute_scale_up_rebalance(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
+        }
+        ClusterPhase::ConfiguringNewReplicas => {
+            let result = cluster_phases::handle_configuring_new_replicas(
+                &obj,
+                &ctx,
+                &api,
+                &phase_ctx,
+                execute_replica_setup(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
+        }
 
-            match execute_slot_assignment(&obj, &ctx, &namespace).await {
-                Ok(()) => {
-                    // Release operation lock when initialization completes
-                    let _ = operation_coordination::complete_operation(
-                        &api,
-                        &name,
-                        OperationType::Initializing,
-                    )
-                    .await;
+        // === Scale-Down Phases ===
+        ClusterPhase::EvacuatingSlots => {
+            let result = cluster_phases::handle_evacuating_slots(
+                &obj,
+                &ctx,
+                &api,
+                &phase_ctx,
+                execute_scale_down_evacuation(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
+        }
+        ClusterPhase::RemovingNodesFromCluster => {
+            let result = cluster_phases::handle_removing_nodes_from_cluster(
+                &obj,
+                &ctx,
+                &phase_ctx,
+                execute_forget_removed_nodes(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
+        }
+        ClusterPhase::ScalingDownStatefulSet => {
+            let result = cluster_phases::handle_scaling_down_statefulset(
+                &obj,
+                &ctx,
+                &api,
+                &phase_ctx,
+                create_owned_resources(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
+        }
 
-                    // Verify cluster is healthy before transitioning to Running
-                    // The cluster needs time to propagate slot information to all nodes
-                    match check_cluster_health(&obj, &ctx, &namespace).await {
-                        Ok(health) if health.is_healthy => {
-                            ctx.publish_normal_event(
-                                &obj,
-                                "SlotsAssigned",
-                                "Initializing",
-                                Some("All 16384 hash slots assigned, cluster ready".to_string()),
-                            )
-                            .await;
-                            ClusterPhase::Running
+        // === Verification Phase ===
+        ClusterPhase::VerifyingClusterHealth => {
+            let result = cluster_phases::handle_verifying_cluster_health(
+                &obj,
+                &ctx,
+                &api,
+                &phase_ctx,
+                async {
+                    check_cluster_health(&obj, &ctx, &namespace).await.map(|h| {
+                        ClusterHealthResult {
+                            is_healthy: h.is_healthy,
+                            slots_assigned: h.slots_assigned,
+                            healthy_masters: h.healthy_masters,
                         }
-                        Ok(health) => {
-                            // Slots assigned but cluster not yet healthy - wait for propagation
-                            debug!(
-                                name = %name,
-                                slots_assigned = health.slots_assigned,
-                                healthy_masters = health.healthy_masters,
-                                "Slots assigned, waiting for cluster to stabilize"
-                            );
-                            // Stay in AssigningSlots to wait for cluster_state:ok
-                            ClusterPhase::AssigningSlots
-                        }
-                        Err(e) => {
-                            // Health check failed - wait and retry
-                            debug!(
-                                name = %name,
-                                error = %e,
-                                "Health check failed after slot assignment, waiting"
-                            );
-                            ClusterPhase::AssigningSlots
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(name = %name, error = %e, "Slot assignment failed, will retry");
-                    ctx.publish_warning_event(
-                        &obj,
-                        "SlotAssignmentFailed",
-                        "Initializing",
-                        Some(format!("Slot assignment failed: {}", e)),
-                    )
-                    .await;
-                    // Stay in AssigningSlots and retry
-                    ClusterPhase::AssigningSlots
-                }
-            }
+                    })
+                },
+            )
+            .await?;
+            result.next_phase
         }
-        // Granular phases for scaling operations
-        // These provide better observability and resumability
-        ClusterPhase::DetectingChanges => {
-            // Compute what changes are needed and store in pending_changes
-            handle_detecting_changes(&obj, &ctx, &api, &namespace).await?
-        }
-        ClusterPhase::ScalingStatefulSet => {
-            // Update StatefulSet replica count
-            handle_scaling_statefulset(&obj, &ctx, &api, &namespace).await?
-        }
-        ClusterPhase::AddingNodes => {
-            // Execute CLUSTER MEET for new nodes
-            handle_adding_nodes(&obj, &ctx, &api, &namespace).await?
-        }
-        ClusterPhase::MigratingSlots => {
-            // Migrate slots for rebalancing
-            handle_migrating_slots(&obj, &ctx, &api, &namespace).await?
-        }
-        ClusterPhase::RemovingNodes => {
-            // Execute CLUSTER FORGET for removed nodes
-            handle_removing_nodes(&obj, &ctx, &api, &namespace).await?
-        }
-        ClusterPhase::VerifyingCluster => {
-            // Final health check before transitioning to Running
-            handle_verifying_cluster(&obj, &ctx, &api, &namespace).await?
+
+        // === Problem States ===
+        ClusterPhase::Degraded => {
+            let result = cluster_phases::handle_degraded(
+                &obj,
+                &ctx,
+                &phase_ctx,
+                create_owned_resources(&obj, &ctx, &namespace),
+            )
+            .await?;
+            result.next_phase
         }
         ClusterPhase::Failed => {
             // Attempt automatic recovery for stale IP conditions
@@ -734,7 +665,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
     };
 
     // Update status
-    let ready_replicas = check_ready_replicas(&obj, &ctx, &namespace)
+    let ready_replicas_final = check_ready_replicas(&obj, &ctx, &namespace)
         .await
         .unwrap_or(0);
 
@@ -760,7 +691,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
         &api,
         &name,
         next_phase,
-        ready_replicas,
+        ready_replicas_final,
         None,
         health_status.as_ref(),
         current_gen,
@@ -778,7 +709,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             &namespace,
             &name,
             i64::from(desired_replicas),
-            i64::from(ready_replicas),
+            i64::from(ready_replicas_final),
         );
     }
 
@@ -1036,97 +967,30 @@ async fn check_running_pods(
     Ok(running_count as i32)
 }
 
-/// Check if the cluster image differs from the current StatefulSet image.
-///
-/// Returns `true` if the desired image differs from what's currently in the StatefulSet,
-/// indicating that a rolling update is needed.
-async fn check_image_changed(
-    obj: &ValkeyCluster,
-    ctx: &Context,
-    namespace: &str,
-) -> Result<bool, Error> {
-    let name = obj.name_any();
-    let sts_api: Api<k8s_openapi::api::apps::v1::StatefulSet> =
-        Api::namespaced(ctx.client.clone(), namespace);
-
-    // Get current StatefulSet
-    let sts = match sts_api.get(&name).await {
-        Ok(sts) => sts,
-        Err(kube::Error::Api(e)) if e.code == 404 => {
-            // StatefulSet doesn't exist yet, not an image change scenario
-            return Ok(false);
-        }
-        Err(e) => return Err(Error::Kube(e)),
-    };
-
-    // Extract current image from StatefulSet (first container is valkey)
-    let current_image = sts
-        .spec
-        .as_ref()
-        .and_then(|s| s.template.spec.as_ref())
-        .and_then(|s| s.containers.first())
-        .and_then(|c| c.image.as_ref())
-        .cloned()
-        .unwrap_or_default();
-
-    // Build desired image from cluster spec
-    let desired_image = format!("{}:{}", obj.spec.image.repository, obj.spec.image.tag);
-
-    let changed = current_image != desired_image;
-
-    if changed {
-        debug!(
-            name = %name,
-            current_image = %current_image,
-            desired_image = %desired_image,
-            "Image change detected"
-        );
-    }
-
-    Ok(changed)
-}
-
 /// Execute cluster initialization (CLUSTER MEET)
 async fn execute_cluster_init(
     obj: &ValkeyCluster,
     ctx: &Context,
     namespace: &str,
 ) -> Result<(), Error> {
+    let name = obj.name_any();
     let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
+
+    // Build topology to get pod IPs for CLUSTER MEET
+    let topology = ClusterTopology::build(&ctx.client, namespace, &name, None)
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
 
     // Execute cluster meet
     cluster_init::execute_cluster_meet(
-        &ctx.client,
         obj,
+        &topology,
         password.as_deref(),
         tls_certs.as_ref(),
         &strategy,
     )
     .await
     .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    Ok(())
-}
-
-/// Execute slot assignment (CLUSTER ADDSLOTS)
-async fn execute_slot_assignment(
-    obj: &ValkeyCluster,
-    ctx: &Context,
-    namespace: &str,
-) -> Result<(), Error> {
-    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
-
-    // Assign slots to masters
-    cluster_init::assign_slots_to_masters(obj, password.as_deref(), tls_certs.as_ref(), &strategy)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    // Set up replicas
-    if obj.spec.replicas_per_master > 0 {
-        cluster_init::setup_replicas(obj, password.as_deref(), tls_certs.as_ref(), &strategy)
-            .await
-            .map_err(|e| Error::Valkey(e.to_string()))?;
-    }
 
     Ok(())
 }
@@ -1141,12 +1005,18 @@ async fn execute_stale_ip_recovery(
     ctx: &Context,
     namespace: &str,
 ) -> Result<(), Error> {
+    let name = obj.name_any();
     let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
+
+    // Build topology to get current pod IPs
+    let topology = ClusterTopology::build(&ctx.client, namespace, &name, None)
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
 
     // Execute recovery via CLUSTER MEET
     cluster_init::recover_stale_ips(
-        &ctx.client,
         obj,
+        &topology,
         password.as_deref(),
         tls_certs.as_ref(),
         &strategy,
@@ -1155,6 +1025,157 @@ async fn execute_stale_ip_recovery(
     .map_err(|e| Error::Valkey(e.to_string()))?;
 
     Ok(())
+}
+
+/// Execute slot assignment without setting up replicas.
+/// Used during initial creation when replicas are configured in a separate phase.
+async fn execute_slot_assignment_no_replicas(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<(), Error> {
+    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
+
+    // Assign slots to masters only
+    cluster_init::assign_slots_to_masters(obj, password.as_deref(), tls_certs.as_ref(), &strategy)
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Execute replica setup (CLUSTER REPLICATE).
+/// Used during initial creation after slots are assigned.
+async fn execute_replica_setup(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<(), Error> {
+    if obj.spec.replicas_per_master == 0 {
+        return Ok(());
+    }
+
+    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
+
+    cluster_init::setup_replicas(obj, password.as_deref(), tls_certs.as_ref(), &strategy)
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Execute slot rebalancing during scale-up.
+/// Returns true when rebalancing is complete, false if still in progress.
+async fn execute_scale_up_rebalance(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<bool, Error> {
+    // Execute the scaling operation to rebalance slots
+    // This internally handles promotion and slot migration
+    let result = execute_scaling_operation(obj, ctx, namespace).await?;
+
+    // Check if scaling is complete
+    if let Some(ref e) = result.error {
+        return Err(Error::Valkey(e.clone()));
+    }
+    // Operation is complete when it succeeds and all slots have been moved
+    Ok(result.success)
+}
+
+/// Execute slot evacuation during scale-down.
+/// Returns true when evacuation is complete, false if still in progress.
+async fn execute_scale_down_evacuation(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<bool, Error> {
+    // Use the scaling operation which handles both scale-up and scale-down
+    let result = execute_scaling_operation(obj, ctx, namespace).await?;
+
+    // Check if scaling is complete
+    if let Some(ref e) = result.error {
+        return Err(Error::Valkey(e.clone()));
+    }
+    // Operation is complete when it succeeds
+    Ok(result.success)
+}
+
+/// Execute CLUSTER FORGET for nodes being removed during scale-down.
+/// Returns true when all nodes are forgotten, false if still in progress.
+async fn execute_forget_removed_nodes(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<bool, Error> {
+    let name = obj.name_any();
+    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
+
+    // Connect to cluster
+    let (host, port) = strategy
+        .get_connection(0)
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let client = crate::client::ValkeyClient::connect_single(
+        &host,
+        port,
+        password.as_deref(),
+        tls_certs.as_ref(),
+    )
+    .await
+    .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let cluster_nodes = client
+        .cluster_nodes()
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    let _ = client.close().await;
+
+    // Build ClusterTopology to find orphaned nodes
+    let cluster_name = obj.name_any();
+    let topology =
+        ClusterTopology::build(&ctx.client, namespace, &cluster_name, Some(&cluster_nodes))
+            .await
+            .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    // Find orphaned nodes: cluster nodes whose IP is NOT in our current pod list
+    let orphaned = topology.orphaned_nodes(&cluster_nodes);
+    let orphan_node_ids: Vec<String> = orphaned.iter().map(|n| n.node_id.clone()).collect();
+
+    if orphan_node_ids.is_empty() {
+        // All orphaned nodes have been forgotten
+        return Ok(true);
+    }
+
+    for node in &orphaned {
+        debug!(
+            node_id = %node.node_id,
+            ip = %node.ip,
+            "Found orphaned node (IP not in current pods)"
+        );
+    }
+
+    info!(
+        name = %name,
+        orphan_count = orphan_node_ids.len(),
+        "Removing orphaned nodes from cluster"
+    );
+
+    // Execute CLUSTER FORGET for orphaned nodes
+    cluster_init::forget_nodes_with_retry(
+        obj,
+        &orphan_node_ids,
+        password.as_deref(),
+        tls_certs.as_ref(),
+        &strategy,
+    )
+    .await
+    .map_err(|e| Error::Valkey(e.to_string()))?;
+
+    // Still need to verify all nodes are gone
+    Ok(false)
 }
 
 /// Health check result containing cluster state information.
@@ -1264,9 +1285,15 @@ async fn check_cluster_health(
 
     if !is_healthy {
         let health_msg = cluster_state.health_status_message(expected_masters);
-        debug!(
+        warn!(
             cluster = %obj.name_any(),
             message = %health_msg,
+            cluster_state = %cluster_state.cluster_info.state,
+            slots_assigned = cluster_state.cluster_info.slots_assigned,
+            slots_fail = cluster_state.cluster_info.slots_fail,
+            slots_pfail = cluster_state.cluster_info.slots_pfail,
+            masters_count = cluster_state.cluster_nodes.masters().len(),
+            healthy_masters = cluster_state.healthy_masters_count(),
             "Cluster health check failed"
         );
     }
@@ -1322,6 +1349,7 @@ async fn update_status(
     reconcile_generation: Option<i64>,
 ) -> Result<(), Error> {
     let obj = api.get(name).await?;
+
     // Use the generation from reconcile start, not the current generation
     // This prevents race conditions when spec changes during reconciliation
     let generation = reconcile_generation.or(obj.metadata.generation);
@@ -1388,8 +1416,6 @@ async fn update_status(
         None
     };
 
-    // Preserve new status fields if present
-    let pending_changes = existing_status.and_then(|s| s.pending_changes.clone());
     let operation_progress = existing_status.and_then(|s| s.operation_progress.clone());
     let message = existing_status
         .map(|s| s.message.clone())
@@ -1472,7 +1498,6 @@ async fn update_status(
         tls_secret: Some(tls_secret_name),
         current_operation,
         operation_started_at,
-        pending_changes,
         operation_progress,
         message,
         reconcile_count,
@@ -1533,6 +1558,141 @@ async fn get_current_master_count(
     Ok(masters.len() as i32)
 }
 
+/// Promote replicas to masters during scale-up.
+///
+/// When scaling from N to M masters (where M > N), pods at ordinals N..M may
+/// currently be replicas in the cluster. These need to be promoted to masters
+/// before rebalancing can assign them slots.
+///
+/// This function uses ClusterTopology to correctly identify replicas that should
+/// be masters by correlating pod IPs with cluster node state. This fixes the bug
+/// where `extract_ordinal_from_address` failed on IP addresses.
+///
+/// This function:
+/// 1. Identifies ordinals that should be masters but are replicas
+/// 2. Executes CLUSTER RESET SOFT on them to clear replication
+/// 3. Waits for the cluster to stabilize
+///
+/// Returns the list of ordinals that were promoted.
+async fn promote_replicas_to_masters(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+    current_masters: i32,
+    target_masters: i32,
+) -> Result<Vec<i32>, Error> {
+    if target_masters <= current_masters {
+        return Ok(Vec::new());
+    }
+
+    let name = obj.name_any();
+    let mut promoted = Vec::new();
+
+    // Get current cluster topology
+    let client = ctx
+        .connect_to_cluster(obj, namespace, 0)
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to connect for promotion check: {}", e)))?;
+
+    let cluster_nodes = client
+        .cluster_nodes()
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to get cluster nodes: {}", e)))?;
+
+    let _ = client.close().await;
+
+    // Build ClusterTopology to correlate pods with cluster nodes via IP matching
+    // This fixes the bug where extract_ordinal_from_address fails on IP addresses
+    let topology = ClusterTopology::build(&ctx.client, namespace, &name, Some(&cluster_nodes))
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to build topology: {}", e)))?;
+
+    // Use topology to find replicas that should be masters
+    // This correctly handles all ordinals 0..target_masters, not just new ones
+    let to_promote = topology.replicas_that_should_be_masters(target_masters);
+
+    for node in to_promote {
+        info!(
+            cluster = %name,
+            ordinal = node.ordinal,
+            node_id = %node.node_id.as_deref().unwrap_or("unknown"),
+            "Promoting replica to master via CLUSTER RESET SOFT"
+        );
+
+        // Connect to this specific pod and reset it
+        let replica_client = ctx
+            .connect_to_cluster(obj, namespace, node.ordinal)
+            .await
+            .map_err(|e| {
+                Error::Valkey(format!("Failed to connect to pod {}: {}", node.ordinal, e))
+            })?;
+
+        match replica_client.cluster_reset(false).await {
+            Ok(()) => {
+                info!(
+                    cluster = %name,
+                    ordinal = node.ordinal,
+                    "Replica promoted to master (CLUSTER RESET SOFT succeeded)"
+                );
+                promoted.push(node.ordinal);
+            }
+            Err(e) => {
+                warn!(
+                    cluster = %name,
+                    ordinal = node.ordinal,
+                    error = %e,
+                    "Failed to promote replica to master"
+                );
+            }
+        }
+
+        let _ = replica_client.close().await;
+    }
+
+    if !promoted.is_empty() {
+        // Wait for the cluster to stabilize after resets
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // Re-meet the promoted nodes back into the cluster
+        // (CLUSTER RESET removes them from the cluster configuration)
+        // Connect to master 0 to issue CLUSTER MEET
+        let client = ctx
+            .connect_to_cluster(obj, namespace, 0)
+            .await
+            .map_err(|e| Error::Valkey(format!("Failed to connect for CLUSTER MEET: {}", e)))?;
+
+        for &ordinal in &promoted {
+            // Use topology to get the IP for this ordinal
+            if let Some(node) = topology.by_ordinal(ordinal)
+                && let Some(endpoint) = &node.endpoint
+            {
+                info!(
+                    cluster = %name,
+                    ordinal = ordinal,
+                    ip = %endpoint.ip(),
+                    port = endpoint.port(),
+                    "Re-adding promoted node via CLUSTER MEET"
+                );
+                if let Err(e) = client.cluster_meet(endpoint.ip(), endpoint.port()).await {
+                    warn!(
+                        cluster = %name,
+                        ordinal = ordinal,
+                        error = %e,
+                        "Failed to CLUSTER MEET promoted node"
+                    );
+                }
+            }
+        }
+
+        let _ = client.close().await;
+
+        // Wait for gossip propagation
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    Ok(promoted)
+}
+
 /// Execute a scaling operation (scale up or scale down).
 ///
 /// For scale-down operations, this function connects directly to each source node
@@ -1562,6 +1722,35 @@ async fn execute_scaling_operation(
 
     let current_masters = cluster_nodes.masters().len() as i32;
     let target_masters = obj.spec.masters;
+    let _ = client.close().await;
+
+    // For scale-up: promote any replicas that should become masters
+    if target_masters > current_masters {
+        let promoted =
+            promote_replicas_to_masters(obj, ctx, namespace, current_masters, target_masters)
+                .await?;
+        if !promoted.is_empty() {
+            info!(
+                promoted = ?promoted,
+                "Promoted replicas to masters before scaling"
+            );
+        }
+    }
+
+    // Re-connect and get updated cluster state after promotions
+    let client = ctx
+        .connect_to_cluster(obj, namespace, 0)
+        .await
+        .map_err(|e| Error::Valkey(format!("Failed to reconnect for scaling: {}", e)))?;
+
+    let cluster_nodes = client.cluster_nodes().await.map_err(|e| {
+        Error::Valkey(format!(
+            "Failed to get cluster nodes after promotion: {}",
+            e
+        ))
+    })?;
+
+    let current_masters = cluster_nodes.masters().len() as i32;
 
     // Build scaling context
     let scaling_ctx = ScalingContext {
@@ -1593,9 +1782,17 @@ async fn execute_scaling_operation(
         let _ = client.close().await;
         execute_scale_down(obj, ctx, namespace, &cluster_nodes, &scaling_ctx).await
     } else {
-        // No scaling needed
+        // current_masters == target_masters: nodes are already in cluster, just need to rebalance.
+        // This happens when CLUSTER MEET was done in AddingNodes phase and we're in MigratingSlots
+        // to redistribute slots to the newly joined nodes.
+        info!(
+            current = current_masters,
+            target = target_masters,
+            "Rebalancing slots (masters already at target count)"
+        );
         let _ = client.close().await;
-        return Ok(crate::client::ScalingResult::default());
+        // Use execute_rebalance_slots which uses port-forwarding for each source node
+        execute_rebalance_slots(obj, ctx, namespace, &cluster_nodes, target_masters).await
     };
 
     result.map_err(|e| Error::Valkey(format!("Scaling operation failed: {}", e)))
@@ -1606,6 +1803,9 @@ async fn execute_scaling_operation(
 /// CLUSTER MIGRATESLOTS must be executed on the source node (the node that currently
 /// owns the slots). This function connects to each node being removed and executes
 /// the migration commands from there.
+///
+/// Uses ClusterTopology for correct IP→ordinal mapping, fixing issues where
+/// extract_ordinal_from_address fails on IP addresses.
 async fn execute_scale_down(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -1614,7 +1814,6 @@ async fn execute_scale_down(
     scaling_ctx: &ScalingContext,
 ) -> Result<crate::client::ScalingResult, crate::client::ValkeyError> {
     use crate::client::ValkeyError;
-    use std::collections::HashMap;
 
     let mut result = crate::client::ScalingResult::default();
     let masters: Vec<_> = cluster_nodes.masters().into_iter().collect();
@@ -1622,30 +1821,21 @@ async fn execute_scale_down(
     // Find masters to remove (highest ordinals)
     let ordinals_to_remove = scaling_ctx.masters_to_remove();
 
-    // Get pod IPs to build a mapping from IP -> ordinal
-    // CLUSTER NODES returns IP addresses, not DNS names, so we need this mapping
+    // Build ClusterTopology for IP→ordinal mapping
+    // This replaces the ad-hoc HashMap building that was prone to bugs
     let cluster_name = obj.name_any();
-    let current_total =
-        crate::crd::total_pods(scaling_ctx.current_masters, obj.spec.replicas_per_master);
 
-    let pod_ips =
-        cluster_init::get_pod_ips(&ctx.client, namespace, &cluster_name, current_total).await?;
+    let topology =
+        ClusterTopology::build(&ctx.client, namespace, &cluster_name, Some(cluster_nodes)).await?;
 
-    // Build IP -> ordinal mapping
-    let ip_to_ordinal: HashMap<&str, i32> = pod_ips
-        .iter()
-        .filter_map(|(pod_name, ip, _)| {
-            // Extract ordinal from pod name (e.g., "scale-down-test-3" -> 3)
-            let ordinal = pod_name.rsplit('-').next()?.parse().ok()?;
-            Some((ip.as_str(), ordinal))
-        })
-        .collect();
+    // Use topology's IP→ordinal map for lookups
+    let ip_to_ordinal = topology.ip_to_ordinal_map();
 
     // Find nodes to remove by matching their IPs to ordinals
     let nodes_to_remove: Vec<_> = masters
         .iter()
         .filter(|m| {
-            if let Some(&ordinal) = ip_to_ordinal.get(m.ip.as_str()) {
+            if let Some(&ordinal) = ip_to_ordinal.get(&m.ip) {
                 ordinals_to_remove.contains(&ordinal)
             } else {
                 false
@@ -1692,8 +1882,8 @@ async fn execute_scale_down(
             continue;
         }
 
-        // Look up the ordinal for this node's IP
-        let Some(&ordinal) = ip_to_ordinal.get(node.ip.as_str()) else {
+        // Look up the ordinal for this node's IP using topology
+        let Some(&ordinal) = ip_to_ordinal.get(&node.ip) else {
             return Err(ValkeyError::InvalidConfig(format!(
                 "Cannot find ordinal for node IP {}: no matching pod",
                 node.ip
@@ -1800,6 +1990,244 @@ async fn execute_scale_down(
         "Scale down complete"
     );
 
+    Ok(result)
+}
+
+/// Execute slot rebalancing with port-forwarding for each source node.
+///
+/// CLUSTER MIGRATESLOTS must be executed on the source node (the node that currently
+/// owns the slots). This function connects to each source node via port-forwarding
+/// and executes the migration commands from there.
+///
+/// Uses ClusterTopology for correct IP→ordinal mapping.
+async fn execute_rebalance_slots(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+    cluster_nodes: &crate::client::ParsedClusterNodes,
+    target_masters: i32,
+) -> Result<crate::client::ScalingResult, crate::client::ValkeyError> {
+    use crate::client::ValkeyError;
+    use crate::slots::calculate_distribution;
+    use std::collections::HashMap;
+
+    let mut result = crate::client::ScalingResult::default();
+    let masters: Vec<_> = cluster_nodes
+        .nodes
+        .iter()
+        .filter(|n| {
+            !n.is_replica()
+                && n.master_id
+                    .as_ref()
+                    .is_none_or(|id| id == "-" || id.is_empty())
+        })
+        .collect();
+
+    if masters.len() != target_masters as usize {
+        return Err(ValkeyError::ClusterNotReady(format!(
+            "Expected {} masters but found {}",
+            target_masters,
+            masters.len()
+        )));
+    }
+
+    // Build ClusterTopology for IP→ordinal mapping
+    let cluster_name = obj.name_any();
+    let topology =
+        ClusterTopology::build(&ctx.client, namespace, &cluster_name, Some(cluster_nodes)).await?;
+
+    // Use topology's IP→ordinal map
+    let ip_to_ordinal = topology.ip_to_ordinal_map();
+
+    // Calculate target slot distribution
+    let target_distribution = calculate_distribution(target_masters as u16);
+
+    // Build current slot ownership map and node info lookup
+    let mut current_ownership: HashMap<u16, String> = HashMap::new();
+    let mut node_info: HashMap<String, (String, i32)> = HashMap::new(); // node_id -> (ip, ordinal)
+
+    for master in &masters {
+        if let Some(&ordinal) = ip_to_ordinal.get(&master.ip) {
+            node_info.insert(master.node_id.clone(), (master.ip.clone(), ordinal));
+        }
+        for range in &master.slots {
+            for slot in range.start..=range.end {
+                current_ownership.insert(slot as u16, master.node_id.clone());
+            }
+        }
+    }
+
+    // Collect all slot migrations grouped by source node
+    // Key: source_node_id, Value: list of (slot, dest_node_id)
+    let mut migrations_by_source: HashMap<String, Vec<(u16, String)>> = HashMap::new();
+    let mut unassigned_slots: HashMap<String, Vec<u16>> = HashMap::new();
+
+    for (master, range) in masters.iter().zip(target_distribution.iter()) {
+        for slot in range.iter() {
+            if let Some(current_owner) = current_ownership.get(&slot) {
+                if *current_owner != master.node_id {
+                    migrations_by_source
+                        .entry(current_owner.clone())
+                        .or_default()
+                        .push((slot, master.node_id.clone()));
+                }
+            } else {
+                unassigned_slots
+                    .entry(master.node_id.clone())
+                    .or_default()
+                    .push(slot);
+            }
+        }
+    }
+
+    // Group consecutive slots into ranges helper
+    fn group_consecutive_slots(slots: &[u16]) -> Vec<(u16, u16)> {
+        let mut iter = slots.iter().copied();
+        let Some(first) = iter.next() else {
+            return Vec::new();
+        };
+        let mut ranges = Vec::new();
+        let mut start = first;
+        let mut end = first;
+        for slot in iter {
+            if slot == end + 1 {
+                end = slot;
+            } else {
+                ranges.push((start, end));
+                start = slot;
+                end = slot;
+            }
+        }
+        ranges.push((start, end));
+        ranges
+    }
+
+    // Migrate slots from each source node
+    for (source_node_id, slot_migrations) in migrations_by_source {
+        // Group by destination
+        let mut by_dest: HashMap<String, Vec<u16>> = HashMap::new();
+        for (slot, dest) in slot_migrations {
+            by_dest.entry(dest).or_default().push(slot);
+        }
+
+        // Get source node's ordinal for port-forwarding (using topology)
+        let Some((_, ordinal)) = node_info.get(&source_node_id) else {
+            return Err(ValkeyError::InvalidConfig(format!(
+                "Cannot find ordinal for source node {}",
+                source_node_id
+            )));
+        };
+        let ordinal = *ordinal;
+
+        info!(
+            source_node = %source_node_id,
+            ordinal = ordinal,
+            destinations = by_dest.len(),
+            "Connecting to source node for slot migration"
+        );
+
+        // Connect to the source node via port forwarding
+        let source_client = ctx
+            .connect_to_cluster(obj, namespace, ordinal)
+            .await
+            .map_err(|e| {
+                ValkeyError::Connection(format!(
+                    "Failed to connect to source node {} (ordinal {}): {}",
+                    source_node_id, ordinal, e
+                ))
+            })?;
+
+        // Migrate slots to each destination in batched ranges
+        for (dest_node_id, mut slots) in by_dest {
+            slots.sort_unstable();
+            let ranges = group_consecutive_slots(&slots);
+
+            info!(
+                from = %source_node_id,
+                to = %dest_node_id,
+                total_slots = slots.len(),
+                num_ranges = ranges.len(),
+                "Migrating slot ranges"
+            );
+
+            for (start, end) in ranges {
+                debug!(
+                    start_slot = start,
+                    end_slot = end,
+                    from = %source_node_id,
+                    to = %dest_node_id,
+                    "Migrating slot range"
+                );
+
+                // Execute CLUSTER MIGRATESLOTS from the source node
+                match source_client
+                    .cluster_migrateslots(start, end, &dest_node_id)
+                    .await
+                {
+                    Ok(()) => {
+                        // Wait for migration to complete
+                        if let Err(e) =
+                            wait_for_slot_migration(ctx, obj, namespace, start, end, &dest_node_id)
+                                .await
+                        {
+                            let _ = source_client.close().await;
+                            return Err(e);
+                        }
+                        result.slots_moved += (end - start + 1) as i32;
+                    }
+                    Err(e) => {
+                        if e.to_string().contains("unknown subcommand") {
+                            let _ = source_client.close().await;
+                            return Err(ValkeyError::InvalidConfig(
+                                "Slot rebalancing requires Valkey 9.0+ (CLUSTER MIGRATESLOTS)."
+                                    .to_string(),
+                            ));
+                        }
+                        warn!(
+                            start_slot = start,
+                            end_slot = end,
+                            error = %e,
+                            "Slot range migration failed"
+                        );
+                        let _ = source_client.close().await;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        let _ = source_client.close().await;
+    }
+
+    // Handle unassigned slots (should be rare, but handle for completeness)
+    if !unassigned_slots.is_empty() {
+        let client = ctx
+            .connect_to_cluster(obj, namespace, 0)
+            .await
+            .map_err(|e| {
+                ValkeyError::Connection(format!(
+                    "Failed to connect for unassigned slot assignment: {}",
+                    e
+                ))
+            })?;
+
+        for (dest, mut slots) in unassigned_slots {
+            slots.sort_unstable();
+            for slot in slots {
+                client
+                    .cluster_setslot(
+                        slot,
+                        crate::client::valkey_client::ClusterSetSlotState::Node(dest.clone()),
+                    )
+                    .await?;
+                result.slots_moved += 1;
+            }
+        }
+
+        let _ = client.close().await;
+    }
+
+    info!(slots_moved = result.slots_moved, "Rebalance complete");
     Ok(result)
 }
 
@@ -1933,22 +2361,13 @@ async fn add_new_replicas_to_cluster(
         return Ok(0);
     }
 
-    // Get pod IPs for new nodes
-    let pod_ips = cluster_init::get_pod_ips(&ctx.client, namespace, &name, desired_total)
+    // Build ClusterTopology to find pods not yet in cluster
+    let topology = ClusterTopology::build(&ctx.client, namespace, &name, Some(&cluster_nodes))
         .await
-        .map_err(|e| Error::Valkey(format!("Failed to get pod IPs: {}", e)))?;
+        .map_err(|e| Error::Valkey(e.to_string()))?;
 
-    // Filter to only pods not yet in cluster
-    let existing_ips: std::collections::HashSet<_> = cluster_nodes
-        .nodes
-        .iter()
-        .map(|n| n.address.split(':').next().unwrap_or(""))
-        .collect();
-
-    let new_pods: Vec<_> = pod_ips
-        .iter()
-        .filter(|(_, ip, _)| !existing_ips.contains(ip.as_str()))
-        .collect();
+    // Get pods not yet in cluster
+    let new_pods: Vec<_> = topology.nodes_not_in_cluster().collect();
 
     if new_pods.is_empty() {
         return Ok(0);
@@ -1967,12 +2386,18 @@ async fn add_new_replicas_to_cluster(
         .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
 
     // Execute CLUSTER MEET for each new pod
-    for (pod_name, ip, port) in &new_pods {
-        info!(pod = %pod_name, ip = %ip, "Executing CLUSTER MEET");
+    for node in &new_pods {
+        let Some(endpoint) = &node.endpoint else {
+            warn!(pod = %node.pod_name, "Pod has no IP, skipping CLUSTER MEET");
+            continue;
+        };
+        info!(pod = %node.pod_name, ip = %endpoint.ip(), "Executing CLUSTER MEET");
         client
-            .cluster_meet(ip, *port)
+            .cluster_meet(endpoint.ip(), endpoint.port())
             .await
-            .map_err(|e| Error::Valkey(format!("CLUSTER MEET failed for {}: {}", pod_name, e)))?;
+            .map_err(|e| {
+                Error::Valkey(format!("CLUSTER MEET failed for {}: {}", node.pod_name, e))
+            })?;
     }
 
     let _ = client.close().await;
@@ -1999,58 +2424,72 @@ async fn add_new_replicas_to_cluster(
 
     let _ = client.close().await;
 
-    // Build a mapping of IP to node ID
-    let ip_to_node_id: std::collections::HashMap<String, String> = cluster_nodes
-        .nodes
-        .iter()
-        .map(|n| (n.ip.clone(), n.node_id.clone()))
-        .collect();
+    // Rebuild topology with updated cluster nodes after CLUSTER MEET
+    let topology = ClusterTopology::build(&ctx.client, namespace, &name, Some(&cluster_nodes))
+        .await
+        .map_err(|e| Error::Valkey(e.to_string()))?;
 
-    // Get master node IDs (from pod-0 to pod-(masters-1))
-    let master_ips: Vec<String> = pod_ips
-        .iter()
-        .take(masters as usize)
-        .map(|(_, ip, _)| ip.clone())
-        .collect();
-
-    let master_node_ids: Vec<String> = master_ips
-        .iter()
-        .filter_map(|ip| ip_to_node_id.get(ip).cloned())
-        .collect();
+    // Get master node IDs (from ordinal 0 to masters-1)
+    // IMPORTANT: Only include nodes that are ACTUALLY masters in the cluster topology.
+    let mut master_node_ids: Vec<Option<String>> = Vec::with_capacity(masters as usize);
+    for ordinal in 0..masters {
+        if let Some(node) = topology.by_ordinal(ordinal) {
+            // Only include if it's actually a master (has master flag or has slots)
+            if node.is_master_with_slots() || node.role == NodeRole::Master {
+                master_node_ids.push(node.node_id.clone());
+            } else {
+                // This pod ordinal should be a master but is still a replica in cluster
+                debug!(
+                    ordinal = ordinal,
+                    node_id = ?node.node_id,
+                    "Pod expected to be master is still a replica in cluster topology"
+                );
+                master_node_ids.push(None);
+            }
+        } else {
+            // Node not found in cluster yet
+            master_node_ids.push(None);
+        }
+    }
 
     // For each new replica, configure it
     let mut added = 0;
-    for (pod_name, ip, _) in &new_pods {
-        // Extract pod ordinal from name (e.g., "test-cluster-3" -> 3)
-        let ordinal = pod_name
-            .rsplit('-')
-            .next()
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(0);
-
+    for node in &new_pods {
         // Skip if this is a master pod
-        if ordinal < masters {
+        if node.ordinal < masters {
             continue;
         }
 
         // Determine which master this replica belongs to
-        let master_index = ((ordinal - masters) % masters) as usize;
-        let Some(master_node_id) = master_node_ids.get(master_index) else {
-            warn!(pod = %pod_name, "Cannot find master for replica");
-            continue;
+        let master_index = ((node.ordinal - masters) % masters) as usize;
+        let master_node_id = match master_node_ids.get(master_index) {
+            Some(Some(id)) => id,
+            Some(None) => {
+                // Master at this index is not yet a master in cluster topology
+                debug!(
+                    pod = %node.pod_name,
+                    master_index = master_index,
+                    "Skipping replica config: master not yet established in cluster"
+                );
+                continue;
+            }
+            None => {
+                warn!(pod = %node.pod_name, "Cannot find master for replica");
+                continue;
+            }
         };
 
-        // Get the node ID for this replica
-        let replica_node_id = match ip_to_node_id.get(ip.as_str()) {
+        // Get the node ID for this replica (should be set after CLUSTER MEET)
+        let replica_node_id = match &node.node_id {
             Some(id) => id,
             None => {
-                warn!(pod = %pod_name, ip = %ip, "Cannot find node ID for replica");
+                warn!(pod = %node.pod_name, "Replica has no node ID yet");
                 continue;
             }
         };
 
         info!(
-            pod = %pod_name,
+            pod = %node.pod_name,
             replica_node = %replica_node_id,
             master_node = %master_node_id,
             master_index = master_index,
@@ -2058,17 +2497,17 @@ async fn add_new_replicas_to_cluster(
         );
 
         let replica_client = ctx
-            .connect_to_cluster(obj, namespace, ordinal)
+            .connect_to_cluster(obj, namespace, node.ordinal)
             .await
             .map_err(|e| Error::Valkey(format!("Failed to connect to replica: {}", e)))?;
 
         match replica_client.cluster_replicate(master_node_id).await {
             Ok(()) => {
-                info!(pod = %pod_name, "Successfully configured as replica");
+                info!(pod = %node.pod_name, "Successfully configured as replica");
                 added += 1;
             }
             Err(e) => {
-                warn!(pod = %pod_name, error = %e, "Failed to configure replica");
+                warn!(pod = %node.pod_name, error = %e, "Failed to configure replica");
             }
         }
 
@@ -2076,1083 +2515,6 @@ async fn add_new_replicas_to_cluster(
     }
 
     Ok(added)
-}
-
-// ============================================================================
-// Phase Handlers - Granular scaling operation phases
-// ============================================================================
-
-/// Handle DetectingChanges phase.
-///
-/// Computes what changes are needed (scale direction, nodes to add/remove)
-/// and stores them in `pending_changes` status field.
-///
-/// Annotation key storing the name of the active upgrade.
-const UPGRADE_NAME_ANNOTATION: &str = "valkey-operator.smoketurner.com/upgrade-name";
-
-async fn handle_detecting_changes(
-    obj: &ValkeyCluster,
-    ctx: &Context,
-    api: &Api<ValkeyCluster>,
-    namespace: &str,
-) -> Result<ClusterPhase, Error> {
-    let name = obj.name_any();
-    info!(name = %name, "Detecting changes for cluster update");
-
-    // Get current cluster state
-    let current_masters = get_current_master_count(obj, ctx, namespace).await?;
-    let target_masters = obj.spec.masters;
-    let target_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
-
-    // Get running pods to compare
-    let running_pods = check_running_pods(obj, ctx, namespace).await?;
-
-    // Determine scale direction
-    let scale_direction = if current_masters > target_masters && current_masters > 0 {
-        "down"
-    } else if current_masters < target_masters && current_masters > 0 {
-        "up"
-    } else if running_pods != target_replicas {
-        "replica_change"
-    } else {
-        "none"
-    };
-
-    // Check if image changed by comparing with current StatefulSet
-    let image_changed = check_image_changed(obj, ctx, namespace).await?;
-
-    info!(
-        name = %name,
-        current_masters = current_masters,
-        target_masters = target_masters,
-        running_pods = running_pods,
-        target_replicas = target_replicas,
-        scale_direction = scale_direction,
-        image_changed = image_changed,
-        "Change detection complete"
-    );
-
-    // Defense in depth: Block non-image changes during an active upgrade
-    // The webhook should have blocked this, but we check here as well
-    if is_upgrade_in_progress(obj) && scale_direction != "none" {
-        let upgrade_name = obj
-            .metadata
-            .annotations
-            .as_ref()
-            .and_then(|a| a.get(UPGRADE_NAME_ANNOTATION))
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let error_msg = format!(
-            "Cannot {} cluster while upgrade '{}' is in progress. \
-             Wait for the upgrade to complete or roll it back first. \
-             Check status: kubectl get valkeyupgrade {} -n {}",
-            scale_direction, upgrade_name, upgrade_name, namespace
-        );
-
-        warn!(name = %name, upgrade = %upgrade_name, "Blocking scale operation during upgrade");
-
-        // Update status with error
-        let mut status = obj.status.clone().unwrap_or_default();
-        status.last_error = Some(error_msg.clone());
-        status.message = format!("Blocked: {}", error_msg);
-
-        let patch = serde_json::json!({ "status": status });
-        let _ = api
-            .patch_status(
-                &name,
-                &kube::api::PatchParams::apply(FIELD_MANAGER),
-                &kube::api::Patch::Merge(&patch),
-            )
-            .await;
-
-        ctx.publish_warning_event(
-            obj,
-            "UpgradeInProgress",
-            "DetectingChanges",
-            Some(error_msg),
-        )
-        .await;
-
-        // Return to Running phase - the spec change is effectively ignored
-        return Ok(ClusterPhase::Running);
-    }
-
-    // Compute nodes to add/remove
-    let (nodes_to_add, nodes_to_remove) = if scale_direction == "up" {
-        let new_masters: Vec<String> = (current_masters..target_masters)
-            .map(|i| format!("{}-{}", name, i))
-            .collect();
-        (new_masters, Vec::new())
-    } else if scale_direction == "down" {
-        let removed_masters: Vec<String> = (target_masters..current_masters)
-            .map(|i| format!("{}-{}", name, i))
-            .collect();
-        (Vec::new(), removed_masters)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    // Create PendingChanges
-    let pending_changes = crate::crd::PendingChanges {
-        scale_direction: scale_direction.to_string(),
-        previous_masters: current_masters,
-        target_masters,
-        nodes_to_add: nodes_to_add.clone(),
-        nodes_to_remove: nodes_to_remove.clone(),
-        slot_migrations: Vec::new(), // Will be populated during MigratingSlots
-        requires_rolling_update: image_changed,
-        for_generation: obj.metadata.generation.unwrap_or(0),
-    };
-
-    // Update status with pending changes
-    let mut status = obj.status.clone().unwrap_or_default();
-    status.pending_changes = Some(pending_changes);
-    status.message = if image_changed && scale_direction == "none" {
-        "Detected image change".to_string()
-    } else if image_changed {
-        format!("Detected {} operation with image change", scale_direction)
-    } else {
-        format!("Detected {} operation", scale_direction)
-    };
-
-    // Update status via patch
-    let patch = serde_json::json!({
-        "status": status
-    });
-    api.patch_status(
-        &name,
-        &kube::api::PatchParams::apply(FIELD_MANAGER),
-        &kube::api::Patch::Merge(&patch),
-    )
-    .await?;
-
-    // Check if operation is allowed
-    if scale_direction != "none"
-        && let Err(e) =
-            operation_coordination::check_operation_allowed(api, &name, OperationType::Scaling)
-                .await
-    {
-        warn!(name = %name, error = %e, "Cannot start scaling operation due to conflict");
-        ctx.publish_warning_event(
-            obj,
-            "ScalingBlocked",
-            "DetectingChanges",
-            Some(e.to_string()),
-        )
-        .await;
-        // Stay in DetectingChanges to retry
-        return Ok(ClusterPhase::DetectingChanges);
-    }
-
-    ctx.publish_normal_event(
-        obj,
-        "ChangesDetected",
-        "DetectingChanges",
-        Some(format!(
-            "Detected {} operation: {} -> {} masters",
-            scale_direction, current_masters, target_masters
-        )),
-    )
-    .await;
-
-    // Determine next phase based on scale direction and image changes
-    match scale_direction {
-        "down" => {
-            // Scale-down: must migrate slots BEFORE removing pods
-            Ok(ClusterPhase::MigratingSlots)
-        }
-        "up" | "replica_change" => {
-            // Scale-up or replica change: update StatefulSet first
-            Ok(ClusterPhase::ScalingStatefulSet)
-        }
-        _ if image_changed => {
-            // Image changed but no scaling needed - still need to update StatefulSet
-            info!(
-                name = %name,
-                "Image change detected, transitioning to ScalingStatefulSet to apply update"
-            );
-            ctx.publish_normal_event(
-                obj,
-                "ImageChangeDetected",
-                "DetectingChanges",
-                Some("Image change detected, updating StatefulSet".to_string()),
-            )
-            .await;
-            Ok(ClusterPhase::ScalingStatefulSet)
-        }
-        _ => {
-            // No changes needed
-            Ok(ClusterPhase::Running)
-        }
-    }
-}
-
-/// Handle ScalingStatefulSet phase.
-///
-/// Updates the StatefulSet replica count and waits for pods to be ready.
-async fn handle_scaling_statefulset(
-    obj: &ValkeyCluster,
-    ctx: &Context,
-    _api: &Api<ValkeyCluster>,
-    namespace: &str,
-) -> Result<ClusterPhase, Error> {
-    let name = obj.name_any();
-    info!(name = %name, "Scaling StatefulSet");
-
-    // Apply StatefulSet changes
-    create_owned_resources(obj, ctx, namespace).await?;
-
-    // Get pending changes to determine what we're doing
-    let pending_changes = obj.status.as_ref().and_then(|s| s.pending_changes.as_ref());
-
-    let scale_direction = pending_changes
-        .map(|p| p.scale_direction.as_str())
-        .unwrap_or("none");
-    let requires_rolling_update = pending_changes
-        .map(|p| p.requires_rolling_update)
-        .unwrap_or(false);
-
-    // Check running pods
-    let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
-    let running_pods = check_running_pods(obj, ctx, namespace).await?;
-
-    // Handle image-only change (no scaling, just rolling update)
-    if scale_direction == "none" && requires_rolling_update {
-        info!(
-            name = %name,
-            "Image change applied to StatefulSet, transitioning to VerifyingCluster"
-        );
-        ctx.publish_normal_event(
-            obj,
-            "StatefulSetUpdated",
-            "ScalingStatefulSet",
-            Some("StatefulSet template updated with new image".to_string()),
-        )
-        .await;
-        // Go to VerifyingCluster to check cluster health
-        // Kubernetes will handle the rolling update automatically
-        return Ok(ClusterPhase::VerifyingCluster);
-    }
-
-    if scale_direction == "down" {
-        // For scale-down, we're reducing replicas AFTER slot migration
-        // StatefulSet should already be updated, just verify
-        if running_pods <= desired_replicas {
-            info!(
-                name = %name,
-                running = running_pods,
-                desired = desired_replicas,
-                "StatefulSet scaled down, verifying cluster"
-            );
-            ctx.publish_normal_event(
-                obj,
-                "StatefulSetScaled",
-                "ScalingStatefulSet",
-                Some(format!("StatefulSet scaled to {} pods", desired_replicas)),
-            )
-            .await;
-            return Ok(ClusterPhase::VerifyingCluster);
-        } else {
-            // Still waiting for pods to terminate
-            debug!(
-                name = %name,
-                running = running_pods,
-                desired = desired_replicas,
-                "Waiting for StatefulSet to scale down"
-            );
-            return Ok(ClusterPhase::ScalingStatefulSet);
-        }
-    }
-
-    // For scale-up, wait for all pods to be running
-    if running_pods < desired_replicas {
-        debug!(
-            name = %name,
-            running = running_pods,
-            desired = desired_replicas,
-            "Waiting for pods to start"
-        );
-        return Ok(ClusterPhase::ScalingStatefulSet);
-    }
-
-    // All pods running, move to adding nodes
-    info!(
-        name = %name,
-        running = running_pods,
-        "All pods running, proceeding to add nodes to cluster"
-    );
-
-    ctx.publish_normal_event(
-        obj,
-        "PodsReady",
-        "ScalingStatefulSet",
-        Some(format!("{} pods ready", running_pods)),
-    )
-    .await;
-
-    Ok(ClusterPhase::AddingNodes)
-}
-
-/// Handle AddingNodes phase.
-///
-/// Executes CLUSTER MEET for new nodes to join the cluster.
-async fn handle_adding_nodes(
-    obj: &ValkeyCluster,
-    ctx: &Context,
-    _api: &Api<ValkeyCluster>,
-    namespace: &str,
-) -> Result<ClusterPhase, Error> {
-    let name = obj.name_any();
-    info!(name = %name, "Adding new nodes to cluster");
-
-    // Get pending changes to see what nodes to add
-    let pending_changes = obj.status.as_ref().and_then(|s| s.pending_changes.as_ref());
-
-    let nodes_to_add = pending_changes
-        .map(|p| p.nodes_to_add.clone())
-        .unwrap_or_default();
-
-    if nodes_to_add.is_empty() {
-        // No new master nodes, but might have new replicas
-        match add_new_replicas_to_cluster(obj, ctx, namespace).await {
-            Ok(added) if added > 0 => {
-                info!(name = %name, added = added, "Added new replicas to cluster");
-                ctx.publish_normal_event(
-                    obj,
-                    "ReplicasAdded",
-                    "AddingNodes",
-                    Some(format!("Added {} new replicas", added)),
-                )
-                .await;
-            }
-            Ok(_) => {
-                debug!(name = %name, "No new replicas to add");
-            }
-            Err(e) => {
-                warn!(name = %name, error = %e, "Failed to add replicas, will retry");
-                return Ok(ClusterPhase::AddingNodes);
-            }
-        }
-        // No scaling needed, verify cluster
-        return Ok(ClusterPhase::VerifyingCluster);
-    }
-
-    // Check how many nodes are in the cluster
-    let nodes_in_cluster = get_nodes_in_cluster_count(obj, ctx, namespace).await?;
-    let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);
-
-    if nodes_in_cluster >= desired_replicas {
-        // All nodes already in cluster
-        info!(
-            name = %name,
-            nodes = nodes_in_cluster,
-            "All nodes in cluster, proceeding to slot migration"
-        );
-        ctx.publish_normal_event(
-            obj,
-            "NodesAdded",
-            "AddingNodes",
-            Some(format!("{} nodes in cluster", nodes_in_cluster)),
-        )
-        .await;
-        return Ok(ClusterPhase::MigratingSlots);
-    }
-
-    // Add new replicas (which includes CLUSTER MEET for new masters)
-    match add_new_replicas_to_cluster(obj, ctx, namespace).await {
-        Ok(added) => {
-            info!(name = %name, added = added, "Added nodes to cluster");
-            ctx.publish_normal_event(
-                obj,
-                "NodesAdded",
-                "AddingNodes",
-                Some(format!("Added {} nodes to cluster", added)),
-            )
-            .await;
-        }
-        Err(e) => {
-            warn!(name = %name, error = %e, "Failed to add nodes, will retry");
-            ctx.publish_warning_event(
-                obj,
-                "NodeAddFailed",
-                "AddingNodes",
-                Some(format!("Failed to add nodes: {}", e)),
-            )
-            .await;
-            return Ok(ClusterPhase::AddingNodes);
-        }
-    }
-
-    // Check again if all nodes are now in cluster
-    let nodes_in_cluster = get_nodes_in_cluster_count(obj, ctx, namespace).await?;
-    if nodes_in_cluster >= desired_replicas {
-        Ok(ClusterPhase::MigratingSlots)
-    } else {
-        // Still more nodes to add
-        Ok(ClusterPhase::AddingNodes)
-    }
-}
-
-/// Handle MigratingSlots phase.
-///
-/// Migrates slots for rebalancing during scale operations.
-async fn handle_migrating_slots(
-    obj: &ValkeyCluster,
-    ctx: &Context,
-    api: &Api<ValkeyCluster>,
-    namespace: &str,
-) -> Result<ClusterPhase, Error> {
-    let name = obj.name_any();
-    info!(name = %name, "Migrating slots");
-
-    // Acquire operation lock for scaling
-    if let Err(e) =
-        operation_coordination::start_operation(api, &name, OperationType::Scaling).await
-    {
-        warn!(name = %name, error = %e, "Failed to acquire operation lock");
-        return Ok(ClusterPhase::MigratingSlots);
-    }
-
-    // Execute the scaling operation (which handles slot migration)
-    let scaling_result = execute_scaling_operation(obj, ctx, namespace).await;
-
-    // Release operation lock
-    let _ = operation_coordination::complete_operation(api, &name, OperationType::Scaling).await;
-
-    match scaling_result {
-        Ok(result) => {
-            if result.success {
-                info!(
-                    name = %name,
-                    slots_moved = result.slots_moved,
-                    nodes_added = result.nodes_added.len(),
-                    nodes_removed = result.nodes_removed.len(),
-                    "Slot migration completed"
-                );
-
-                ctx.publish_normal_event(
-                    obj,
-                    "SlotsMigrated",
-                    "MigratingSlots",
-                    Some(format!("{} slots migrated", result.slots_moved)),
-                )
-                .await;
-
-                // Determine next phase based on operation type
-                let pending_changes = obj.status.as_ref().and_then(|s| s.pending_changes.as_ref());
-
-                let scale_direction = pending_changes
-                    .map(|p| p.scale_direction.as_str())
-                    .unwrap_or("none");
-
-                if scale_direction == "down" {
-                    // Scale-down: need to remove nodes from cluster
-                    Ok(ClusterPhase::RemovingNodes)
-                } else {
-                    // Scale-up: verify cluster health
-                    Ok(ClusterPhase::VerifyingCluster)
-                }
-            } else {
-                warn!(name = %name, error = ?result.error, "Slot migration failed");
-                ctx.publish_warning_event(
-                    obj,
-                    "SlotMigrationFailed",
-                    "MigratingSlots",
-                    result.error.clone(),
-                )
-                .await;
-                // Stay in MigratingSlots to retry
-                Ok(ClusterPhase::MigratingSlots)
-            }
-        }
-        Err(e) => {
-            warn!(name = %name, error = %e, "Slot migration error");
-            ctx.publish_warning_event(
-                obj,
-                "SlotMigrationFailed",
-                "MigratingSlots",
-                Some(format!("Migration failed: {}", e)),
-            )
-            .await;
-            // Stay in MigratingSlots to retry
-            Ok(ClusterPhase::MigratingSlots)
-        }
-    }
-}
-
-/// Handle RemovingNodes phase.
-///
-/// Executes CLUSTER FORGET for nodes being removed during scale-down.
-async fn handle_removing_nodes(
-    obj: &ValkeyCluster,
-    ctx: &Context,
-    _api: &Api<ValkeyCluster>,
-    _namespace: &str,
-) -> Result<ClusterPhase, Error> {
-    let name = obj.name_any();
-    info!(name = %name, "Removing nodes from cluster");
-
-    // Get pending changes to see what nodes to remove
-    let pending_changes = obj.status.as_ref().and_then(|s| s.pending_changes.as_ref());
-
-    let nodes_to_remove = pending_changes
-        .map(|p| p.nodes_to_remove.clone())
-        .unwrap_or_default();
-
-    if nodes_to_remove.is_empty() {
-        info!(name = %name, "No nodes to remove");
-        return Ok(ClusterPhase::ScalingStatefulSet);
-    }
-
-    // The execute_scaling_operation already handles CLUSTER FORGET
-    // So at this point, the nodes should already be forgotten
-    // We just need to verify and update the StatefulSet
-
-    info!(
-        name = %name,
-        nodes = ?nodes_to_remove,
-        "Nodes removed from cluster, updating StatefulSet"
-    );
-
-    ctx.publish_normal_event(
-        obj,
-        "NodesRemoved",
-        "RemovingNodes",
-        Some(format!(
-            "Removed {} nodes from cluster",
-            nodes_to_remove.len()
-        )),
-    )
-    .await;
-
-    // Proceed to scale down the StatefulSet
-    Ok(ClusterPhase::ScalingStatefulSet)
-}
-
-/// Detect and clean up orphaned nodes (masters with no slots beyond expected count).
-///
-/// This handles the case where a node dies during scale-down before CLUSTER FORGET
-/// can be executed. The orphaned node will still appear in CLUSTER NODES with fail/pfail
-/// flags, causing the health check to fail.
-///
-/// Returns the list of node IDs that were successfully cleaned up.
-async fn detect_and_cleanup_orphans(
-    cluster: &ValkeyCluster,
-    ctx: &Context,
-    namespace: &str,
-) -> Result<Vec<String>, Error> {
-    let expected_masters = cluster.spec.masters;
-    let name = cluster.name_any();
-
-    // Get connection context
-    let (password, tls_certs, strategy) = ctx.connection_context(cluster, namespace).await?;
-
-    // Connect to get cluster state
-    let (host, port) = strategy
-        .get_connection(0)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    let client = crate::client::ValkeyClient::connect_single(
-        &host,
-        port,
-        password.as_deref(),
-        tls_certs.as_ref(),
-    )
-    .await
-    .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    let orphans = cluster_init::detect_orphaned_nodes(&client, expected_masters)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    let _ = client.close().await;
-
-    if orphans.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let orphan_ids: Vec<String> = orphans.iter().map(|n| n.node_id.clone()).collect();
-
-    info!(
-        cluster = %name,
-        orphan_count = orphans.len(),
-        orphan_ids = ?orphan_ids,
-        "Detected orphaned nodes, cleaning up via CLUSTER FORGET"
-    );
-
-    // Execute CLUSTER FORGET with retry across pods
-    let forgotten = cluster_init::forget_nodes_with_retry(
-        cluster,
-        &orphan_ids,
-        password.as_deref(),
-        tls_certs.as_ref(),
-        &strategy,
-    )
-    .await
-    .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    Ok(forgotten)
-}
-
-/// Rebalance replicas across masters to ensure even distribution.
-///
-/// After scaling operations, replicas may become unevenly distributed. This function
-/// detects masters with too many replicas and moves excess replicas to masters with
-/// too few replicas.
-///
-/// Returns the number of replicas moved.
-async fn rebalance_replicas(
-    cluster: &ValkeyCluster,
-    ctx: &Context,
-    namespace: &str,
-) -> Result<i32, Error> {
-    let expected_masters = cluster.spec.masters;
-    let expected_replicas_per_master = cluster.spec.replicas_per_master;
-
-    if expected_replicas_per_master == 0 {
-        return Ok(0);
-    }
-
-    // Get connection context
-    let (password, tls_certs, strategy) = ctx.connection_context(cluster, namespace).await?;
-
-    // Connect to get cluster state
-    let (host, port) = strategy
-        .get_connection(0)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    let client = crate::client::ValkeyClient::connect_single(
-        &host,
-        port,
-        password.as_deref(),
-        tls_certs.as_ref(),
-    )
-    .await
-    .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    let cluster_nodes = client
-        .cluster_nodes()
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    let _ = client.close().await;
-
-    // Build map of master node_id -> (ordinal, replica_count, replica_node_ids)
-    let masters = cluster_nodes.masters();
-    let mut master_info: Vec<(String, i32, i32, Vec<String>)> = Vec::new();
-
-    for master in &masters {
-        let ordinal = crate::slots::planner::extract_ordinal_from_address(&master.address)
-            .map(|o| o as i32)
-            .unwrap_or(-1);
-
-        // Only consider masters within expected range
-        if ordinal < 0 || ordinal >= expected_masters {
-            continue;
-        }
-
-        let replicas = cluster_nodes.replicas_of(&master.node_id);
-        let replica_ids: Vec<String> = replicas.iter().map(|r| r.node_id.clone()).collect();
-
-        master_info.push((
-            master.node_id.clone(),
-            ordinal,
-            replicas.len() as i32,
-            replica_ids,
-        ));
-    }
-
-    // Sort by ordinal to ensure consistent ordering
-    master_info.sort_by_key(|(_, ordinal, _, _)| *ordinal);
-
-    // Find masters with too many and too few replicas
-    let mut masters_with_excess: Vec<(String, i32, Vec<String>)> = Vec::new();
-    let mut masters_needing_replicas: Vec<(String, i32)> = Vec::new();
-
-    for (node_id, ordinal, replica_count, replica_ids) in master_info {
-        if replica_count > expected_replicas_per_master {
-            // Calculate excess replicas
-            let excess = replica_count - expected_replicas_per_master;
-            // Take the last `excess` replicas to move
-            let excess_replica_ids: Vec<String> = replica_ids
-                .into_iter()
-                .rev()
-                .take(excess as usize)
-                .collect();
-            masters_with_excess.push((node_id, ordinal, excess_replica_ids));
-        } else if replica_count < expected_replicas_per_master {
-            for _ in 0..(expected_replicas_per_master - replica_count) {
-                masters_needing_replicas.push((node_id.clone(), ordinal));
-            }
-        }
-    }
-
-    if masters_with_excess.is_empty() || masters_needing_replicas.is_empty() {
-        // No rebalancing needed
-        return Ok(0);
-    }
-
-    info!(
-        masters_with_excess = masters_with_excess.len(),
-        masters_needing_replicas = masters_needing_replicas.len(),
-        "Rebalancing replicas across masters"
-    );
-
-    let mut replicas_moved = 0;
-
-    // For each master needing replicas, take one from a master with excess
-    for (target_master_id, target_ordinal) in masters_needing_replicas {
-        // Find a master with excess replicas
-        let Some((source_idx, (_, source_ordinal, excess_replicas))) = masters_with_excess
-            .iter_mut()
-            .enumerate()
-            .find(|(_, (_, _, replicas))| !replicas.is_empty())
-        else {
-            // No more excess replicas available
-            break;
-        };
-
-        let Some(replica_to_move) = excess_replicas.pop() else {
-            continue;
-        };
-
-        info!(
-            replica_id = %replica_to_move,
-            from_master_ordinal = source_ordinal,
-            to_master_ordinal = target_ordinal,
-            "Moving replica to rebalance cluster"
-        );
-
-        // Find the replica's ordinal to connect to it
-        let replica_ordinal = cluster_nodes
-            .nodes
-            .iter()
-            .find(|n| n.node_id == replica_to_move)
-            .and_then(|n| crate::slots::planner::extract_ordinal_from_address(&n.address))
-            .map(|o| o as i32);
-
-        let Some(replica_ordinal) = replica_ordinal else {
-            warn!(
-                replica_id = %replica_to_move,
-                "Could not find ordinal for replica, skipping"
-            );
-            continue;
-        };
-
-        // Connect to the replica and execute CLUSTER REPLICATE
-        let (replica_host, replica_port) = strategy
-            .get_connection(replica_ordinal)
-            .await
-            .map_err(|e| Error::Valkey(e.to_string()))?;
-
-        let replica_client = crate::client::ValkeyClient::connect_single(
-            &replica_host,
-            replica_port,
-            password.as_deref(),
-            tls_certs.as_ref(),
-        )
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
-
-        match replica_client.cluster_replicate(&target_master_id).await {
-            Ok(()) => {
-                info!(
-                    replica_ordinal = replica_ordinal,
-                    target_master_ordinal = target_ordinal,
-                    "Replica reassigned to new master"
-                );
-                replicas_moved += 1;
-            }
-            Err(e) => {
-                warn!(
-                    replica_ordinal = replica_ordinal,
-                    target_master_ordinal = target_ordinal,
-                    error = %e,
-                    "Failed to reassign replica"
-                );
-            }
-        }
-
-        let _ = replica_client.close().await;
-
-        // Clean up empty entries
-        if excess_replicas.is_empty() {
-            masters_with_excess.remove(source_idx);
-        }
-    }
-
-    if replicas_moved > 0 {
-        info!(
-            replicas_moved = replicas_moved,
-            "Replica rebalancing complete"
-        );
-    }
-
-    Ok(replicas_moved)
-}
-
-/// Set up replicas for new masters if they don't have the expected number of replicas.
-///
-/// This function detects masters that have fewer replicas than expected and configures
-/// the missing replicas. This handles the scale-up case where CLUSTER MEET succeeded
-/// for new masters but their replicas weren't configured.
-async fn setup_replicas_for_new_masters_if_needed(
-    cluster: &ValkeyCluster,
-    ctx: &Context,
-    namespace: &str,
-) -> Result<i32, Error> {
-    let expected_masters = cluster.spec.masters;
-    let expected_replicas_per_master = cluster.spec.replicas_per_master;
-
-    if expected_replicas_per_master == 0 {
-        return Ok(0);
-    }
-
-    // Get connection context
-    let (password, tls_certs, strategy) = ctx.connection_context(cluster, namespace).await?;
-
-    // Connect to get cluster state
-    let (host, port) = strategy
-        .get_connection(0)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    let client = crate::client::ValkeyClient::connect_single(
-        &host,
-        port,
-        password.as_deref(),
-        tls_certs.as_ref(),
-    )
-    .await
-    .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    let cluster_nodes = client
-        .cluster_nodes()
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    let _ = client.close().await;
-
-    // Find masters and count their replicas
-    let masters = cluster_nodes.masters();
-    let mut new_master_ordinals: Vec<i32> = Vec::new();
-
-    for master in &masters {
-        // Extract ordinal from master address
-        let ordinal = match crate::slots::planner::extract_ordinal_from_address(&master.address) {
-            Some(o) => o as i32,
-            None => continue,
-        };
-
-        // Only check masters within the expected range
-        if ordinal >= expected_masters {
-            continue;
-        }
-
-        // Count replicas for this master
-        let replica_count = cluster_nodes.replicas_of(&master.node_id).len() as i32;
-
-        if replica_count < expected_replicas_per_master {
-            debug!(
-                master_ordinal = ordinal,
-                current_replicas = replica_count,
-                expected_replicas = expected_replicas_per_master,
-                "Master has fewer replicas than expected"
-            );
-            new_master_ordinals.push(ordinal);
-        }
-    }
-
-    if new_master_ordinals.is_empty() {
-        return Ok(0);
-    }
-
-    info!(
-        masters_needing_replicas = ?new_master_ordinals,
-        "Setting up replicas for masters with missing replicas"
-    );
-
-    // Set up replicas for the masters that need them
-    let configured = cluster_init::setup_replicas_for_new_masters(
-        cluster,
-        password.as_deref(),
-        tls_certs.as_ref(),
-        &strategy,
-        &new_master_ordinals,
-    )
-    .await
-    .map_err(|e| Error::Valkey(e.to_string()))?;
-
-    Ok(configured)
-}
-
-/// Handle VerifyingCluster phase.
-///
-/// Performs final health check before transitioning to Running.
-/// Also detects and cleans up orphaned nodes that may remain from failed scale-down operations.
-async fn handle_verifying_cluster(
-    obj: &ValkeyCluster,
-    ctx: &Context,
-    api: &Api<ValkeyCluster>,
-    namespace: &str,
-) -> Result<ClusterPhase, Error> {
-    let name = obj.name_any();
-    info!(name = %name, "Verifying cluster health");
-
-    // Step 1: Check for orphaned nodes (masters with no slots beyond expected count)
-    // This handles the case where CLUSTER FORGET failed during scale-down
-    match detect_and_cleanup_orphans(obj, ctx, namespace).await {
-        Ok(forgotten) if !forgotten.is_empty() => {
-            info!(
-                name = %name,
-                orphan_count = forgotten.len(),
-                "Cleaned up orphaned nodes, will re-verify"
-            );
-            ctx.publish_normal_event(
-                obj,
-                "OrphanedNodesRemoved",
-                "Cleanup",
-                Some(format!(
-                    "Removed {} orphaned nodes from cluster",
-                    forgotten.len()
-                )),
-            )
-            .await;
-
-            // Give gossip time to propagate, then re-verify
-            return Ok(ClusterPhase::VerifyingCluster);
-        }
-        Ok(_) => {
-            // No orphaned nodes found
-        }
-        Err(e) => {
-            // Log but continue with health check - orphan cleanup is best-effort
-            warn!(name = %name, error = %e, "Failed to check for orphaned nodes, continuing");
-        }
-    }
-
-    // Step 2: Ensure replicas are configured for any new masters (scale-up scenario)
-    // This handles the case where CLUSTER MEET succeeded but replicas weren't set up
-    if obj.spec.replicas_per_master > 0 {
-        match setup_replicas_for_new_masters_if_needed(obj, ctx, namespace).await {
-            Ok(configured) if configured > 0 => {
-                info!(
-                    name = %name,
-                    replicas_configured = configured,
-                    "Configured replicas for new masters"
-                );
-                ctx.publish_normal_event(
-                    obj,
-                    "ReplicasConfigured",
-                    "VerifyingCluster",
-                    Some(format!(
-                        "Configured {} replicas for new masters",
-                        configured
-                    )),
-                )
-                .await;
-            }
-            Ok(_) => {
-                // No new replicas needed
-            }
-            Err(e) => {
-                warn!(name = %name, error = %e, "Failed to configure replicas for new masters, continuing");
-            }
-        }
-    }
-
-    // Step 3: Rebalance replicas if needed (after scale cycles)
-    // This handles the case where replicas are unevenly distributed
-    if obj.spec.replicas_per_master > 0 {
-        match rebalance_replicas(obj, ctx, namespace).await {
-            Ok(moved) if moved > 0 => {
-                info!(
-                    name = %name,
-                    replicas_moved = moved,
-                    "Rebalanced replicas across masters"
-                );
-                ctx.publish_normal_event(
-                    obj,
-                    "ReplicasRebalanced",
-                    "VerifyingCluster",
-                    Some(format!("Rebalanced {} replicas across masters", moved)),
-                )
-                .await;
-                // Give cluster time to stabilize before health check
-                return Ok(ClusterPhase::VerifyingCluster);
-            }
-            Ok(_) => {
-                // No rebalancing needed
-            }
-            Err(e) => {
-                warn!(name = %name, error = %e, "Failed to rebalance replicas, continuing");
-            }
-        }
-    }
-
-    // Step 4: Check cluster health
-    match check_cluster_health(obj, ctx, namespace).await {
-        Ok(health) if health.is_healthy => {
-            info!(
-                name = %name,
-                slots_assigned = health.slots_assigned,
-                healthy_masters = health.healthy_masters,
-                "Cluster verification passed"
-            );
-
-            // Clear pending changes
-            let mut status = obj.status.clone().unwrap_or_default();
-            status.pending_changes = None;
-            status.operation_progress = None;
-            status.message = "Cluster healthy".to_string();
-
-            let patch = serde_json::json!({
-                "status": status
-            });
-            let _ = api
-                .patch_status(
-                    &name,
-                    &kube::api::PatchParams::apply(FIELD_MANAGER),
-                    &kube::api::Patch::Merge(&patch),
-                )
-                .await;
-
-            ctx.publish_normal_event(
-                obj,
-                "ClusterVerified",
-                "VerifyingCluster",
-                Some("Cluster health verification passed".to_string()),
-            )
-            .await;
-
-            Ok(ClusterPhase::Running)
-        }
-        Ok(health) => {
-            // Cluster not healthy yet, check if degraded
-            warn!(
-                name = %name,
-                slots_assigned = health.slots_assigned,
-                healthy_masters = health.healthy_masters,
-                "Cluster not yet healthy, waiting"
-            );
-
-            if health.healthy_masters == 0 {
-                // No healthy masters - this is a problem
-                Ok(ClusterPhase::Degraded)
-            } else {
-                // Some masters healthy, might still be stabilizing
-                Ok(ClusterPhase::VerifyingCluster)
-            }
-        }
-        Err(e) => {
-            warn!(name = %name, error = %e, "Health check failed during verification");
-            // Might be transient, stay in VerifyingCluster to retry
-            Ok(ClusterPhase::VerifyingCluster)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3408,9 +2770,17 @@ mod tests {
     }
 
     #[test]
-    fn test_requeue_duration_initializing_phase() {
-        assert_eq!(requeue_duration(ClusterPhase::Initializing).as_secs(), 2);
+    fn test_requeue_duration_initial_creation_phases() {
+        assert_eq!(requeue_duration(ClusterPhase::WaitingForPods).as_secs(), 2);
+        assert_eq!(
+            requeue_duration(ClusterPhase::InitializingCluster).as_secs(),
+            2
+        );
         assert_eq!(requeue_duration(ClusterPhase::AssigningSlots).as_secs(), 2);
+        assert_eq!(
+            requeue_duration(ClusterPhase::ConfiguringReplicas).as_secs(),
+            2
+        );
     }
 
     #[test]
@@ -3419,42 +2789,52 @@ mod tests {
     }
 
     #[test]
-    fn test_requeue_duration_detecting_changes_phase() {
+    fn test_requeue_duration_scale_up_phases() {
         assert_eq!(
-            requeue_duration(ClusterPhase::DetectingChanges).as_secs(),
+            requeue_duration(ClusterPhase::ScalingUpStatefulSet).as_secs(),
+            2
+        );
+        assert_eq!(
+            requeue_duration(ClusterPhase::WaitingForNewPods).as_secs(),
+            2
+        );
+        assert_eq!(
+            requeue_duration(ClusterPhase::AddingNodesToCluster).as_secs(),
+            2
+        );
+        assert_eq!(
+            requeue_duration(ClusterPhase::ConfiguringNewReplicas).as_secs(),
             2
         );
     }
 
     #[test]
-    fn test_requeue_duration_scaling_statefulset_phase() {
+    fn test_requeue_duration_scale_down_phases() {
         assert_eq!(
-            requeue_duration(ClusterPhase::ScalingStatefulSet).as_secs(),
+            requeue_duration(ClusterPhase::RemovingNodesFromCluster).as_secs(),
+            2
+        );
+        assert_eq!(
+            requeue_duration(ClusterPhase::ScalingDownStatefulSet).as_secs(),
             2
         );
     }
 
     #[test]
-    fn test_requeue_duration_adding_nodes_phase() {
-        assert_eq!(requeue_duration(ClusterPhase::AddingNodes).as_secs(), 2);
-    }
-
-    #[test]
-    fn test_requeue_duration_removing_nodes_phase() {
-        assert_eq!(requeue_duration(ClusterPhase::RemovingNodes).as_secs(), 2);
-    }
-
-    #[test]
-    fn test_requeue_duration_verifying_cluster_phase() {
+    fn test_requeue_duration_verifying_cluster_health_phase() {
         assert_eq!(
-            requeue_duration(ClusterPhase::VerifyingCluster).as_secs(),
+            requeue_duration(ClusterPhase::VerifyingClusterHealth).as_secs(),
             2
         );
     }
 
     #[test]
-    fn test_requeue_duration_migrating_slots_phase() {
-        assert_eq!(requeue_duration(ClusterPhase::MigratingSlots).as_secs(), 5);
+    fn test_requeue_duration_slot_phases() {
+        assert_eq!(
+            requeue_duration(ClusterPhase::RebalancingSlots).as_secs(),
+            5
+        );
+        assert_eq!(requeue_duration(ClusterPhase::EvacuatingSlots).as_secs(), 5);
     }
 
     #[test]

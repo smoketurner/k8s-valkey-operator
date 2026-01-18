@@ -137,10 +137,14 @@ async fn test_slot_rebalancing_on_scale_up() {
                 .map(|s| {
                     matches!(
                         s.phase,
-                        ClusterPhase::DetectingChanges
-                            | ClusterPhase::ScalingStatefulSet
-                            | ClusterPhase::AddingNodes
-                            | ClusterPhase::MigratingSlots
+                        ClusterPhase::ScalingUpStatefulSet
+                            | ClusterPhase::WaitingForNewPods
+                            | ClusterPhase::AddingNodesToCluster
+                            | ClusterPhase::RebalancingSlots
+                            | ClusterPhase::ConfiguringNewReplicas
+                            | ClusterPhase::EvacuatingSlots
+                            | ClusterPhase::RemovingNodesFromCluster
+                            | ClusterPhase::ScalingDownStatefulSet
                     )
                 })
                 .unwrap_or(false)
@@ -237,11 +241,11 @@ async fn test_slot_migration_on_scale_down() {
     wait_for_phase(
         &api,
         "slot-migrate-test",
-        ClusterPhase::DetectingChanges,
+        ClusterPhase::EvacuatingSlots,
         SHORT_TIMEOUT,
     )
     .await
-    .ok(); // May be fast enough to skip directly to MigratingSlots
+    .ok(); // May be fast enough to skip directly to RemovingNodesFromCluster
 
     // Wait for cluster to be operational again
     wait_for_operational(&api, "slot-migrate-test", EXTENDED_TIMEOUT)
@@ -404,7 +408,7 @@ async fn test_resharding_phase_detection() {
     let resharding_detected = wait_for_phase(
         &api,
         "reshard-detect-test",
-        ClusterPhase::MigratingSlots,
+        ClusterPhase::RebalancingSlots,
         DEFAULT_TIMEOUT,
     )
     .await;
@@ -415,7 +419,7 @@ async fn test_resharding_phase_detection() {
             client.clone(),
             &ns_name,
             "reshard-detect-test",
-            ClusterPhase::MigratingSlots,
+            ClusterPhase::RebalancingSlots,
         )
         .await;
     } else {

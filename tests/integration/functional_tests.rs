@@ -109,15 +109,15 @@ async fn test_phase_transitions_to_running() {
         .await
         .expect("Resource should reach Creating phase");
 
-    // Should transition to Initializing
+    // Should transition to InitializingCluster
     wait_for_phase(
         &api,
         "test-phases",
-        ClusterPhase::Initializing,
+        ClusterPhase::InitializingCluster,
         LONG_TIMEOUT,
     )
     .await
-    .expect("Resource should reach Initializing phase");
+    .expect("Resource should reach InitializingCluster phase");
 
     // Should transition to AssigningSlots
     wait_for_phase(

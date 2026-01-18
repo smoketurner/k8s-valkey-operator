@@ -29,19 +29,31 @@ fn valid_replicas_per_master() -> impl Strategy<Value = i32> {
 /// Strategy for generating random phases.
 fn any_phase() -> impl Strategy<Value = ClusterPhase> {
     prop_oneof![
+        // Initial creation phases
         Just(ClusterPhase::Pending),
         Just(ClusterPhase::Creating),
-        Just(ClusterPhase::Initializing),
+        Just(ClusterPhase::WaitingForPods),
+        Just(ClusterPhase::InitializingCluster),
         Just(ClusterPhase::AssigningSlots),
+        Just(ClusterPhase::ConfiguringReplicas),
+        // Running
         Just(ClusterPhase::Running),
-        Just(ClusterPhase::DetectingChanges),
-        Just(ClusterPhase::ScalingStatefulSet),
-        Just(ClusterPhase::AddingNodes),
-        Just(ClusterPhase::MigratingSlots),
-        Just(ClusterPhase::RemovingNodes),
-        Just(ClusterPhase::VerifyingCluster),
+        // Scale-up phases
+        Just(ClusterPhase::ScalingUpStatefulSet),
+        Just(ClusterPhase::WaitingForNewPods),
+        Just(ClusterPhase::AddingNodesToCluster),
+        Just(ClusterPhase::RebalancingSlots),
+        Just(ClusterPhase::ConfiguringNewReplicas),
+        // Scale-down phases
+        Just(ClusterPhase::EvacuatingSlots),
+        Just(ClusterPhase::RemovingNodesFromCluster),
+        Just(ClusterPhase::ScalingDownStatefulSet),
+        // Verification
+        Just(ClusterPhase::VerifyingClusterHealth),
+        // Problem states
         Just(ClusterPhase::Degraded),
         Just(ClusterPhase::Failed),
+        // Terminal
         Just(ClusterPhase::Deleting),
     ]
 }
@@ -50,13 +62,16 @@ fn any_phase() -> impl Strategy<Value = ClusterPhase> {
 fn any_event() -> impl Strategy<Value = ClusterEvent> {
     prop_oneof![
         Just(ClusterEvent::ResourcesApplied),
-        Just(ClusterEvent::AllReplicasReady),
+        Just(ClusterEvent::PodsRunning),
         Just(ClusterEvent::ReplicasDegraded),
-        Just(ClusterEvent::SpecChanged),
         Just(ClusterEvent::ReconcileError),
         Just(ClusterEvent::DeletionRequested),
         Just(ClusterEvent::RecoveryInitiated),
         Just(ClusterEvent::FullyRecovered),
+        Just(ClusterEvent::PhaseComplete),
+        Just(ClusterEvent::ScaleUpDetected),
+        Just(ClusterEvent::ScaleDownDetected),
+        Just(ClusterEvent::ClusterHealthy),
     ]
 }
 

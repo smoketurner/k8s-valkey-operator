@@ -18,6 +18,7 @@ pub mod cluster_init;
 pub mod cluster_phases;
 pub mod cluster_reconciler;
 pub mod cluster_state_machine;
+pub mod cluster_topology;
 pub mod cluster_validation;
 pub mod operation_coordination;
 

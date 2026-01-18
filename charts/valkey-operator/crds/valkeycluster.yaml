@@ -76,7 +76,7 @@ spec:
                       default: "valkey/valkey"
                     tag:
                       type: string
-                      default: "9-alpine"
+                      default: "9.0.1-alpine"
                     pullPolicy:
                       type: string
                       default: "IfNotPresent"
@@ -338,19 +338,31 @@ spec:
                 phase:
                   type: string
                   enum:
+                    # Initial Creation
                     - Pending
                     - Creating
-                    - Initializing
+                    - WaitingForPods
+                    - InitializingCluster
                     - AssigningSlots
+                    - ConfiguringReplicas
+                    # Steady State
                     - Running
-                    - DetectingChanges
-                    - ScalingStatefulSet
-                    - AddingNodes
-                    - MigratingSlots
-                    - RemovingNodes
-                    - VerifyingCluster
+                    # Scale-Up Path
+                    - ScalingUpStatefulSet
+                    - WaitingForNewPods
+                    - AddingNodesToCluster
+                    - RebalancingSlots
+                    - ConfiguringNewReplicas
+                    # Scale-Down Path
+                    - EvacuatingSlots
+                    - RemovingNodesFromCluster
+                    - ScalingDownStatefulSet
+                    # Completion
+                    - VerifyingClusterHealth
+                    # Problem States
                     - Degraded
                     - Failed
+                    # Terminal
                     - Deleting
                 readyNodes:
                   type: string
@@ -375,6 +387,37 @@ spec:
                 tlsSecret:
                   type: string
                   description: Secret containing TLS certificates
+                operationProgress:
+                  type: object
+                  description: Progress tracking for multi-step operations
+                  properties:
+                    currentStep:
+                      type: string
+                    totalSteps:
+                      type: integer
+                    completedSteps:
+                      type: integer
+                message:
+                  type: string
+                  description: Human-readable status message
+                reconcileCount:
+                  type: integer
+                  description: Count of reconciliations in current phase
+                lastPhaseTransition:
+                  type: string
+                  description: Timestamp of last phase transition
+                recoveryAttempts:
+                  type: integer
+                  description: Number of recovery attempts
+                lastRecoveryAttempt:
+                  type: string
+                  description: Timestamp of last recovery attempt
+                currentOperation:
+                  type: string
+                  description: Current operation in progress
+                operationStartedAt:
+                  type: string
+                  description: Timestamp when current operation started
                 topology:
                   type: object
                   properties:

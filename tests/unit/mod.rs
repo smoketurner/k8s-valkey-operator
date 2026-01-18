@@ -16,10 +16,25 @@ mod crd_tests {
     fn test_phase_display() {
         assert_eq!(ClusterPhase::Pending.to_string(), "Pending");
         assert_eq!(ClusterPhase::Creating.to_string(), "Creating");
+        assert_eq!(ClusterPhase::WaitingForPods.to_string(), "WaitingForPods");
+        assert_eq!(
+            ClusterPhase::InitializingCluster.to_string(),
+            "InitializingCluster"
+        );
+        assert_eq!(ClusterPhase::AssigningSlots.to_string(), "AssigningSlots");
+        assert_eq!(
+            ClusterPhase::ConfiguringReplicas.to_string(),
+            "ConfiguringReplicas"
+        );
         assert_eq!(ClusterPhase::Running.to_string(), "Running");
         assert_eq!(
-            ClusterPhase::DetectingChanges.to_string(),
-            "DetectingChanges"
+            ClusterPhase::ScalingUpStatefulSet.to_string(),
+            "ScalingUpStatefulSet"
+        );
+        assert_eq!(ClusterPhase::EvacuatingSlots.to_string(), "EvacuatingSlots");
+        assert_eq!(
+            ClusterPhase::VerifyingClusterHealth.to_string(),
+            "VerifyingClusterHealth"
         );
         assert_eq!(ClusterPhase::Degraded.to_string(), "Degraded");
         assert_eq!(ClusterPhase::Failed.to_string(), "Failed");
@@ -75,15 +90,15 @@ mod state_machine_tests {
         assert!(sm.can_transition(&ClusterPhase::Pending, &ClusterEvent::ReconcileError));
         // Pending can transition via DeletionRequested -> Deleting
         assert!(sm.can_transition(&ClusterPhase::Pending, &ClusterEvent::DeletionRequested));
-        // Pending cannot directly go to Running via AllReplicasReady
-        assert!(!sm.can_transition(&ClusterPhase::Pending, &ClusterEvent::AllReplicasReady));
+        // Pending cannot directly go to Running via PodsRunning
+        assert!(!sm.can_transition(&ClusterPhase::Pending, &ClusterEvent::PodsRunning));
     }
 
     #[test]
     fn test_valid_events_from_creating() {
         let sm = ClusterStateMachine::new();
-        // Creating can transition via PodsRunning -> Initializing (for cluster formation)
-        assert!(sm.can_transition(&ClusterPhase::Creating, &ClusterEvent::PodsRunning));
+        // Creating can transition via ResourcesApplied -> WaitingForPods
+        assert!(sm.can_transition(&ClusterPhase::Creating, &ClusterEvent::ResourcesApplied));
         // Creating can transition via ReconcileError -> Failed
         assert!(sm.can_transition(&ClusterPhase::Creating, &ClusterEvent::ReconcileError));
         // Creating can transition via DeletionRequested -> Deleting
@@ -93,8 +108,10 @@ mod state_machine_tests {
     #[test]
     fn test_valid_events_from_running() {
         let sm = ClusterStateMachine::new();
-        // Running can transition via SpecChanged -> Updating
-        assert!(sm.can_transition(&ClusterPhase::Running, &ClusterEvent::SpecChanged));
+        // Running can transition via ScaleUpDetected -> ScalingUpStatefulSet
+        assert!(sm.can_transition(&ClusterPhase::Running, &ClusterEvent::ScaleUpDetected));
+        // Running can transition via ScaleDownDetected -> EvacuatingSlots
+        assert!(sm.can_transition(&ClusterPhase::Running, &ClusterEvent::ScaleDownDetected));
         // Running can transition via ReplicasDegraded -> Degraded
         assert!(sm.can_transition(&ClusterPhase::Running, &ClusterEvent::ReplicasDegraded));
         // Running can transition via DeletionRequested -> Deleting
@@ -104,32 +121,24 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn test_valid_events_from_detecting_changes() {
+    fn test_valid_events_from_scale_up_phases() {
         let sm = ClusterStateMachine::new();
-        // DetectingChanges can transition via NoChangesNeeded -> Running
+        // ScalingUpStatefulSet can transition via PhaseComplete -> WaitingForNewPods
         assert!(sm.can_transition(
-            &ClusterPhase::DetectingChanges,
-            &ClusterEvent::NoChangesNeeded
+            &ClusterPhase::ScalingUpStatefulSet,
+            &ClusterEvent::PhaseComplete
         ));
-        // DetectingChanges can transition via ChangesDetected -> ScalingStatefulSet
+        // WaitingForNewPods can transition via PodsRunning -> AddingNodesToCluster
+        assert!(sm.can_transition(&ClusterPhase::WaitingForNewPods, &ClusterEvent::PodsRunning));
+        // AddingNodesToCluster can transition via PhaseComplete -> RebalancingSlots
         assert!(sm.can_transition(
-            &ClusterPhase::DetectingChanges,
-            &ClusterEvent::ChangesDetected
+            &ClusterPhase::AddingNodesToCluster,
+            &ClusterEvent::PhaseComplete
         ));
-        // DetectingChanges can transition via SlotsMigrated -> MigratingSlots (for scale-down)
+        // RebalancingSlots can transition via PhaseComplete -> ConfiguringNewReplicas
         assert!(sm.can_transition(
-            &ClusterPhase::DetectingChanges,
-            &ClusterEvent::SlotsMigrated
-        ));
-        // DetectingChanges can transition via ReconcileError -> Failed
-        assert!(sm.can_transition(
-            &ClusterPhase::DetectingChanges,
-            &ClusterEvent::ReconcileError
-        ));
-        // DetectingChanges can transition via DeletionRequested -> Deleting
-        assert!(sm.can_transition(
-            &ClusterPhase::DetectingChanges,
-            &ClusterEvent::DeletionRequested
+            &ClusterPhase::RebalancingSlots,
+            &ClusterEvent::PhaseComplete
         ));
     }
 
@@ -138,10 +147,6 @@ mod state_machine_tests {
         let sm = ClusterStateMachine::new();
         // Degraded can transition via FullyRecovered -> Running
         assert!(sm.can_transition(&ClusterPhase::Degraded, &ClusterEvent::FullyRecovered));
-        // Degraded can transition via AllReplicasReady -> Running
-        assert!(sm.can_transition(&ClusterPhase::Degraded, &ClusterEvent::AllReplicasReady));
-        // Degraded can transition via SpecChanged -> Updating
-        assert!(sm.can_transition(&ClusterPhase::Degraded, &ClusterEvent::SpecChanged));
         // Degraded can transition via ReconcileError -> Failed
         assert!(sm.can_transition(&ClusterPhase::Degraded, &ClusterEvent::ReconcileError));
         // Degraded can transition via DeletionRequested -> Deleting
@@ -151,12 +156,12 @@ mod state_machine_tests {
     #[test]
     fn test_valid_events_from_failed() {
         let sm = ClusterStateMachine::new();
-        // Failed can transition via RecoveryInitiated -> Pending
+        // Failed can transition via RecoveryInitiated -> Degraded
         assert!(sm.can_transition(&ClusterPhase::Failed, &ClusterEvent::RecoveryInitiated));
         // Failed can transition via DeletionRequested -> Deleting
         assert!(sm.can_transition(&ClusterPhase::Failed, &ClusterEvent::DeletionRequested));
-        // Failed cannot go directly to Running
-        assert!(!sm.can_transition(&ClusterPhase::Failed, &ClusterEvent::AllReplicasReady));
+        // Failed can transition via ClusterHealthy -> Running (cluster recovered)
+        assert!(sm.can_transition(&ClusterPhase::Failed, &ClusterEvent::ClusterHealthy));
     }
 
     #[test]
@@ -176,15 +181,20 @@ mod state_machine_tests {
         let states = vec![
             ClusterPhase::Pending,
             ClusterPhase::Creating,
-            ClusterPhase::Initializing,
+            ClusterPhase::WaitingForPods,
+            ClusterPhase::InitializingCluster,
             ClusterPhase::AssigningSlots,
+            ClusterPhase::ConfiguringReplicas,
             ClusterPhase::Running,
-            ClusterPhase::DetectingChanges,
-            ClusterPhase::ScalingStatefulSet,
-            ClusterPhase::AddingNodes,
-            ClusterPhase::MigratingSlots,
-            ClusterPhase::RemovingNodes,
-            ClusterPhase::VerifyingCluster,
+            ClusterPhase::ScalingUpStatefulSet,
+            ClusterPhase::WaitingForNewPods,
+            ClusterPhase::AddingNodesToCluster,
+            ClusterPhase::RebalancingSlots,
+            ClusterPhase::ConfiguringNewReplicas,
+            ClusterPhase::EvacuatingSlots,
+            ClusterPhase::RemovingNodesFromCluster,
+            ClusterPhase::ScalingDownStatefulSet,
+            ClusterPhase::VerifyingClusterHealth,
             ClusterPhase::Degraded,
             ClusterPhase::Failed,
         ];

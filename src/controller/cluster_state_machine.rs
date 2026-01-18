@@ -3,24 +3,37 @@
 //! This module implements a proper FSM pattern with explicit state transitions,
 //! guards, and actions. It ensures that only valid state transitions occur and
 //! provides a clear audit trail of resource lifecycle events.
+//!
+//! ## Phase Categories
+//!
+//! ### Initial Creation
+//! Pending → Creating → WaitingForPods → InitializingCluster →
+//! AssigningSlots → ConfiguringReplicas → VerifyingClusterHealth → Running
+//!
+//! ### Scale-Up (e.g., 3→4 masters)
+//! Running → ScalingUpStatefulSet → WaitingForNewPods → AddingNodesToCluster →
+//! RebalancingSlots → ConfiguringNewReplicas → VerifyingClusterHealth → Running
+//!
+//! ### Scale-Down (e.g., 4→3 masters)
+//! Running → EvacuatingSlots → RemovingNodesFromCluster →
+//! ScalingDownStatefulSet → VerifyingClusterHealth → Running
 
 use std::fmt;
 
 use crate::crd::ClusterPhase;
 
-/// Events that trigger state transitions in the resource lifecycle
+/// Events that trigger state transitions in the resource lifecycle.
+///
+/// Note: The new granular phases are self-describing, so fewer events are needed.
+/// The phase name itself encodes the direction (e.g., ScalingUpStatefulSet vs ScalingDownStatefulSet).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClusterEvent {
     /// Kubernetes resources have been applied to the cluster
     ResourcesApplied,
-    /// All desired replicas are ready
-    AllReplicasReady,
-    /// All pods are running (but may not be ready yet)
+    /// All desired pods are running (may not be ready yet)
     PodsRunning,
     /// Some replicas are ready but not all (resource is degraded)
     ReplicasDegraded,
-    /// Resource spec has changed and requires reconciliation
-    SpecChanged,
     /// An error occurred during reconciliation
     ReconcileError,
     /// Deletion timestamp has been set on the resource
@@ -29,19 +42,12 @@ pub enum ClusterEvent {
     RecoveryInitiated,
     /// Resource has fully recovered from degraded state
     FullyRecovered,
-    // === New events for granular scaling phases ===
-    /// Changes have been detected and recorded in pending_changes
-    ChangesDetected,
-    /// No changes needed, cluster is already at desired state
-    NoChangesNeeded,
-    /// StatefulSet has been updated with new replica count
-    StatefulSetScaled,
-    /// New nodes have been added to cluster via CLUSTER MEET
-    NodesAdded,
-    /// Hash slots have been migrated for rebalancing
-    SlotsMigrated,
-    /// Nodes have been removed from cluster via CLUSTER FORGET
-    NodesRemoved,
+    /// Phase-specific work completed successfully
+    PhaseComplete,
+    /// Scale-up operation detected (masters increased)
+    ScaleUpDetected,
+    /// Scale-down operation detected (masters decreased)
+    ScaleDownDetected,
     /// Cluster health verification passed
     ClusterHealthy,
 }
@@ -50,20 +56,15 @@ impl fmt::Display for ClusterEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ClusterEvent::ResourcesApplied => write!(f, "ResourcesApplied"),
-            ClusterEvent::AllReplicasReady => write!(f, "AllReplicasReady"),
             ClusterEvent::PodsRunning => write!(f, "PodsRunning"),
             ClusterEvent::ReplicasDegraded => write!(f, "ReplicasDegraded"),
-            ClusterEvent::SpecChanged => write!(f, "SpecChanged"),
             ClusterEvent::ReconcileError => write!(f, "ReconcileError"),
             ClusterEvent::DeletionRequested => write!(f, "DeletionRequested"),
             ClusterEvent::RecoveryInitiated => write!(f, "RecoveryInitiated"),
             ClusterEvent::FullyRecovered => write!(f, "FullyRecovered"),
-            ClusterEvent::ChangesDetected => write!(f, "ChangesDetected"),
-            ClusterEvent::NoChangesNeeded => write!(f, "NoChangesNeeded"),
-            ClusterEvent::StatefulSetScaled => write!(f, "StatefulSetScaled"),
-            ClusterEvent::NodesAdded => write!(f, "NodesAdded"),
-            ClusterEvent::SlotsMigrated => write!(f, "SlotsMigrated"),
-            ClusterEvent::NodesRemoved => write!(f, "NodesRemoved"),
+            ClusterEvent::PhaseComplete => write!(f, "PhaseComplete"),
+            ClusterEvent::ScaleUpDetected => write!(f, "ScaleUpDetected"),
+            ClusterEvent::ScaleDownDetected => write!(f, "ScaleDownDetected"),
             ClusterEvent::ClusterHealthy => write!(f, "ClusterHealthy"),
         }
     }
@@ -194,7 +195,9 @@ impl ClusterStateMachine {
     pub fn new() -> Self {
         Self {
             transitions: vec![
-                // === Pending state transitions ===
+                // ========================================
+                // Pending state transitions
+                // ========================================
                 Transition::new(
                     ClusterPhase::Pending,
                     ClusterPhase::Creating,
@@ -213,13 +216,14 @@ impl ClusterStateMachine {
                     ClusterEvent::DeletionRequested,
                     "Resource deletion requested before creation",
                 ),
-                // === Creating state transitions ===
-                // Creating -> Initializing when all pods are running
+                // ========================================
+                // Creating state transitions
+                // ========================================
                 Transition::new(
                     ClusterPhase::Creating,
-                    ClusterPhase::Initializing,
-                    ClusterEvent::PodsRunning,
-                    "All pods running, starting cluster initialization",
+                    ClusterPhase::WaitingForPods,
+                    ClusterEvent::ResourcesApplied,
+                    "Resources created, waiting for pods",
                 ),
                 Transition::new(
                     ClusterPhase::Creating,
@@ -233,31 +237,62 @@ impl ClusterStateMachine {
                     ClusterEvent::DeletionRequested,
                     "Resource deletion requested during creation",
                 ),
-                // === Initializing state transitions ===
+                // ========================================
+                // WaitingForPods state transitions
+                // ========================================
                 Transition::new(
-                    ClusterPhase::Initializing,
+                    ClusterPhase::WaitingForPods,
+                    ClusterPhase::InitializingCluster,
+                    ClusterEvent::PodsRunning,
+                    "All pods running, initializing cluster",
+                ),
+                Transition::new(
+                    ClusterPhase::WaitingForPods,
+                    ClusterPhase::Failed,
+                    ClusterEvent::ReconcileError,
+                    "Error waiting for pods",
+                ),
+                Transition::new(
+                    ClusterPhase::WaitingForPods,
+                    ClusterPhase::Deleting,
+                    ClusterEvent::DeletionRequested,
+                    "Resource deletion requested while waiting",
+                ),
+                // ========================================
+                // InitializingCluster state transitions
+                // ========================================
+                Transition::new(
+                    ClusterPhase::InitializingCluster,
                     ClusterPhase::AssigningSlots,
-                    ClusterEvent::ResourcesApplied,
+                    ClusterEvent::PhaseComplete,
                     "Cluster nodes connected via CLUSTER MEET",
                 ),
                 Transition::new(
-                    ClusterPhase::Initializing,
+                    ClusterPhase::InitializingCluster,
                     ClusterPhase::Failed,
                     ClusterEvent::ReconcileError,
                     "Error during cluster initialization",
                 ),
                 Transition::new(
-                    ClusterPhase::Initializing,
+                    ClusterPhase::InitializingCluster,
                     ClusterPhase::Deleting,
                     ClusterEvent::DeletionRequested,
                     "Resource deletion requested during initialization",
                 ),
-                // === AssigningSlots state transitions ===
+                // ========================================
+                // AssigningSlots state transitions
+                // ========================================
                 Transition::new(
                     ClusterPhase::AssigningSlots,
-                    ClusterPhase::Running,
+                    ClusterPhase::ConfiguringReplicas,
+                    ClusterEvent::PhaseComplete,
+                    "Slots assigned, configuring replicas",
+                ),
+                Transition::new(
+                    ClusterPhase::AssigningSlots,
+                    ClusterPhase::VerifyingClusterHealth,
                     ClusterEvent::ClusterHealthy,
-                    "Slots assigned and cluster healthy",
+                    "Slots assigned, no replicas to configure",
                 ),
                 Transition::new(
                     ClusterPhase::AssigningSlots,
@@ -271,12 +306,41 @@ impl ClusterStateMachine {
                     ClusterEvent::DeletionRequested,
                     "Resource deletion requested during slot assignment",
                 ),
-                // === Running state transitions ===
+                // ========================================
+                // ConfiguringReplicas state transitions
+                // ========================================
+                Transition::new(
+                    ClusterPhase::ConfiguringReplicas,
+                    ClusterPhase::VerifyingClusterHealth,
+                    ClusterEvent::PhaseComplete,
+                    "Replicas configured, verifying cluster",
+                ),
+                Transition::new(
+                    ClusterPhase::ConfiguringReplicas,
+                    ClusterPhase::Failed,
+                    ClusterEvent::ReconcileError,
+                    "Error configuring replicas",
+                ),
+                Transition::new(
+                    ClusterPhase::ConfiguringReplicas,
+                    ClusterPhase::Deleting,
+                    ClusterEvent::DeletionRequested,
+                    "Resource deletion requested while configuring replicas",
+                ),
+                // ========================================
+                // Running state transitions
+                // ========================================
                 Transition::new(
                     ClusterPhase::Running,
-                    ClusterPhase::DetectingChanges,
-                    ClusterEvent::SpecChanged,
-                    "Spec changed, detecting required changes",
+                    ClusterPhase::ScalingUpStatefulSet,
+                    ClusterEvent::ScaleUpDetected,
+                    "Scale-up detected, increasing StatefulSet replicas",
+                ),
+                Transition::new(
+                    ClusterPhase::Running,
+                    ClusterPhase::EvacuatingSlots,
+                    ClusterEvent::ScaleDownDetected,
+                    "Scale-down detected, evacuating slots first",
                 ),
                 Transition::new(
                     ClusterPhase::Running,
@@ -296,163 +360,216 @@ impl ClusterStateMachine {
                     ClusterEvent::DeletionRequested,
                     "Resource deletion requested",
                 ),
-                // === DetectingChanges state transitions ===
+                // ========================================
+                // Scale-Up Path: ScalingUpStatefulSet
+                // ========================================
                 Transition::new(
-                    ClusterPhase::DetectingChanges,
-                    ClusterPhase::ScalingStatefulSet,
-                    ClusterEvent::ChangesDetected,
-                    "Scale-up detected, updating StatefulSet",
+                    ClusterPhase::ScalingUpStatefulSet,
+                    ClusterPhase::WaitingForNewPods,
+                    ClusterEvent::PhaseComplete,
+                    "StatefulSet scaled up, waiting for new pods",
                 ),
                 Transition::new(
-                    ClusterPhase::DetectingChanges,
-                    ClusterPhase::MigratingSlots,
-                    ClusterEvent::SlotsMigrated,
-                    "Scale-down detected, migrating slots first",
-                ),
-                Transition::new(
-                    ClusterPhase::DetectingChanges,
-                    ClusterPhase::Running,
-                    ClusterEvent::NoChangesNeeded,
-                    "No changes needed",
-                ),
-                Transition::new(
-                    ClusterPhase::DetectingChanges,
+                    ClusterPhase::ScalingUpStatefulSet,
                     ClusterPhase::Failed,
                     ClusterEvent::ReconcileError,
-                    "Error detecting changes",
+                    "Error scaling up StatefulSet",
                 ),
                 Transition::new(
-                    ClusterPhase::DetectingChanges,
+                    ClusterPhase::ScalingUpStatefulSet,
                     ClusterPhase::Deleting,
                     ClusterEvent::DeletionRequested,
-                    "Resource deletion requested",
+                    "Resource deletion requested during scale-up",
                 ),
-                // === ScalingStatefulSet state transitions ===
+                // ========================================
+                // Scale-Up Path: WaitingForNewPods
+                // ========================================
                 Transition::new(
-                    ClusterPhase::ScalingStatefulSet,
-                    ClusterPhase::AddingNodes,
+                    ClusterPhase::WaitingForNewPods,
+                    ClusterPhase::AddingNodesToCluster,
                     ClusterEvent::PodsRunning,
                     "New pods running, adding to cluster",
                 ),
                 Transition::new(
-                    ClusterPhase::ScalingStatefulSet,
-                    ClusterPhase::VerifyingCluster,
-                    ClusterEvent::StatefulSetScaled,
-                    "StatefulSet scaled down, verifying cluster",
-                ),
-                Transition::new(
-                    ClusterPhase::ScalingStatefulSet,
+                    ClusterPhase::WaitingForNewPods,
                     ClusterPhase::Failed,
                     ClusterEvent::ReconcileError,
-                    "Error scaling StatefulSet",
+                    "Error waiting for new pods",
                 ),
                 Transition::new(
-                    ClusterPhase::ScalingStatefulSet,
+                    ClusterPhase::WaitingForNewPods,
                     ClusterPhase::Deleting,
                     ClusterEvent::DeletionRequested,
-                    "Resource deletion requested",
+                    "Resource deletion requested while waiting for pods",
                 ),
-                // === AddingNodes state transitions ===
+                // ========================================
+                // Scale-Up Path: AddingNodesToCluster
+                // ========================================
                 Transition::new(
-                    ClusterPhase::AddingNodes,
-                    ClusterPhase::MigratingSlots,
-                    ClusterEvent::NodesAdded,
-                    "Nodes added, migrating slots for rebalancing",
-                ),
-                Transition::new(
-                    ClusterPhase::AddingNodes,
-                    ClusterPhase::VerifyingCluster,
-                    ClusterEvent::ClusterHealthy,
-                    "No slot migration needed, verifying cluster",
+                    ClusterPhase::AddingNodesToCluster,
+                    ClusterPhase::RebalancingSlots,
+                    ClusterEvent::PhaseComplete,
+                    "Nodes added, rebalancing slots",
                 ),
                 Transition::new(
-                    ClusterPhase::AddingNodes,
+                    ClusterPhase::AddingNodesToCluster,
                     ClusterPhase::Failed,
                     ClusterEvent::ReconcileError,
                     "Error adding nodes to cluster",
                 ),
                 Transition::new(
-                    ClusterPhase::AddingNodes,
+                    ClusterPhase::AddingNodesToCluster,
                     ClusterPhase::Deleting,
                     ClusterEvent::DeletionRequested,
-                    "Resource deletion requested",
+                    "Resource deletion requested while adding nodes",
                 ),
-                // === MigratingSlots state transitions ===
+                // ========================================
+                // Scale-Up Path: RebalancingSlots
+                // ========================================
                 Transition::new(
-                    ClusterPhase::MigratingSlots,
-                    ClusterPhase::RemovingNodes,
-                    ClusterEvent::SlotsMigrated,
-                    "Slots migrated, removing old nodes",
+                    ClusterPhase::RebalancingSlots,
+                    ClusterPhase::ConfiguringNewReplicas,
+                    ClusterEvent::PhaseComplete,
+                    "Slots rebalanced, configuring new replicas",
                 ),
                 Transition::new(
-                    ClusterPhase::MigratingSlots,
-                    ClusterPhase::VerifyingCluster,
+                    ClusterPhase::RebalancingSlots,
+                    ClusterPhase::VerifyingClusterHealth,
                     ClusterEvent::ClusterHealthy,
-                    "Slots migrated for scale-up, verifying cluster",
+                    "Slots rebalanced, no replicas to configure",
                 ),
                 Transition::new(
-                    ClusterPhase::MigratingSlots,
-                    ClusterPhase::Degraded,
-                    ClusterEvent::ReplicasDegraded,
-                    "Cluster degraded during migration",
-                ),
-                Transition::new(
-                    ClusterPhase::MigratingSlots,
+                    ClusterPhase::RebalancingSlots,
                     ClusterPhase::Failed,
                     ClusterEvent::ReconcileError,
-                    "Error during slot migration",
+                    "Error rebalancing slots",
                 ),
                 Transition::new(
-                    ClusterPhase::MigratingSlots,
+                    ClusterPhase::RebalancingSlots,
                     ClusterPhase::Deleting,
                     ClusterEvent::DeletionRequested,
-                    "Resource deletion requested",
+                    "Resource deletion requested during rebalancing",
                 ),
-                // === RemovingNodes state transitions ===
+                // ========================================
+                // Scale-Up Path: ConfiguringNewReplicas
+                // ========================================
                 Transition::new(
-                    ClusterPhase::RemovingNodes,
-                    ClusterPhase::ScalingStatefulSet,
-                    ClusterEvent::NodesRemoved,
-                    "Nodes removed from cluster, scaling down StatefulSet",
+                    ClusterPhase::ConfiguringNewReplicas,
+                    ClusterPhase::VerifyingClusterHealth,
+                    ClusterEvent::PhaseComplete,
+                    "New replicas configured, verifying cluster",
                 ),
                 Transition::new(
-                    ClusterPhase::RemovingNodes,
+                    ClusterPhase::ConfiguringNewReplicas,
+                    ClusterPhase::Failed,
+                    ClusterEvent::ReconcileError,
+                    "Error configuring new replicas",
+                ),
+                Transition::new(
+                    ClusterPhase::ConfiguringNewReplicas,
+                    ClusterPhase::Deleting,
+                    ClusterEvent::DeletionRequested,
+                    "Resource deletion requested while configuring replicas",
+                ),
+                // ========================================
+                // Scale-Down Path: EvacuatingSlots
+                // ========================================
+                Transition::new(
+                    ClusterPhase::EvacuatingSlots,
+                    ClusterPhase::RemovingNodesFromCluster,
+                    ClusterEvent::PhaseComplete,
+                    "Slots evacuated, removing nodes from cluster",
+                ),
+                Transition::new(
+                    ClusterPhase::EvacuatingSlots,
+                    ClusterPhase::Degraded,
+                    ClusterEvent::ReplicasDegraded,
+                    "Cluster degraded during evacuation",
+                ),
+                Transition::new(
+                    ClusterPhase::EvacuatingSlots,
+                    ClusterPhase::Failed,
+                    ClusterEvent::ReconcileError,
+                    "Error evacuating slots",
+                ),
+                Transition::new(
+                    ClusterPhase::EvacuatingSlots,
+                    ClusterPhase::Deleting,
+                    ClusterEvent::DeletionRequested,
+                    "Resource deletion requested during evacuation",
+                ),
+                // ========================================
+                // Scale-Down Path: RemovingNodesFromCluster
+                // ========================================
+                Transition::new(
+                    ClusterPhase::RemovingNodesFromCluster,
+                    ClusterPhase::ScalingDownStatefulSet,
+                    ClusterEvent::PhaseComplete,
+                    "Nodes removed, scaling down StatefulSet",
+                ),
+                Transition::new(
+                    ClusterPhase::RemovingNodesFromCluster,
                     ClusterPhase::Failed,
                     ClusterEvent::ReconcileError,
                     "Error removing nodes from cluster",
                 ),
                 Transition::new(
-                    ClusterPhase::RemovingNodes,
+                    ClusterPhase::RemovingNodesFromCluster,
                     ClusterPhase::Deleting,
                     ClusterEvent::DeletionRequested,
-                    "Resource deletion requested",
+                    "Resource deletion requested while removing nodes",
                 ),
-                // === VerifyingCluster state transitions ===
+                // ========================================
+                // Scale-Down Path: ScalingDownStatefulSet
+                // ========================================
                 Transition::new(
-                    ClusterPhase::VerifyingCluster,
+                    ClusterPhase::ScalingDownStatefulSet,
+                    ClusterPhase::VerifyingClusterHealth,
+                    ClusterEvent::PhaseComplete,
+                    "StatefulSet scaled down, verifying cluster",
+                ),
+                Transition::new(
+                    ClusterPhase::ScalingDownStatefulSet,
+                    ClusterPhase::Failed,
+                    ClusterEvent::ReconcileError,
+                    "Error scaling down StatefulSet",
+                ),
+                Transition::new(
+                    ClusterPhase::ScalingDownStatefulSet,
+                    ClusterPhase::Deleting,
+                    ClusterEvent::DeletionRequested,
+                    "Resource deletion requested during scale-down",
+                ),
+                // ========================================
+                // VerifyingClusterHealth state transitions
+                // ========================================
+                Transition::new(
+                    ClusterPhase::VerifyingClusterHealth,
                     ClusterPhase::Running,
                     ClusterEvent::ClusterHealthy,
                     "Cluster verified healthy",
                 ),
                 Transition::new(
-                    ClusterPhase::VerifyingCluster,
+                    ClusterPhase::VerifyingClusterHealth,
                     ClusterPhase::Degraded,
                     ClusterEvent::ReplicasDegraded,
                     "Cluster verification found degraded state",
                 ),
                 Transition::new(
-                    ClusterPhase::VerifyingCluster,
+                    ClusterPhase::VerifyingClusterHealth,
                     ClusterPhase::Failed,
                     ClusterEvent::ReconcileError,
                     "Error during cluster verification",
                 ),
                 Transition::new(
-                    ClusterPhase::VerifyingCluster,
+                    ClusterPhase::VerifyingClusterHealth,
                     ClusterPhase::Deleting,
                     ClusterEvent::DeletionRequested,
-                    "Resource deletion requested",
+                    "Resource deletion requested during verification",
                 ),
-                // === Degraded state transitions ===
+                // ========================================
+                // Degraded state transitions
+                // ========================================
                 Transition::new(
                     ClusterPhase::Degraded,
                     ClusterPhase::Running,
@@ -462,14 +579,20 @@ impl ClusterStateMachine {
                 Transition::new(
                     ClusterPhase::Degraded,
                     ClusterPhase::Running,
-                    ClusterEvent::AllReplicasReady,
-                    "All replicas recovered",
+                    ClusterEvent::ClusterHealthy,
+                    "Cluster now healthy",
                 ),
                 Transition::new(
                     ClusterPhase::Degraded,
-                    ClusterPhase::DetectingChanges,
-                    ClusterEvent::SpecChanged,
-                    "Spec changed while degraded",
+                    ClusterPhase::ScalingUpStatefulSet,
+                    ClusterEvent::ScaleUpDetected,
+                    "Scale-up detected while degraded",
+                ),
+                Transition::new(
+                    ClusterPhase::Degraded,
+                    ClusterPhase::EvacuatingSlots,
+                    ClusterEvent::ScaleDownDetected,
+                    "Scale-down detected while degraded",
                 ),
                 Transition::new(
                     ClusterPhase::Degraded,
@@ -483,12 +606,20 @@ impl ClusterStateMachine {
                     ClusterEvent::DeletionRequested,
                     "Resource deletion requested while degraded",
                 ),
-                // === Failed state transitions ===
+                // ========================================
+                // Failed state transitions
+                // ========================================
                 Transition::new(
                     ClusterPhase::Failed,
-                    ClusterPhase::Pending,
+                    ClusterPhase::Degraded,
                     ClusterEvent::RecoveryInitiated,
                     "Recovery initiated from failed state",
+                ),
+                Transition::new(
+                    ClusterPhase::Failed,
+                    ClusterPhase::Running,
+                    ClusterEvent::ClusterHealthy,
+                    "Cluster recovered to healthy state",
                 ),
                 Transition::new(
                     ClusterPhase::Failed,
@@ -496,7 +627,9 @@ impl ClusterStateMachine {
                     ClusterEvent::DeletionRequested,
                     "Resource deletion requested while failed",
                 ),
-                // === Deleting state transitions (terminal) ===
+                // ========================================
+                // Deleting state transitions (terminal)
+                // ========================================
                 // Deleting is a terminal state - no transitions out except completion
             ],
         }
@@ -560,22 +693,6 @@ impl ClusterStateMachine {
     /// Check guard conditions for a transition
     fn check_guard(&self, transition: &Transition, ctx: &TransitionContext) -> Option<String> {
         match (&transition.from, &transition.to, &transition.event) {
-            // Guard: AllReplicasReady requires all replicas to be ready
-            (_, ClusterPhase::Running, ClusterEvent::AllReplicasReady)
-            | (
-                ClusterPhase::Creating,
-                ClusterPhase::Initializing,
-                ClusterEvent::AllReplicasReady,
-            ) => {
-                if !ctx.all_replicas_ready() {
-                    Some(format!(
-                        "Not all replicas ready: {}/{}",
-                        ctx.ready_replicas, ctx.desired_replicas
-                    ))
-                } else {
-                    None
-                }
-            }
             // Guard: ReplicasDegraded requires partial readiness
             (_, ClusterPhase::Degraded, ClusterEvent::ReplicasDegraded) => {
                 if !ctx.is_degraded() {
@@ -615,19 +732,18 @@ pub fn determine_event(
         return ClusterEvent::DeletionRequested;
     }
 
-    // Check for spec change
-    if ctx.spec_changed
-        && matches!(
-            current_phase,
-            ClusterPhase::Running | ClusterPhase::Degraded
-        )
-    {
-        return ClusterEvent::SpecChanged;
-    }
-
     // Determine event based on replica status and current phase
     match current_phase {
         ClusterPhase::Pending => ClusterEvent::ResourcesApplied,
+        ClusterPhase::Creating => ClusterEvent::ResourcesApplied,
+        ClusterPhase::WaitingForPods | ClusterPhase::WaitingForNewPods => {
+            if ctx.all_replicas_ready() {
+                ClusterEvent::PodsRunning
+            } else {
+                // Stay in waiting
+                ClusterEvent::ResourcesApplied
+            }
+        }
         ClusterPhase::Failed => {
             if ctx.all_replicas_ready() {
                 ClusterEvent::RecoveryInitiated
@@ -644,34 +760,30 @@ pub fn determine_event(
                 ClusterEvent::ReconcileError
             }
         }
-        ClusterPhase::Creating => {
-            // During initial creation, wait for pods to be running
-            if ctx.all_replicas_ready() {
-                ClusterEvent::PodsRunning
-            } else {
-                // Stay in Creating while waiting for pods
-                ClusterEvent::ResourcesApplied
-            }
-        }
-        ClusterPhase::Initializing | ClusterPhase::AssigningSlots => {
-            // CLUSTER MEET and slot assignment phases
-            ClusterEvent::ResourcesApplied
-        }
-        // Granular scaling phases - these are driven by phase handlers, not this function
-        ClusterPhase::DetectingChanges
-        | ClusterPhase::ScalingStatefulSet
-        | ClusterPhase::AddingNodes
-        | ClusterPhase::MigratingSlots
-        | ClusterPhase::RemovingNodes
-        | ClusterPhase::VerifyingCluster => {
-            // These phases determine their own transitions based on handler results
-            ClusterEvent::ResourcesApplied
-        }
         ClusterPhase::Running => {
             if ctx.is_degraded() {
                 ClusterEvent::ReplicasDegraded
             } else {
-                ClusterEvent::AllReplicasReady
+                // Scale operations are detected by the reconciler
+                ClusterEvent::ClusterHealthy
+            }
+        }
+        // Phase-driven transitions: these phases complete via PhaseComplete
+        ClusterPhase::InitializingCluster
+        | ClusterPhase::AssigningSlots
+        | ClusterPhase::ConfiguringReplicas
+        | ClusterPhase::ScalingUpStatefulSet
+        | ClusterPhase::AddingNodesToCluster
+        | ClusterPhase::RebalancingSlots
+        | ClusterPhase::ConfiguringNewReplicas
+        | ClusterPhase::EvacuatingSlots
+        | ClusterPhase::RemovingNodesFromCluster
+        | ClusterPhase::ScalingDownStatefulSet => ClusterEvent::PhaseComplete,
+        ClusterPhase::VerifyingClusterHealth => {
+            if ctx.is_degraded() {
+                ClusterEvent::ReplicasDegraded
+            } else {
+                ClusterEvent::ClusterHealthy
             }
         }
         ClusterPhase::Deleting => ClusterEvent::DeletionRequested,
@@ -706,18 +818,116 @@ mod tests {
     }
 
     #[test]
-    fn test_creating_to_initializing() {
+    fn test_creating_to_waiting_for_pods() {
         let sm = ClusterStateMachine::new();
-        let ctx = TransitionContext::new(3, 3);
+        let ctx = TransitionContext::new(0, 3);
 
-        // Should succeed with PodsRunning event
-        let result = sm.transition(&ClusterPhase::Creating, ClusterEvent::PodsRunning, &ctx);
+        let result = sm.transition(
+            &ClusterPhase::Creating,
+            ClusterEvent::ResourcesApplied,
+            &ctx,
+        );
         match result {
             TransitionResult::Success { from, to, .. } => {
                 assert_eq!(from, ClusterPhase::Creating);
-                assert_eq!(to, ClusterPhase::Initializing);
+                assert_eq!(to, ClusterPhase::WaitingForPods);
             }
-            _ => panic!("Expected successful transition to Initializing"),
+            _ => panic!("Expected successful transition to WaitingForPods"),
+        }
+    }
+
+    #[test]
+    fn test_waiting_for_pods_to_initializing() {
+        let sm = ClusterStateMachine::new();
+        let ctx = TransitionContext::new(6, 6);
+
+        let result = sm.transition(
+            &ClusterPhase::WaitingForPods,
+            ClusterEvent::PodsRunning,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { from, to, .. } => {
+                assert_eq!(from, ClusterPhase::WaitingForPods);
+                assert_eq!(to, ClusterPhase::InitializingCluster);
+            }
+            _ => panic!("Expected successful transition to InitializingCluster"),
+        }
+    }
+
+    #[test]
+    fn test_initializing_to_assigning_slots() {
+        let sm = ClusterStateMachine::new();
+        let ctx = TransitionContext::new(6, 6);
+
+        let result = sm.transition(
+            &ClusterPhase::InitializingCluster,
+            ClusterEvent::PhaseComplete,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { from, to, .. } => {
+                assert_eq!(from, ClusterPhase::InitializingCluster);
+                assert_eq!(to, ClusterPhase::AssigningSlots);
+            }
+            _ => panic!("Expected successful transition to AssigningSlots"),
+        }
+    }
+
+    #[test]
+    fn test_assigning_slots_to_configuring_replicas() {
+        let sm = ClusterStateMachine::new();
+        let ctx = TransitionContext::new(6, 6);
+
+        let result = sm.transition(
+            &ClusterPhase::AssigningSlots,
+            ClusterEvent::PhaseComplete,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { from, to, .. } => {
+                assert_eq!(from, ClusterPhase::AssigningSlots);
+                assert_eq!(to, ClusterPhase::ConfiguringReplicas);
+            }
+            _ => panic!("Expected successful transition to ConfiguringReplicas"),
+        }
+    }
+
+    #[test]
+    fn test_configuring_replicas_to_verifying() {
+        let sm = ClusterStateMachine::new();
+        let ctx = TransitionContext::new(6, 6);
+
+        let result = sm.transition(
+            &ClusterPhase::ConfiguringReplicas,
+            ClusterEvent::PhaseComplete,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { from, to, .. } => {
+                assert_eq!(from, ClusterPhase::ConfiguringReplicas);
+                assert_eq!(to, ClusterPhase::VerifyingClusterHealth);
+            }
+            _ => panic!("Expected successful transition to VerifyingClusterHealth"),
+        }
+    }
+
+    #[test]
+    fn test_verifying_to_running() {
+        let sm = ClusterStateMachine::new();
+        let ctx = TransitionContext::new(6, 6);
+
+        let result = sm.transition(
+            &ClusterPhase::VerifyingClusterHealth,
+            ClusterEvent::ClusterHealthy,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { from, to, .. } => {
+                assert_eq!(from, ClusterPhase::VerifyingClusterHealth);
+                assert_eq!(to, ClusterPhase::Running);
+            }
+            _ => panic!("Expected successful transition to Running"),
         }
     }
 
@@ -737,175 +947,150 @@ mod tests {
     }
 
     #[test]
-    fn test_running_to_detecting_changes() {
-        let sm = ClusterStateMachine::new();
-        let ctx = TransitionContext::new(3, 3);
-
-        let result = sm.transition(&ClusterPhase::Running, ClusterEvent::SpecChanged, &ctx);
-        match result {
-            TransitionResult::Success { from, to, .. } => {
-                assert_eq!(from, ClusterPhase::Running);
-                assert_eq!(to, ClusterPhase::DetectingChanges);
-            }
-            _ => panic!("Expected successful transition to DetectingChanges"),
-        }
-    }
-
-    #[test]
-    fn test_detecting_changes_to_scaling() {
-        let sm = ClusterStateMachine::new();
-        let ctx = TransitionContext::new(3, 3);
-
-        // Scale-up path
-        let result = sm.transition(
-            &ClusterPhase::DetectingChanges,
-            ClusterEvent::ChangesDetected,
-            &ctx,
-        );
-        match result {
-            TransitionResult::Success { from, to, .. } => {
-                assert_eq!(from, ClusterPhase::DetectingChanges);
-                assert_eq!(to, ClusterPhase::ScalingStatefulSet);
-            }
-            _ => panic!("Expected successful transition to ScalingStatefulSet"),
-        }
-
-        // No changes needed
-        let result = sm.transition(
-            &ClusterPhase::DetectingChanges,
-            ClusterEvent::NoChangesNeeded,
-            &ctx,
-        );
-        match result {
-            TransitionResult::Success { from, to, .. } => {
-                assert_eq!(from, ClusterPhase::DetectingChanges);
-                assert_eq!(to, ClusterPhase::Running);
-            }
-            _ => panic!("Expected successful transition back to Running"),
-        }
-    }
-
-    #[test]
-    fn test_scaling_statefulset_transitions() {
+    fn test_running_to_scaling_up() {
         let sm = ClusterStateMachine::new();
         let ctx = TransitionContext::new(6, 6);
 
-        // Scale-up: pods running -> AddingNodes
+        let result = sm.transition(&ClusterPhase::Running, ClusterEvent::ScaleUpDetected, &ctx);
+        match result {
+            TransitionResult::Success { from, to, .. } => {
+                assert_eq!(from, ClusterPhase::Running);
+                assert_eq!(to, ClusterPhase::ScalingUpStatefulSet);
+            }
+            _ => panic!("Expected successful transition to ScalingUpStatefulSet"),
+        }
+    }
+
+    #[test]
+    fn test_running_to_evacuating_slots() {
+        let sm = ClusterStateMachine::new();
+        let ctx = TransitionContext::new(6, 6);
+
         let result = sm.transition(
-            &ClusterPhase::ScalingStatefulSet,
+            &ClusterPhase::Running,
+            ClusterEvent::ScaleDownDetected,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { from, to, .. } => {
+                assert_eq!(from, ClusterPhase::Running);
+                assert_eq!(to, ClusterPhase::EvacuatingSlots);
+            }
+            _ => panic!("Expected successful transition to EvacuatingSlots"),
+        }
+    }
+
+    #[test]
+    fn test_scale_up_path() {
+        let sm = ClusterStateMachine::new();
+        let ctx = TransitionContext::new(8, 8);
+
+        // ScalingUpStatefulSet -> WaitingForNewPods
+        let result = sm.transition(
+            &ClusterPhase::ScalingUpStatefulSet,
+            ClusterEvent::PhaseComplete,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { to, .. } => {
+                assert_eq!(to, ClusterPhase::WaitingForNewPods)
+            }
+            _ => panic!("Expected transition to WaitingForNewPods"),
+        }
+
+        // WaitingForNewPods -> AddingNodesToCluster
+        let result = sm.transition(
+            &ClusterPhase::WaitingForNewPods,
             ClusterEvent::PodsRunning,
             &ctx,
         );
         match result {
-            TransitionResult::Success { from, to, .. } => {
-                assert_eq!(from, ClusterPhase::ScalingStatefulSet);
-                assert_eq!(to, ClusterPhase::AddingNodes);
+            TransitionResult::Success { to, .. } => {
+                assert_eq!(to, ClusterPhase::AddingNodesToCluster)
             }
-            _ => panic!("Expected successful transition to AddingNodes"),
+            _ => panic!("Expected transition to AddingNodesToCluster"),
         }
 
-        // Scale-down: StatefulSet scaled -> VerifyingCluster
+        // AddingNodesToCluster -> RebalancingSlots
         let result = sm.transition(
-            &ClusterPhase::ScalingStatefulSet,
-            ClusterEvent::StatefulSetScaled,
+            &ClusterPhase::AddingNodesToCluster,
+            ClusterEvent::PhaseComplete,
             &ctx,
         );
         match result {
-            TransitionResult::Success { from, to, .. } => {
-                assert_eq!(from, ClusterPhase::ScalingStatefulSet);
-                assert_eq!(to, ClusterPhase::VerifyingCluster);
+            TransitionResult::Success { to, .. } => assert_eq!(to, ClusterPhase::RebalancingSlots),
+            _ => panic!("Expected transition to RebalancingSlots"),
+        }
+
+        // RebalancingSlots -> ConfiguringNewReplicas
+        let result = sm.transition(
+            &ClusterPhase::RebalancingSlots,
+            ClusterEvent::PhaseComplete,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { to, .. } => {
+                assert_eq!(to, ClusterPhase::ConfiguringNewReplicas)
             }
-            _ => panic!("Expected successful transition to VerifyingCluster"),
+            _ => panic!("Expected transition to ConfiguringNewReplicas"),
+        }
+
+        // ConfiguringNewReplicas -> VerifyingClusterHealth
+        let result = sm.transition(
+            &ClusterPhase::ConfiguringNewReplicas,
+            ClusterEvent::PhaseComplete,
+            &ctx,
+        );
+        match result {
+            TransitionResult::Success { to, .. } => {
+                assert_eq!(to, ClusterPhase::VerifyingClusterHealth)
+            }
+            _ => panic!("Expected transition to VerifyingClusterHealth"),
         }
     }
 
     #[test]
-    fn test_adding_nodes_transitions() {
+    fn test_scale_down_path() {
         let sm = ClusterStateMachine::new();
         let ctx = TransitionContext::new(6, 6);
 
-        // Nodes added -> MigratingSlots
-        let result = sm.transition(&ClusterPhase::AddingNodes, ClusterEvent::NodesAdded, &ctx);
-        match result {
-            TransitionResult::Success { from, to, .. } => {
-                assert_eq!(from, ClusterPhase::AddingNodes);
-                assert_eq!(to, ClusterPhase::MigratingSlots);
-            }
-            _ => panic!("Expected successful transition to MigratingSlots"),
-        }
-    }
-
-    #[test]
-    fn test_migrating_slots_transitions() {
-        let sm = ClusterStateMachine::new();
-        let ctx = TransitionContext::new(6, 6);
-
-        // Scale-down: slots migrated -> RemovingNodes
+        // EvacuatingSlots -> RemovingNodesFromCluster
         let result = sm.transition(
-            &ClusterPhase::MigratingSlots,
-            ClusterEvent::SlotsMigrated,
+            &ClusterPhase::EvacuatingSlots,
+            ClusterEvent::PhaseComplete,
             &ctx,
         );
         match result {
-            TransitionResult::Success { from, to, .. } => {
-                assert_eq!(from, ClusterPhase::MigratingSlots);
-                assert_eq!(to, ClusterPhase::RemovingNodes);
+            TransitionResult::Success { to, .. } => {
+                assert_eq!(to, ClusterPhase::RemovingNodesFromCluster)
             }
-            _ => panic!("Expected successful transition to RemovingNodes"),
+            _ => panic!("Expected transition to RemovingNodesFromCluster"),
         }
 
-        // Scale-up: cluster healthy -> VerifyingCluster
+        // RemovingNodesFromCluster -> ScalingDownStatefulSet
         let result = sm.transition(
-            &ClusterPhase::MigratingSlots,
-            ClusterEvent::ClusterHealthy,
+            &ClusterPhase::RemovingNodesFromCluster,
+            ClusterEvent::PhaseComplete,
             &ctx,
         );
         match result {
-            TransitionResult::Success { from, to, .. } => {
-                assert_eq!(from, ClusterPhase::MigratingSlots);
-                assert_eq!(to, ClusterPhase::VerifyingCluster);
+            TransitionResult::Success { to, .. } => {
+                assert_eq!(to, ClusterPhase::ScalingDownStatefulSet)
             }
-            _ => panic!("Expected successful transition to VerifyingCluster"),
+            _ => panic!("Expected transition to ScalingDownStatefulSet"),
         }
-    }
 
-    #[test]
-    fn test_removing_nodes_transitions() {
-        let sm = ClusterStateMachine::new();
-        let ctx = TransitionContext::new(3, 3);
-
-        // Nodes removed -> ScalingStatefulSet
+        // ScalingDownStatefulSet -> VerifyingClusterHealth
         let result = sm.transition(
-            &ClusterPhase::RemovingNodes,
-            ClusterEvent::NodesRemoved,
+            &ClusterPhase::ScalingDownStatefulSet,
+            ClusterEvent::PhaseComplete,
             &ctx,
         );
         match result {
-            TransitionResult::Success { from, to, .. } => {
-                assert_eq!(from, ClusterPhase::RemovingNodes);
-                assert_eq!(to, ClusterPhase::ScalingStatefulSet);
+            TransitionResult::Success { to, .. } => {
+                assert_eq!(to, ClusterPhase::VerifyingClusterHealth)
             }
-            _ => panic!("Expected successful transition to ScalingStatefulSet"),
-        }
-    }
-
-    #[test]
-    fn test_verifying_cluster_transitions() {
-        let sm = ClusterStateMachine::new();
-        let ctx = TransitionContext::new(6, 6);
-
-        // Cluster healthy -> Running
-        let result = sm.transition(
-            &ClusterPhase::VerifyingCluster,
-            ClusterEvent::ClusterHealthy,
-            &ctx,
-        );
-        match result {
-            TransitionResult::Success { from, to, .. } => {
-                assert_eq!(from, ClusterPhase::VerifyingCluster);
-                assert_eq!(to, ClusterPhase::Running);
-            }
-            _ => panic!("Expected successful transition to Running"),
+            _ => panic!("Expected transition to VerifyingClusterHealth"),
         }
     }
 
@@ -935,15 +1120,20 @@ mod tests {
         let states = vec![
             ClusterPhase::Pending,
             ClusterPhase::Creating,
-            ClusterPhase::Initializing,
+            ClusterPhase::WaitingForPods,
+            ClusterPhase::InitializingCluster,
             ClusterPhase::AssigningSlots,
+            ClusterPhase::ConfiguringReplicas,
             ClusterPhase::Running,
-            ClusterPhase::DetectingChanges,
-            ClusterPhase::ScalingStatefulSet,
-            ClusterPhase::AddingNodes,
-            ClusterPhase::MigratingSlots,
-            ClusterPhase::RemovingNodes,
-            ClusterPhase::VerifyingCluster,
+            ClusterPhase::ScalingUpStatefulSet,
+            ClusterPhase::WaitingForNewPods,
+            ClusterPhase::AddingNodesToCluster,
+            ClusterPhase::RebalancingSlots,
+            ClusterPhase::ConfiguringNewReplicas,
+            ClusterPhase::EvacuatingSlots,
+            ClusterPhase::RemovingNodesFromCluster,
+            ClusterPhase::ScalingDownStatefulSet,
+            ClusterPhase::VerifyingClusterHealth,
             ClusterPhase::Degraded,
             ClusterPhase::Failed,
         ];
@@ -965,16 +1155,9 @@ mod tests {
     }
 
     #[test]
-    fn test_determine_event_spec_changed() {
-        let ctx = TransitionContext::new(3, 3).with_spec_changed(true);
-        let event = determine_event(&ClusterPhase::Running, &ctx, false);
-        assert_eq!(event, ClusterEvent::SpecChanged);
-    }
-
-    #[test]
     fn test_determine_event_pods_running() {
-        let ctx = TransitionContext::new(3, 3);
-        let event = determine_event(&ClusterPhase::Creating, &ctx, false);
+        let ctx = TransitionContext::new(6, 6);
+        let event = determine_event(&ClusterPhase::WaitingForPods, &ctx, false);
         assert_eq!(event, ClusterEvent::PodsRunning);
     }
 
@@ -988,13 +1171,15 @@ mod tests {
     #[test]
     fn test_event_display() {
         assert_eq!(format!("{}", ClusterEvent::PodsRunning), "PodsRunning");
+        assert_eq!(format!("{}", ClusterEvent::PhaseComplete), "PhaseComplete");
         assert_eq!(
-            format!("{}", ClusterEvent::ChangesDetected),
-            "ChangesDetected"
+            format!("{}", ClusterEvent::ScaleUpDetected),
+            "ScaleUpDetected"
         );
-        assert_eq!(format!("{}", ClusterEvent::NodesAdded), "NodesAdded");
-        assert_eq!(format!("{}", ClusterEvent::SlotsMigrated), "SlotsMigrated");
-        assert_eq!(format!("{}", ClusterEvent::NodesRemoved), "NodesRemoved");
+        assert_eq!(
+            format!("{}", ClusterEvent::ScaleDownDetected),
+            "ScaleDownDetected"
+        );
         assert_eq!(
             format!("{}", ClusterEvent::ClusterHealthy),
             "ClusterHealthy"

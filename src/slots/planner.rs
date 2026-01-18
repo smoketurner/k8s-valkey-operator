@@ -203,24 +203,6 @@ pub fn plan_initial_assignment(master_count: u16, node_ids: &[NodeId]) -> Migrat
     plan_rebalance(&empty_state, master_count, node_ids)
 }
 
-/// Extract pod ordinal from a StatefulSet pod address.
-///
-/// Address formats supported:
-/// - `my-cluster-0.my-cluster-headless.ns.svc.cluster.local:6379@16379`
-/// - `my-cluster-0:6379`
-/// - `my-cluster-0`
-///
-/// Returns the ordinal (e.g., `0` from `my-cluster-0`).
-pub fn extract_ordinal_from_address(address: &str) -> Option<u16> {
-    // Remove port suffix if present (handles both :6379 and :6379@16379)
-    let hostname = address.split(':').next()?;
-    // Get the pod name part (before first dot)
-    let pod_name = hostname.split('.').next()?;
-    // Extract ordinal from pod name (last part after last hyphen)
-    let ordinal_str = pod_name.rsplit('-').next()?;
-    ordinal_str.parse().ok()
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -362,44 +344,6 @@ mod tests {
         assert!(plan.slots_to_move > 0);
         assert!(plan.nodes_to_add.is_empty());
         assert_eq!(plan.nodes_to_remove.len(), 3);
-    }
-
-    #[test]
-    fn test_extract_ordinal_full_dns() {
-        assert_eq!(
-            extract_ordinal_from_address(
-                "my-cluster-0.my-cluster-headless.default.svc.cluster.local:6379@16379"
-            ),
-            Some(0)
-        );
-        assert_eq!(
-            extract_ordinal_from_address(
-                "my-cluster-5.my-cluster-headless.ns.svc.cluster.local:6379@16379"
-            ),
-            Some(5)
-        );
-    }
-
-    #[test]
-    fn test_extract_ordinal_short_hostname() {
-        assert_eq!(extract_ordinal_from_address("my-cluster-0:6379"), Some(0));
-        assert_eq!(extract_ordinal_from_address("my-cluster-5:6379"), Some(5));
-    }
-
-    #[test]
-    fn test_extract_ordinal_no_port() {
-        assert_eq!(extract_ordinal_from_address("my-cluster-0"), Some(0));
-        assert_eq!(
-            extract_ordinal_from_address("my-cluster-0.my-cluster-headless"),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn test_extract_ordinal_invalid() {
-        assert_eq!(extract_ordinal_from_address(""), None);
-        assert_eq!(extract_ordinal_from_address("invalid"), None);
-        assert_eq!(extract_ordinal_from_address("no-number-here"), None);
     }
 
     #[test]

@@ -189,7 +189,7 @@ fn default_image_repository() -> String {
 }
 
 fn default_image_tag() -> String {
-    "9-alpine".to_string()
+    "9.0.1-alpine".to_string()
 }
 
 fn default_image_pull_policy() -> String {
@@ -813,11 +813,6 @@ pub struct ValkeyClusterStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_started_at: Option<String>,
 
-    /// Pending changes detected from spec diff.
-    /// Set in DetectingChanges phase, cleared when changes are applied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_changes: Option<PendingChanges>,
-
     /// Progress tracking for multi-step operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_progress: Option<OperationProgress>,
@@ -858,35 +853,62 @@ pub struct ValkeyClusterStatus {
 }
 
 /// ClusterPhase represents the current lifecycle phase of a ValkeyCluster.
+///
+/// Phases are self-describing and encode the operation being performed.
+/// This eliminates the need for context-passing (like pending_changes) since
+/// each phase can determine what to do by querying cluster state vs spec.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema)]
 pub enum ClusterPhase {
+    // === Initial Creation ===
     /// Initial state, waiting for reconciliation.
     #[default]
     Pending,
-    /// Kubernetes resources (StatefulSet, Services) are being created.
+    /// Creating Kubernetes resources (StatefulSet, Services, PDB, Certificate).
     Creating,
-    /// Cluster nodes are running, performing CLUSTER MEET.
-    Initializing,
-    /// Hash slots are being assigned to master nodes.
+    /// Waiting for all pods to be Running (not Ready).
+    WaitingForPods,
+    /// Connecting cluster nodes via CLUSTER MEET.
+    InitializingCluster,
+    /// Assigning hash slots to master nodes via CLUSTER ADDSLOTS.
     AssigningSlots,
-    /// Cluster is fully operational.
+    /// Setting up replica relationships via CLUSTER REPLICATE.
+    ConfiguringReplicas,
+
+    // === Steady State ===
+    /// Cluster is healthy and fully operational.
     Running,
-    /// Detecting what changes are needed based on spec vs current state.
-    DetectingChanges,
-    /// Updating StatefulSet replica count.
-    ScalingStatefulSet,
+
+    // === Scale-Up Path ===
+    /// Increasing StatefulSet replicas for scale-up.
+    ScalingUpStatefulSet,
+    /// Waiting for new pods to be Running after scale-up.
+    WaitingForNewPods,
     /// Adding new nodes to cluster via CLUSTER MEET.
-    AddingNodes,
-    /// Migrating hash slots between nodes.
-    MigratingSlots,
+    AddingNodesToCluster,
+    /// Rebalancing slots to new masters via CLUSTER MIGRATESLOTS.
+    RebalancingSlots,
+    /// Configuring replicas for new masters.
+    ConfiguringNewReplicas,
+
+    // === Scale-Down Path ===
+    /// Evacuating slots from nodes being removed via CLUSTER MIGRATESLOTS.
+    EvacuatingSlots,
     /// Removing nodes from cluster via CLUSTER FORGET.
-    RemovingNodes,
-    /// Verifying cluster health before returning to Running.
-    VerifyingCluster,
+    RemovingNodesFromCluster,
+    /// Decreasing StatefulSet replicas after scale-down.
+    ScalingDownStatefulSet,
+
+    // === Completion ===
+    /// Final health check before transitioning to Running.
+    VerifyingClusterHealth,
+
+    // === Problem States ===
     /// Cluster is operational but degraded (some nodes unavailable).
     Degraded,
     /// Cluster has failed and requires intervention.
     Failed,
+
+    // === Terminal ===
     /// Cluster is being deleted.
     Deleting,
 }
@@ -894,19 +916,31 @@ pub enum ClusterPhase {
 impl std::fmt::Display for ClusterPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // Initial Creation
             ClusterPhase::Pending => write!(f, "Pending"),
             ClusterPhase::Creating => write!(f, "Creating"),
-            ClusterPhase::Initializing => write!(f, "Initializing"),
+            ClusterPhase::WaitingForPods => write!(f, "WaitingForPods"),
+            ClusterPhase::InitializingCluster => write!(f, "InitializingCluster"),
             ClusterPhase::AssigningSlots => write!(f, "AssigningSlots"),
+            ClusterPhase::ConfiguringReplicas => write!(f, "ConfiguringReplicas"),
+            // Steady State
             ClusterPhase::Running => write!(f, "Running"),
-            ClusterPhase::DetectingChanges => write!(f, "DetectingChanges"),
-            ClusterPhase::ScalingStatefulSet => write!(f, "ScalingStatefulSet"),
-            ClusterPhase::AddingNodes => write!(f, "AddingNodes"),
-            ClusterPhase::MigratingSlots => write!(f, "MigratingSlots"),
-            ClusterPhase::RemovingNodes => write!(f, "RemovingNodes"),
-            ClusterPhase::VerifyingCluster => write!(f, "VerifyingCluster"),
+            // Scale-Up Path
+            ClusterPhase::ScalingUpStatefulSet => write!(f, "ScalingUpStatefulSet"),
+            ClusterPhase::WaitingForNewPods => write!(f, "WaitingForNewPods"),
+            ClusterPhase::AddingNodesToCluster => write!(f, "AddingNodesToCluster"),
+            ClusterPhase::RebalancingSlots => write!(f, "RebalancingSlots"),
+            ClusterPhase::ConfiguringNewReplicas => write!(f, "ConfiguringNewReplicas"),
+            // Scale-Down Path
+            ClusterPhase::EvacuatingSlots => write!(f, "EvacuatingSlots"),
+            ClusterPhase::RemovingNodesFromCluster => write!(f, "RemovingNodesFromCluster"),
+            ClusterPhase::ScalingDownStatefulSet => write!(f, "ScalingDownStatefulSet"),
+            // Completion
+            ClusterPhase::VerifyingClusterHealth => write!(f, "VerifyingClusterHealth"),
+            // Problem States
             ClusterPhase::Degraded => write!(f, "Degraded"),
             ClusterPhase::Failed => write!(f, "Failed"),
+            // Terminal
             ClusterPhase::Deleting => write!(f, "Deleting"),
         }
     }
@@ -1053,52 +1087,6 @@ pub struct ReplicaNode {
     pub replication_lag: i64,
 }
 
-/// Records what changes need to be applied to the cluster.
-/// Computed once during DetectingChanges phase to avoid repeated detection.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingChanges {
-    /// Scale direction: "up", "down", or "none".
-    pub scale_direction: String,
-    /// Previous master count (from cluster state).
-    pub previous_masters: i32,
-    /// Target master count (from spec).
-    pub target_masters: i32,
-    /// Pod names of nodes to add (for scale-up).
-    #[serde(default)]
-    pub nodes_to_add: Vec<String>,
-    /// Node IDs of nodes to remove (for scale-down).
-    #[serde(default)]
-    pub nodes_to_remove: Vec<String>,
-    /// Slot migrations to perform.
-    #[serde(default)]
-    pub slot_migrations: Vec<SlotMigrationStatus>,
-    /// Whether image/config changes require rolling update.
-    #[serde(default)]
-    pub requires_rolling_update: bool,
-    /// Generation when these changes were computed.
-    pub for_generation: i64,
-}
-
-/// Tracks a single slot migration operation.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SlotMigrationStatus {
-    /// Source node ID (node currently owning the slots).
-    pub source_node_id: String,
-    /// Target node ID (node that will own the slots).
-    pub target_node_id: String,
-    /// Start slot of the range.
-    pub start_slot: i32,
-    /// End slot of the range (inclusive).
-    pub end_slot: i32,
-    /// Status: "pending", "in_progress", "completed", "failed".
-    pub status: String,
-    /// Error message if status is "failed".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 /// Progress tracking for multi-step operations.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1149,28 +1137,61 @@ mod tests {
 
     #[test]
     fn test_phase_display() {
+        // Initial Creation
         assert_eq!(ClusterPhase::Pending.to_string(), "Pending");
         assert_eq!(ClusterPhase::Creating.to_string(), "Creating");
-        assert_eq!(ClusterPhase::Initializing.to_string(), "Initializing");
+        assert_eq!(ClusterPhase::WaitingForPods.to_string(), "WaitingForPods");
+        assert_eq!(
+            ClusterPhase::InitializingCluster.to_string(),
+            "InitializingCluster"
+        );
         assert_eq!(ClusterPhase::AssigningSlots.to_string(), "AssigningSlots");
+        assert_eq!(
+            ClusterPhase::ConfiguringReplicas.to_string(),
+            "ConfiguringReplicas"
+        );
+        // Steady State
         assert_eq!(ClusterPhase::Running.to_string(), "Running");
+        // Scale-Up Path
         assert_eq!(
-            ClusterPhase::DetectingChanges.to_string(),
-            "DetectingChanges"
+            ClusterPhase::ScalingUpStatefulSet.to_string(),
+            "ScalingUpStatefulSet"
         );
         assert_eq!(
-            ClusterPhase::ScalingStatefulSet.to_string(),
-            "ScalingStatefulSet"
+            ClusterPhase::WaitingForNewPods.to_string(),
+            "WaitingForNewPods"
         );
-        assert_eq!(ClusterPhase::AddingNodes.to_string(), "AddingNodes");
-        assert_eq!(ClusterPhase::MigratingSlots.to_string(), "MigratingSlots");
-        assert_eq!(ClusterPhase::RemovingNodes.to_string(), "RemovingNodes");
         assert_eq!(
-            ClusterPhase::VerifyingCluster.to_string(),
-            "VerifyingCluster"
+            ClusterPhase::AddingNodesToCluster.to_string(),
+            "AddingNodesToCluster"
         );
+        assert_eq!(
+            ClusterPhase::RebalancingSlots.to_string(),
+            "RebalancingSlots"
+        );
+        assert_eq!(
+            ClusterPhase::ConfiguringNewReplicas.to_string(),
+            "ConfiguringNewReplicas"
+        );
+        // Scale-Down Path
+        assert_eq!(ClusterPhase::EvacuatingSlots.to_string(), "EvacuatingSlots");
+        assert_eq!(
+            ClusterPhase::RemovingNodesFromCluster.to_string(),
+            "RemovingNodesFromCluster"
+        );
+        assert_eq!(
+            ClusterPhase::ScalingDownStatefulSet.to_string(),
+            "ScalingDownStatefulSet"
+        );
+        // Completion
+        assert_eq!(
+            ClusterPhase::VerifyingClusterHealth.to_string(),
+            "VerifyingClusterHealth"
+        );
+        // Problem States
         assert_eq!(ClusterPhase::Degraded.to_string(), "Degraded");
         assert_eq!(ClusterPhase::Failed.to_string(), "Failed");
+        // Terminal
         assert_eq!(ClusterPhase::Deleting.to_string(), "Deleting");
     }
 
@@ -1195,7 +1216,7 @@ mod tests {
         assert_eq!(spec.masters, 3);
         assert_eq!(spec.replicas_per_master, 1);
         assert_eq!(spec.image.repository, "valkey/valkey");
-        assert_eq!(spec.image.tag, "9-alpine");
+        assert_eq!(spec.image.tag, "9.0.1-alpine");
         assert!(spec.persistence.enabled);
         assert_eq!(spec.persistence.size, "10Gi");
         assert!(spec.persistence.aof.enabled);
