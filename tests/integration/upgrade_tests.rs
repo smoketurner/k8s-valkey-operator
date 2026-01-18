@@ -396,8 +396,9 @@ async fn test_upgrade_execution_with_replicas() {
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster with 3 masters and 0 replicas (3 total pods) to reduce resource usage
-    let cluster = test_cluster_with_replicas("upgrade-exec-target", 0);
+    // Create cluster with 3 masters and 1 replica per master (6 total pods)
+    // Upgrades require at least 1 replica for safe failover
+    let cluster = test_cluster_with_replicas("upgrade-exec-target", 1);
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await

@@ -37,8 +37,9 @@ async fn test_rollback_restores_original_image() {
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster (0 replicas to reduce resource usage)
-    let cluster = test_cluster_with_replicas("rollback-target", 0);
+    // Create cluster with 1 replica per master (required for upgrades)
+    // Upgrades require at least 1 replica for safe failover
+    let cluster = test_cluster_with_replicas("rollback-target", 1);
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await
@@ -151,8 +152,9 @@ async fn test_rollback_state_transitions() {
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster (0 replicas to reduce resource usage)
-    let cluster = test_cluster_with_replicas("rollback-states-target", 0);
+    // Create cluster with 1 replica per master (required for upgrades)
+    // Upgrades require at least 1 replica for safe failover
+    let cluster = test_cluster_with_replicas("rollback-states-target", 1);
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await

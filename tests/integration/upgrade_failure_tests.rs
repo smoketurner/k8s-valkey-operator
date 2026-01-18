@@ -33,8 +33,9 @@ async fn test_upgrade_fails_on_cluster_health_issue() {
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster (0 replicas to reduce resource usage)
-    let cluster = test_cluster_with_replicas("health-fail-target", 0);
+    // Create cluster with 1 replica per master (required for upgrades)
+    // Upgrades require at least 1 replica for safe failover
+    let cluster = test_cluster_with_replicas("health-fail-target", 1);
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await
@@ -100,13 +101,21 @@ async fn test_upgrade_fails_on_cluster_health_issue() {
             status.phase
         );
 
-        // If failed, verify error message is present
+        // If failed, log the error information (if present)
+        // Note: Not all failures have detailed error info in shard_statuses or progress
+        // (e.g., validation failures are stored in error_message)
         if status.phase == UpgradePhase::Failed {
-            // Status should have error information
+            let has_shard_error = status.shard_statuses.iter().any(|s| s.error.is_some());
+            let has_progress = !status.progress.is_empty();
+            let has_error_message = status.error_message.is_some();
+
+            // At least one form of error information should be present
             assert!(
-                status.shard_statuses.iter().any(|s| s.error.is_some())
-                    || !status.progress.is_empty(),
-                "Failed upgrade should have error information"
+                has_shard_error || has_progress || has_error_message,
+                "Failed upgrade should have error information (shard_error={}, progress={}, error_message={})",
+                has_shard_error,
+                has_progress,
+                has_error_message
             );
         }
     }
@@ -129,8 +138,9 @@ async fn test_concurrent_upgrade_prevention() {
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster (0 replicas to reduce resource usage)
-    let cluster = test_cluster_with_replicas("concurrent-target", 0);
+    // Create cluster with 1 replica per master (required for upgrades)
+    // Upgrades require at least 1 replica for safe failover
+    let cluster = test_cluster_with_replicas("concurrent-target", 1);
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await
@@ -250,8 +260,9 @@ async fn test_upgrade_fails_with_invalid_version() {
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster
-    let cluster = test_cluster_with_replicas("invalid-version-target", 0);
+    // Create cluster with 1 replica per master (required for upgrades)
+    // Upgrades require at least 1 replica for safe failover
+    let cluster = test_cluster_with_replicas("invalid-version-target", 1);
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await
