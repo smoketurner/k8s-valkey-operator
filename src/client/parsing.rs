@@ -31,9 +31,11 @@ pub enum ParseError {
 ///
 /// # Example
 /// ```
+/// use valkey_operator::client::parsing::parse_info_output;
+///
 /// let info = "master_repl_offset:12345\nslave_repl_offset:12340\n";
-/// let parsed = parse_info_output(info)?;
-/// assert_eq!(parsed.get("master_repl_offset"), Some("12345"));
+/// let parsed = parse_info_output(info).unwrap();
+/// assert_eq!(parsed.get("master_repl_offset"), Some(&"12345".to_string()));
 /// ```
 pub fn parse_info_output(
     info: &str,
