@@ -6,7 +6,7 @@
 //! IMPORTANT: Tests using TestNamespace must use `#[tokio::test(flavor = "multi_thread")]`
 //! to support synchronous cleanup via `block_in_place`.
 
-use k8s_openapi::api::core::v1::Namespace;
+use k8s_openapi::api::core::v1::{Namespace, PersistentVolumeClaim};
 use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::{Client, Resource};
 use serde::Serialize;
@@ -140,6 +140,9 @@ impl Drop for TestNamespace {
                 // Remove any remaining finalizers from ValkeyCluster resources
                 Self::remove_resource_finalizers::<ValkeyCluster>(&client, &name).await;
 
+                // Delete all PVCs in the namespace (StatefulSet PVCs are orphaned on deletion)
+                Self::delete_all_pvcs(&client, &name).await;
+
                 let ns_api: Api<Namespace> = Api::all(client);
                 let dp = DeleteParams {
                     propagation_policy: Some(kube::api::PropagationPolicy::Background),
@@ -228,6 +231,31 @@ impl TestNamespace {
                     tracing::warn!("Failed to remove finalizer from {} {}: {}", kind, name, e);
                 } else {
                     tracing::debug!("Removed finalizer from {} {}", kind, name);
+                }
+            }
+        }
+    }
+
+    /// Delete all PVCs in the namespace.
+    /// StatefulSet-created PVCs are not automatically deleted when the StatefulSet is deleted.
+    async fn delete_all_pvcs(client: &Client, namespace: &str) {
+        let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+
+        let pvc_list = match api.list(&Default::default()).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::debug!("Failed to list PVCs for deletion: {}", e);
+                return;
+            }
+        };
+
+        let dp = DeleteParams::default();
+        for pvc in pvc_list.items {
+            if let Some(name) = pvc.metadata.name.as_ref() {
+                if let Err(e) = api.delete(name, &dp).await {
+                    tracing::debug!("Failed to delete PVC {}: {}", name, e);
+                } else {
+                    tracing::debug!("Deleted PVC {}", name);
                 }
             }
         }

@@ -185,7 +185,9 @@ async fn test_resource_deletion() {
         .expect("ValkeyCluster should be deleted");
 
     // Verify owned resources are also deleted (via owner references)
-    wait::wait_for_deletion(&sts_api, "test-delete", DEFAULT_TIMEOUT)
+    // Note: Kubernetes garbage collection can take longer than usual, so we use
+    // LONG_TIMEOUT to allow sufficient time for cascading deletion to complete.
+    wait::wait_for_deletion(&sts_api, "test-delete", LONG_TIMEOUT)
         .await
         .expect("StatefulSet should be garbage collected after ValkeyCluster deletion");
 }

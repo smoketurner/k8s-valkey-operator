@@ -42,6 +42,11 @@ check: ## Run cargo check
 test: ## Run unit tests
 	$(CARGO) test --test unit
 
+test-functional: ## Run functional tests (no cluster required)
+	$(CARGO) test --test functional
+
+test-all: test test-functional ## Run all non-integration tests
+
 audit: ## Run security audit on dependencies
 	$(CARGO) audit
 

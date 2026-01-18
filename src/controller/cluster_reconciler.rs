@@ -2272,12 +2272,18 @@ async fn wait_for_slot_migration(
         match nodes_result {
             Ok(nodes) => {
                 if let Some(target) = nodes.get_node(target_node_id) {
-                    // Check if target node now owns the slot range
-                    let owns_range = target.slots.iter().any(|range| {
-                        range.start <= start_slot as i32 && range.end >= end_slot as i32
+                    // Check if target node now owns ALL slots in the range
+                    // Note: Valkey may fragment slots into multiple ranges after migration,
+                    // so we need to check each slot individually rather than looking for
+                    // a single contiguous range that contains the entire migrated range.
+                    let owns_all_slots = (start_slot..=end_slot).all(|slot| {
+                        target
+                            .slots
+                            .iter()
+                            .any(|range| range.start <= slot as i32 && range.end >= slot as i32)
                     });
 
-                    if owns_range {
+                    if owns_all_slots {
                         debug!(
                             start_slot = start_slot,
                             end_slot = end_slot,
