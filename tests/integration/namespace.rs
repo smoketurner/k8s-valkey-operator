@@ -131,8 +131,8 @@ impl Drop for TestNamespace {
                 // Delete all ValkeyCluster resources to trigger operator cleanup
                 Self::delete_resources::<ValkeyCluster>(&client, &name).await;
 
-                // Brief wait for operator to process deletions
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                // Wait for any in-flight operator reconciliation to complete
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
                 // Remove any remaining finalizers from ValkeyUpgrade resources
                 Self::remove_resource_finalizers::<ValkeyUpgrade>(&client, &name).await;
@@ -195,6 +195,8 @@ impl TestNamespace {
     }
 
     /// Remove finalizers from all resources of type `T` in the namespace.
+    /// Uses empty array `[]` instead of `null` for reliable finalizer removal.
+    /// Retries up to 3 times in case of ResourceVersion conflicts.
     async fn remove_resource_finalizers<T>(client: &Client, namespace: &str)
     where
         T: Resource<Scope = k8s_openapi::NamespaceResourceScope>
@@ -216,8 +218,8 @@ impl TestNamespace {
             }
         };
 
-        let patch: Patch<serde_json::Value> =
-            Patch::Merge(json!({"metadata": {"finalizers": null}}));
+        // Use empty array instead of null for reliable finalizer removal
+        let patch: Patch<serde_json::Value> = Patch::Merge(json!({"metadata": {"finalizers": []}}));
         let patch_params = PatchParams::default();
 
         for resource in resource_list.items {
@@ -227,10 +229,38 @@ impl TestNamespace {
                 if meta.finalizers.as_ref().is_none_or(|f| f.is_empty()) {
                     continue;
                 }
-                if let Err(e) = api.patch(name, &patch_params, &patch).await {
-                    tracing::warn!("Failed to remove finalizer from {} {}: {}", kind, name, e);
-                } else {
-                    tracing::debug!("Removed finalizer from {} {}", kind, name);
+
+                // Retry up to 3 times in case of ResourceVersion conflicts
+                for attempt in 0..3 {
+                    match api.patch(name, &patch_params, &patch).await {
+                        Ok(_) => {
+                            tracing::debug!("Removed finalizers from {} {}", kind, name);
+                            break;
+                        }
+                        Err(kube::Error::Api(e)) if e.code == 404 => {
+                            // Resource already deleted, that's fine
+                            tracing::debug!("{} {} already deleted", kind, name);
+                            break;
+                        }
+                        Err(e) if attempt < 2 => {
+                            tracing::debug!(
+                                "Retry {} removing finalizer from {} {}: {}",
+                                attempt + 1,
+                                kind,
+                                name,
+                                e
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to remove finalizer from {} {}: {}",
+                                kind,
+                                name,
+                                e
+                            );
+                        }
+                    }
                 }
             }
         }

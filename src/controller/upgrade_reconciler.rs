@@ -2223,7 +2223,7 @@ async fn handle_deletion(
     info!(name = %name, "Handling deletion");
 
     let api: Api<ValkeyUpgrade> = Api::namespaced(ctx.client.clone(), namespace);
-    remove_finalizer(&api, &name).await?;
+    remove_finalizer(&api, &name, UPGRADE_FINALIZER).await?;
 
     Ok(Action::await_change())
 }

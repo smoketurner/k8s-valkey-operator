@@ -819,7 +819,7 @@ async fn handle_deletion(
 
     // Remove finalizer
     let api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), namespace);
-    remove_finalizer(&api, &name).await?;
+    remove_finalizer(&api, &name, FINALIZER).await?;
 
     Ok(Action::await_change())
 }

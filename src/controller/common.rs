@@ -36,24 +36,40 @@ where
     Ok(())
 }
 
-/// Remove a finalizer from a resource.
-pub async fn remove_finalizer<T>(api: &Api<T>, name: &str) -> Result<(), Error>
+/// Remove a specific finalizer from a resource.
+pub async fn remove_finalizer<T>(api: &Api<T>, name: &str, finalizer: &str) -> Result<(), Error>
 where
     T: Resource + Clone + DeserializeOwned + std::fmt::Debug,
     <T as Resource>::DynamicType: Default,
 {
-    // Use merge patch to clear all finalizers
-    let patch = serde_json::json!({
-        "metadata": {
-            "finalizers": []
+    // Get current resource to check existing finalizers
+    let resource = match api.get(name).await {
+        Ok(r) => r,
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            // Resource already deleted, nothing to do
+            return Ok(());
         }
-    });
-    api.patch(
-        name,
-        &PatchParams::default(),
-        &kube::api::Patch::Merge(&patch),
-    )
-    .await?;
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut finalizers = resource.finalizers().to_vec();
+
+    // Only patch if the finalizer exists
+    if let Some(pos) = finalizers.iter().position(|f| f == finalizer) {
+        finalizers.remove(pos);
+
+        let patch = serde_json::json!({
+            "metadata": {
+                "finalizers": finalizers
+            }
+        });
+        api.patch(
+            name,
+            &PatchParams::default(),
+            &kube::api::Patch::Merge(&patch),
+        )
+        .await?;
+    }
     Ok(())
 }
 
