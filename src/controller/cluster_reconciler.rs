@@ -2111,11 +2111,11 @@ async fn execute_scale_down(
                 .await
             {
                 Ok(()) => {
-                    // Wait for migration to complete
+                    // Wait for migration to complete, reusing the existing connection
+                    // to avoid the expensive overhead of creating new port-forward
+                    // connections on each poll iteration
                     if let Err(e) = wait_for_slot_migration(
-                        ctx,
-                        obj,
-                        namespace,
+                        &source_client,
                         range.start as u16,
                         range.end as u16,
                         &dest_node.node_id,
@@ -2234,12 +2234,21 @@ async fn execute_rebalance_slots(
         }
     }
 
+    // Sort masters by ordinal to match target_distribution order.
+    // target_distribution[i] should be assigned to the master with ordinal i.
+    // This is critical because CLUSTER NODES returns nodes in arbitrary order,
+    // but target_distribution assumes ordinal order.
+    let mut masters_sorted: Vec<_> = masters.clone();
+    masters_sorted.sort_by_key(|m| {
+        ip_to_ordinal.get(&m.ip).copied().unwrap_or(i32::MAX)
+    });
+
     // Collect all slot migrations grouped by source node
     // Key: source_node_id, Value: list of (slot, dest_node_id)
     let mut migrations_by_source: HashMap<String, Vec<(u16, String)>> = HashMap::new();
     let mut unassigned_slots: HashMap<String, Vec<u16>> = HashMap::new();
 
-    for (master, range) in masters.iter().zip(target_distribution.iter()) {
+    for (master, range) in masters_sorted.iter().zip(target_distribution.iter()) {
         for slot in range.iter() {
             if let Some(current_owner) = current_ownership.get(&slot) {
                 if *current_owner != master.node_id {
@@ -2342,10 +2351,11 @@ async fn execute_rebalance_slots(
                     .await
                 {
                     Ok(()) => {
-                        // Wait for migration to complete
+                        // Wait for migration to complete, reusing the existing connection
+                        // to avoid the expensive overhead of creating new port-forward
+                        // connections on each poll iteration
                         if let Err(e) =
-                            wait_for_slot_migration(ctx, obj, namespace, start, end, &dest_node_id)
-                                .await
+                            wait_for_slot_migration(&source_client, start, end, &dest_node_id).await
                         {
                             let _ = source_client.close().await;
                             return Err(e);
@@ -2408,11 +2418,49 @@ async fn execute_rebalance_slots(
     Ok(result)
 }
 
+/// Check if the given slot ranges collectively cover all slots in [start, end].
+///
+/// This is an O(m) operation where m is the number of slot ranges, compared to the
+/// previous O(n*m) implementation that iterated through every individual slot.
+/// Valkey may fragment slots into multiple ranges after migration, so we need to
+/// verify that contiguous ranges cover the entire requested range.
+fn owns_all_slots_in_range(slot_ranges: &[crate::client::SlotRange], start: u16, end: u16) -> bool {
+    if slot_ranges.is_empty() {
+        return false;
+    }
+
+    // Sort ranges by start (usually already sorted, but be safe)
+    let mut sorted_ranges: Vec<_> = slot_ranges
+        .iter()
+        .map(|r| (r.start as u16, r.end as u16))
+        .collect();
+    sorted_ranges.sort_by_key(|r| r.0);
+
+    // Walk through the requested range, checking coverage
+    let mut current = start;
+    for (range_start, range_end) in sorted_ranges {
+        // If this range starts after what we need, there's a gap
+        if range_start > current {
+            return false;
+        }
+        // If this range covers current position, advance
+        if range_start <= current && range_end >= current {
+            if range_end >= end {
+                return true; // Fully covered
+            }
+            current = range_end + 1;
+        }
+    }
+    false
+}
+
 /// Wait for a slot migration to complete by polling cluster state.
+///
+/// This function reuses an existing client connection to avoid the overhead of
+/// creating new port-forward connections on each poll iteration. The caller
+/// should pass in a client that's already connected to a cluster node.
 async fn wait_for_slot_migration(
-    ctx: &Context,
-    obj: &ValkeyCluster,
-    namespace: &str,
+    client: &crate::client::ValkeyClient,
     start_slot: u16,
     end_slot: u16,
     target_node_id: &str,
@@ -2435,32 +2483,13 @@ async fn wait_for_slot_migration(
             });
         }
 
-        // Connect to check cluster state
-        let client = ctx
-            .connect_to_cluster(obj, namespace, 0)
-            .await
-            .map_err(|e| {
-                ValkeyError::Connection(format!("Failed to connect for migration check: {}", e))
-            })?;
-
-        let nodes_result = client.cluster_nodes().await;
-        let _ = client.close().await;
-
-        match nodes_result {
+        // Query cluster state using the existing connection
+        match client.cluster_nodes().await {
             Ok(nodes) => {
                 if let Some(target) = nodes.get_node(target_node_id) {
-                    // Check if target node now owns ALL slots in the range
-                    // Note: Valkey may fragment slots into multiple ranges after migration,
-                    // so we need to check each slot individually rather than looking for
-                    // a single contiguous range that contains the entire migrated range.
-                    let owns_all_slots = (start_slot..=end_slot).all(|slot| {
-                        target
-                            .slots
-                            .iter()
-                            .any(|range| range.start <= slot as i32 && range.end >= slot as i32)
-                    });
-
-                    if owns_all_slots {
+                    // Check if target node now owns ALL slots in the range using
+                    // the optimized O(m) algorithm instead of O(n*m)
+                    if owns_all_slots_in_range(&target.slots, start_slot, end_slot) {
                         debug!(
                             start_slot = start_slot,
                             end_slot = end_slot,
@@ -2468,6 +2497,20 @@ async fn wait_for_slot_migration(
                         );
                         return Ok(());
                     }
+                    // Log current slot ranges for debugging at debug level (not just trace)
+                    // to help diagnose slow migrations
+                    debug!(
+                        target_node = target_node_id,
+                        target_slots = ?target.slots.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>(),
+                        expected_start = start_slot,
+                        expected_end = end_slot,
+                        "Target does not yet own expected slot range"
+                    );
+                } else {
+                    debug!(
+                        target_node = target_node_id,
+                        "Target node not found in cluster nodes response"
+                    );
                 }
             }
             Err(e) => {
@@ -3158,5 +3201,89 @@ mod tests {
             .and_then(|a| a.get(UPGRADE_NAME_ANNOTATION))
             .cloned();
         assert_eq!(upgrade_name, Some("production-upgrade-v2".to_string()));
+    }
+
+    // ==========================================================================
+    // owns_all_slots_in_range() tests
+    // ==========================================================================
+
+    fn make_slot_range(start: i32, end: i32) -> crate::client::SlotRange {
+        crate::client::SlotRange { start, end }
+    }
+
+    #[test]
+    fn test_owns_all_slots_single_range_exact_match() {
+        let ranges = vec![make_slot_range(0, 5460)];
+        assert!(owns_all_slots_in_range(&ranges, 0, 5460));
+    }
+
+    #[test]
+    fn test_owns_all_slots_single_range_covers_subset() {
+        let ranges = vec![make_slot_range(0, 5460)];
+        assert!(owns_all_slots_in_range(&ranges, 100, 500));
+    }
+
+    #[test]
+    fn test_owns_all_slots_contiguous_ranges() {
+        let ranges = vec![
+            make_slot_range(0, 1000),
+            make_slot_range(1001, 2000),
+            make_slot_range(2001, 3000),
+        ];
+        assert!(owns_all_slots_in_range(&ranges, 0, 3000));
+    }
+
+    #[test]
+    fn test_owns_all_slots_gap_in_ranges() {
+        let ranges = vec![
+            make_slot_range(0, 1000),
+            make_slot_range(2001, 3000), // Gap: 1001-2000 missing
+        ];
+        assert!(!owns_all_slots_in_range(&ranges, 0, 3000));
+    }
+
+    #[test]
+    fn test_owns_all_slots_empty_ranges() {
+        let ranges: Vec<crate::client::SlotRange> = vec![];
+        assert!(!owns_all_slots_in_range(&ranges, 0, 100));
+    }
+
+    #[test]
+    fn test_owns_all_slots_unsorted_ranges() {
+        // Ranges in wrong order - function should still work
+        let ranges = vec![
+            make_slot_range(2001, 3000),
+            make_slot_range(0, 1000),
+            make_slot_range(1001, 2000),
+        ];
+        assert!(owns_all_slots_in_range(&ranges, 0, 3000));
+    }
+
+    #[test]
+    fn test_owns_all_slots_range_starts_after_request() {
+        let ranges = vec![make_slot_range(1000, 2000)];
+        assert!(!owns_all_slots_in_range(&ranges, 0, 500));
+    }
+
+    #[test]
+    fn test_owns_all_slots_range_ends_before_request() {
+        let ranges = vec![make_slot_range(0, 500)];
+        assert!(!owns_all_slots_in_range(&ranges, 0, 1000));
+    }
+
+    #[test]
+    fn test_owns_all_slots_single_slot() {
+        let ranges = vec![make_slot_range(100, 100)];
+        assert!(owns_all_slots_in_range(&ranges, 100, 100));
+    }
+
+    #[test]
+    fn test_owns_all_slots_overlapping_ranges() {
+        // Overlapping ranges should still work
+        let ranges = vec![
+            make_slot_range(0, 1500),
+            make_slot_range(1000, 2000),
+        ];
+        assert!(owns_all_slots_in_range(&ranges, 0, 2000));
     }
 }
