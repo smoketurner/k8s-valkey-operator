@@ -42,7 +42,7 @@ spec:
 spec:
   image:
     repository: "valkey/valkey"    # Default
-    tag: "9-alpine"                # Default
+    tag: "9.0.1-alpine"            # Default
     pullPolicy: "IfNotPresent"     # Always, IfNotPresent, Never
     pullSecrets:                   # Optional
       - my-registry-secret
@@ -412,15 +412,9 @@ When enabled, masters stream RDB data directly to replicas without writing to di
 - Datasets are large
 - Memory is available for streaming
 
-### Replica Health Thresholds (Secure by Default)
+### Replica Health Thresholds
 
-The operator enforces durability by default when replicas are configured.
-
-**Default behavior:**
-- When `replicasPerMaster > 0`: `minReplicasToWrite` defaults to **1**
-- When `replicasPerMaster = 0`: `minReplicasToWrite` defaults to **0**
-
-This ensures that if you configure replicas for high availability, writes are only accepted when at least one replica can acknowledge them, preventing silent data loss.
+Configure write safety requirements based on replica health.
 
 ```yaml
 spec:
@@ -431,16 +425,16 @@ spec:
 
 | Setting | Value | Effect |
 |---------|-------|--------|
-| `minReplicasToWrite: 0` | Disabled | Writes always accepted (explicit opt-out) |
-| `minReplicasToWrite: 1` | 1 replica required | **Default when replicas exist** |
+| `minReplicasToWrite: 0` | Disabled | Writes always accepted (**default**) |
+| `minReplicasToWrite: 1` | 1 replica required | Improved durability |
 | `minReplicasToWrite: 2` | 2 replicas required | Strong durability |
 
-**To prioritize availability over durability**, explicitly set:
+**To improve durability**, set `minReplicasToWrite` to ensure writes are replicated:
 
 ```yaml
 spec:
   replication:
-    minReplicasToWrite: 0  # Accept writes even with no healthy replicas
+    minReplicasToWrite: 1  # Reject writes if no healthy replica available
 ```
 
 **Warning**: Setting `minReplicasToWrite` too high can cause write unavailability during replica failures.

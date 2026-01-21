@@ -205,7 +205,8 @@ When only replicas are being removed (masters unchanged), the flow skips slot ev
 3. `WaitingForPods` → `InitializingCluster` (PodsRunning)
 4. `InitializingCluster` → `AssigningSlots` (ClusterMeetComplete)
 5. `AssigningSlots` → `ConfiguringReplicas` (SlotsAssigned)
-6. `ConfiguringReplicas` → `Running` (ReplicasConfigured)
+6. `ConfiguringReplicas` → `VerifyingClusterHealth` (ReplicasConfigured)
+7. `VerifyingClusterHealth` → `Running` (ClusterHealthy)
 
 ---
 
