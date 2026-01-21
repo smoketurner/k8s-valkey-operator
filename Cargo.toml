@@ -22,11 +22,11 @@ futures = { version = "=0.3.31", default-features = false }
 # Serialization
 serde = { version = "=1.0.228", default-features = false, features = ["derive"] }
 serde_json = { version = "=1.0.149", default-features = false }
-serde-saphyr = { version = "=0.0.15", default-features = false }
+serde-saphyr = { version = "=0.0.16", default-features = false }
 schemars = { version = "=1.2.0", default-features = false }
 
 # Error handling
-thiserror = { version = "=2.0.17", default-features = false }
+thiserror = { version = "=2.0.18", default-features = false }
 
 # Logging/Tracing
 tracing = { version = "=0.1.44", default-features = false }
