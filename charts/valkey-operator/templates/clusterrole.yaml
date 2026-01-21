@@ -34,6 +34,34 @@ rules:
     verbs:
       - update
 
+  # ValkeyUpgrade CRD resources
+  - apiGroups:
+      - valkey-operator.smoketurner.com
+    resources:
+      - valkeyupgrades
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - valkey-operator.smoketurner.com
+    resources:
+      - valkeyupgrades/status
+    verbs:
+      - get
+      - update
+      - patch
+  - apiGroups:
+      - valkey-operator.smoketurner.com
+    resources:
+      - valkeyupgrades/finalizers
+    verbs:
+      - update
+
   # Core resources
   - apiGroups:
       - ""
@@ -43,6 +71,13 @@ rules:
       - get
       - list
       - watch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - pods/exec
+    verbs:
+      - create
   - apiGroups:
       - ""
     resources:
@@ -64,6 +99,34 @@ rules:
     verbs:
       - create
       - patch
+
+  # Policy resources (PodDisruptionBudget)
+  - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+
+  # cert-manager resources
+  - apiGroups:
+      - cert-manager.io
+    resources:
+      - certificates
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
 
   # Apps resources
   - apiGroups:
