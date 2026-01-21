@@ -37,4 +37,6 @@ pub use types::{
     ClusterHealthState, ClusterInfo, ClusterNode, NodeFlags, NodeRole, ParsedClusterNodes,
     SlotRange,
 };
-pub use valkey_client::{TlsCertData, ValkeyClient, ValkeyClientConfig, ValkeyError};
+pub use valkey_client::{
+    SlotMigrationInfo, TlsCertData, ValkeyClient, ValkeyClientConfig, ValkeyError,
+};

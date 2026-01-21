@@ -39,6 +39,122 @@ pub enum ValkeyError {
 
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+
+    #[error("Slot migration failed: {0}")]
+    SlotMigrationFailed(String),
+}
+
+/// Information about a slot migration returned by CLUSTER GETSLOTMIGRATIONS.
+#[derive(Debug, Clone, Default)]
+pub struct SlotMigrationInfo {
+    /// Slot range being migrated (start, end)
+    pub slot_range: Option<(u16, u16)>,
+    /// Current state of the migration (e.g., "migrating", "success", "failed", "cancelled")
+    pub state: Option<String>,
+    /// Operation type (e.g., "EXPORT", "IMPORT")
+    pub operation: Option<String>,
+}
+
+impl SlotMigrationInfo {
+    /// Check if this migration is still in progress (not in a terminal state).
+    pub fn is_in_progress(&self) -> bool {
+        match self.state.as_deref() {
+            Some("success") | Some("failed") | Some("cancelled") => false,
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Check if this migration's slot range overlaps with the given range.
+    pub fn overlaps_range(&self, start: u16, end: u16) -> bool {
+        if let Some((s, e)) = self.slot_range {
+            s <= end && e >= start
+        } else {
+            false
+        }
+    }
+}
+
+/// Parse the CLUSTER GETSLOTMIGRATIONS response into structured data.
+///
+/// The response is a RESP array where each element is an array of key-value pairs:
+/// ```text
+/// 1) 1) "slot_ranges"
+///    2) "0-2730"
+///    3) "state"
+///    4) "migrating"
+///    5) "operation"
+///    6) "EXPORT"
+///    ...
+/// ```
+fn parse_slot_migrations(response: Value) -> Result<Vec<SlotMigrationInfo>, ValkeyError> {
+    // If the response is empty or null, return empty list
+    if response.is_null() {
+        return Ok(Vec::new());
+    }
+
+    // Try to convert to an array of migrations
+    let migrations_array: Vec<Value> = match response.convert() {
+        Ok(arr) => arr,
+        Err(_) => {
+            // Single value or unexpected format - return empty
+            debug!("GETSLOTMIGRATIONS returned non-array response");
+            return Ok(Vec::new());
+        }
+    };
+
+    let mut result = Vec::new();
+
+    for migration_value in migrations_array {
+        // Each migration is an array of key-value pairs (flattened map)
+        let pairs: Vec<Value> = match migration_value.convert() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let mut info = SlotMigrationInfo::default();
+
+        // Parse key-value pairs (alternating key, value) using safe indexing
+        for chunk in pairs.chunks(2) {
+            let (Some(key_val), Some(val_val)) = (chunk.first(), chunk.get(1)) else {
+                continue;
+            };
+
+            let key: String = match key_val.clone().convert() {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+
+            match key.as_str() {
+                "slot_ranges" => {
+                    // Value is a string like "0-2730"
+                    if let Ok(range_str) = val_val.clone().convert::<String>()
+                        && let Some((start, end)) = range_str.split_once('-')
+                        && let (Ok(s), Ok(e)) = (start.parse::<u16>(), end.parse::<u16>())
+                    {
+                        info.slot_range = Some((s, e));
+                    }
+                }
+                "state" => {
+                    if let Ok(state) = val_val.clone().convert::<String>() {
+                        info.state = Some(state);
+                    }
+                }
+                "operation" => {
+                    if let Ok(op) = val_val.clone().convert::<String>() {
+                        info.operation = Some(op);
+                    }
+                }
+                _ => {
+                    // Ignore other fields
+                }
+            }
+        }
+
+        result.push(info);
+    }
+
+    Ok(result)
 }
 
 /// Configuration for connecting to a Valkey cluster.
@@ -667,12 +783,20 @@ impl ValkeyClient {
     ///
     /// Returns information about in-progress and recently completed slot migrations.
     /// Can be called on either source or target node.
+    ///
+    /// The response is a complex RESP array structure. This function returns a
+    /// structured representation that can be parsed for migration status.
     #[instrument(skip(self))]
-    pub async fn cluster_getslotmigrations(&self) -> Result<String, ValkeyError> {
-        // CLUSTER GETSLOTMIGRATIONS
+    pub async fn cluster_getslotmigrations(&self) -> Result<Vec<SlotMigrationInfo>, ValkeyError> {
+        // CLUSTER GETSLOTMIGRATIONS returns an array of migration info
         let cmd = CustomCommand::new("CLUSTER", None, false);
-        let response: String = self.client.custom(cmd, vec!["GETSLOTMIGRATIONS"]).await?;
-        Ok(response)
+        let response: Value = self.client.custom(cmd, vec!["GETSLOTMIGRATIONS"]).await?;
+
+        // Parse the response - it's an array of migration entries
+        // Each entry is a map-like structure with fields like:
+        // slot_ranges, state, operation, etc.
+        let migrations = parse_slot_migrations(response)?;
+        Ok(migrations)
     }
 
     /// Cancel all active slot migrations using CLUSTER CANCELSLOTMIGRATIONS.
@@ -858,5 +982,170 @@ mod tests {
         assert_eq!(config.password, Some("secret".to_string()));
         assert_eq!(config.connection_timeout, Duration::from_secs(5));
         assert_eq!(config.command_timeout, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn test_slot_migration_info_is_in_progress() {
+        // Terminal states should return false
+        let success = SlotMigrationInfo {
+            state: Some("success".to_string()),
+            ..Default::default()
+        };
+        assert!(!success.is_in_progress());
+
+        let failed = SlotMigrationInfo {
+            state: Some("failed".to_string()),
+            ..Default::default()
+        };
+        assert!(!failed.is_in_progress());
+
+        let cancelled = SlotMigrationInfo {
+            state: Some("cancelled".to_string()),
+            ..Default::default()
+        };
+        assert!(!cancelled.is_in_progress());
+
+        // Active states should return true
+        let migrating = SlotMigrationInfo {
+            state: Some("migrating".to_string()),
+            ..Default::default()
+        };
+        assert!(migrating.is_in_progress());
+
+        let syncing = SlotMigrationInfo {
+            state: Some("syncing".to_string()),
+            ..Default::default()
+        };
+        assert!(syncing.is_in_progress());
+
+        // None state should return false
+        let no_state = SlotMigrationInfo::default();
+        assert!(!no_state.is_in_progress());
+    }
+
+    #[test]
+    fn test_slot_migration_info_overlaps_range() {
+        let info = SlotMigrationInfo {
+            slot_range: Some((100, 200)),
+            ..Default::default()
+        };
+
+        // Exact match
+        assert!(info.overlaps_range(100, 200));
+
+        // Partial overlap at start
+        assert!(info.overlaps_range(50, 150));
+
+        // Partial overlap at end
+        assert!(info.overlaps_range(150, 250));
+
+        // Query range contains migration range
+        assert!(info.overlaps_range(50, 250));
+
+        // Migration range contains query range
+        assert!(info.overlaps_range(120, 180));
+
+        // No overlap - before
+        assert!(!info.overlaps_range(0, 99));
+
+        // No overlap - after
+        assert!(!info.overlaps_range(201, 300));
+
+        // Edge case - adjacent ranges don't overlap
+        assert!(!info.overlaps_range(201, 250));
+        assert!(!info.overlaps_range(50, 99));
+
+        // Edge case - touching at boundary should overlap
+        assert!(info.overlaps_range(50, 100));
+        assert!(info.overlaps_range(200, 250));
+
+        // No slot range set
+        let no_range = SlotMigrationInfo::default();
+        assert!(!no_range.overlaps_range(100, 200));
+    }
+
+    #[test]
+    fn test_parse_slot_migrations_empty() {
+        // Null value should return empty vec
+        let result = parse_slot_migrations(Value::Null).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_slot_migrations_single_migration() {
+        // Simulate a RESP array response for a single migration
+        // Structure: [[key1, val1, key2, val2, ...]]
+        let migration_entry = Value::Array(vec![
+            Value::String("slot_ranges".into()),
+            Value::String("0-2730".into()),
+            Value::String("state".into()),
+            Value::String("migrating".into()),
+            Value::String("operation".into()),
+            Value::String("EXPORT".into()),
+        ]);
+        let response = Value::Array(vec![migration_entry]);
+
+        let result = parse_slot_migrations(response).unwrap();
+        assert_eq!(result.len(), 1);
+
+        let info = &result[0];
+        assert_eq!(info.slot_range, Some((0, 2730)));
+        assert_eq!(info.state, Some("migrating".to_string()));
+        assert_eq!(info.operation, Some("EXPORT".to_string()));
+        assert!(info.is_in_progress());
+    }
+
+    #[test]
+    fn test_parse_slot_migrations_multiple_migrations() {
+        let migration1 = Value::Array(vec![
+            Value::String("slot_ranges".into()),
+            Value::String("0-5000".into()),
+            Value::String("state".into()),
+            Value::String("success".into()),
+        ]);
+        let migration2 = Value::Array(vec![
+            Value::String("slot_ranges".into()),
+            Value::String("5001-10000".into()),
+            Value::String("state".into()),
+            Value::String("migrating".into()),
+        ]);
+        let response = Value::Array(vec![migration1, migration2]);
+
+        let result = parse_slot_migrations(response).unwrap();
+        assert_eq!(result.len(), 2);
+
+        // First migration - completed
+        assert_eq!(result[0].slot_range, Some((0, 5000)));
+        assert_eq!(result[0].state, Some("success".to_string()));
+        assert!(!result[0].is_in_progress());
+
+        // Second migration - in progress
+        assert_eq!(result[1].slot_range, Some((5001, 10000)));
+        assert_eq!(result[1].state, Some("migrating".to_string()));
+        assert!(result[1].is_in_progress());
+    }
+
+    #[test]
+    fn test_parse_slot_migrations_invalid_range_format() {
+        // Invalid slot range format should be handled gracefully
+        let migration = Value::Array(vec![
+            Value::String("slot_ranges".into()),
+            Value::String("invalid".into()),
+            Value::String("state".into()),
+            Value::String("migrating".into()),
+        ]);
+        let response = Value::Array(vec![migration]);
+
+        let result = parse_slot_migrations(response).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].slot_range, None);
+        assert_eq!(result[0].state, Some("migrating".to_string()));
+    }
+
+    #[test]
+    fn test_parse_slot_migrations_empty_array() {
+        let response = Value::Array(vec![]);
+        let result = parse_slot_migrations(response).unwrap();
+        assert!(result.is_empty());
     }
 }

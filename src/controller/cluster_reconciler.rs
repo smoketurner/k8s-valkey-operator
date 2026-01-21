@@ -190,18 +190,18 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
 
         // Check iteration count
         if reconcile_count > MAX_RECONCILE_COUNT {
+            // Short message for event (K8s has 1024 char limit), full diagnostic in status
+            let event_msg = format!(
+                "Phase {} stuck: {} reconcile iterations exceeded threshold of {}. See status.message for diagnostics.",
+                current_phase, reconcile_count, MAX_RECONCILE_COUNT
+            );
             let error_msg = format!(
                 "Phase {} stuck: {} reconcile iterations exceeded threshold of {}.\n\n{}",
                 current_phase, reconcile_count, MAX_RECONCILE_COUNT, diagnostic_hint
             );
             error!(name = %name, phase = %current_phase, reconcile_count = reconcile_count, "Stuck detection triggered");
-            ctx.publish_warning_event(
-                &obj,
-                "StuckDetected",
-                "Reconciling",
-                Some(error_msg.clone()),
-            )
-            .await;
+            ctx.publish_warning_event(&obj, "StuckDetected", "Reconciling", Some(event_msg))
+                .await;
             update_status(
                 &api,
                 &name,
@@ -221,18 +221,18 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
         {
             let elapsed = jiff::Timestamp::now().duration_since(ts).as_secs();
             if elapsed > MAX_STUCK_DURATION_SECS {
+                // Short message for event (K8s has 1024 char limit), full diagnostic in status
+                let event_msg = format!(
+                    "Phase {} stuck: {} seconds since last transition exceeds threshold of {}. See status.message for diagnostics.",
+                    current_phase, elapsed, MAX_STUCK_DURATION_SECS
+                );
                 let error_msg = format!(
                     "Phase {} stuck: {} seconds since last transition exceeds threshold of {}.\n\n{}",
                     current_phase, elapsed, MAX_STUCK_DURATION_SECS, diagnostic_hint
                 );
                 error!(name = %name, phase = %current_phase, elapsed_secs = elapsed, "Stuck detection triggered");
-                ctx.publish_warning_event(
-                    &obj,
-                    "StuckDetected",
-                    "Reconciling",
-                    Some(error_msg.clone()),
-                )
-                .await;
+                ctx.publish_warning_event(&obj, "StuckDetected", "Reconciling", Some(event_msg))
+                    .await;
                 update_status(
                     &api,
                     &name,
@@ -1586,12 +1586,8 @@ async fn update_status(
     let current_operation = existing_status.and_then(|s| s.current_operation.clone());
     let operation_started_at = existing_status.and_then(|s| s.operation_started_at.clone());
 
-    // Set connection secret to auth secret name when running
-    let connection_secret = if phase == ClusterPhase::Running {
-        Some(obj.spec.auth.secret_ref.name.clone())
-    } else {
-        None
-    };
+    // Set connection secret to auth secret name (always available from spec)
+    let connection_secret = Some(obj.spec.auth.secret_ref.name.clone());
 
     let operation_progress = existing_status.and_then(|s| s.operation_progress.clone());
     let message = existing_status
@@ -2022,13 +2018,13 @@ async fn execute_scale_down(
         .collect();
 
     if nodes_to_remove.is_empty() {
-        warn!(
-            ordinals_to_remove = ?ordinals_to_remove,
-            master_ips = ?masters.iter().map(|m| &m.ip).collect::<Vec<_>>(),
-            ip_to_ordinal = ?ip_to_ordinal,
-            "No nodes found to remove, skipping scale down"
-        );
-        return Ok(result);
+        return Err(ValkeyError::InvalidConfig(format!(
+            "Scale-down failed: no nodes found to remove. Expected ordinals {:?}, but none matched IPs. \
+             Master IPs: {:?}, IP→ordinal map: {:?}. This may indicate orphan cluster nodes.",
+            ordinals_to_remove,
+            masters.iter().map(|m| &m.ip).collect::<Vec<_>>(),
+            ip_to_ordinal
+        )));
     }
 
     // Find remaining masters (those not being removed)
@@ -2097,9 +2093,13 @@ async fn execute_scale_down(
                 ));
             };
 
+            // Look up target ordinal from ip_to_ordinal map for slot verification
+            let target_ordinal = ip_to_ordinal.get(&dest_node.ip).copied().unwrap_or(0);
+
             info!(
                 from_node = %node.node_id,
                 to_node = %dest_node.node_id,
+                target_ordinal = target_ordinal,
                 start_slot = range.start,
                 end_slot = range.end,
                 "Migrating slot range using CLUSTER MIGRATESLOTS"
@@ -2111,11 +2111,15 @@ async fn execute_scale_down(
                 .await
             {
                 Ok(()) => {
-                    // Wait for migration to complete, reusing the existing connection
-                    // to avoid the expensive overhead of creating new port-forward
-                    // connections on each poll iteration
+                    // Wait for migration to complete using dual-strategy verification:
+                    // 1. Poll GETSLOTMIGRATIONS on source to detect completion
+                    // 2. Connect to target node to verify it owns the slots
                     if let Err(e) = wait_for_slot_migration(
+                        ctx,
+                        obj,
+                        namespace,
                         &source_client,
+                        target_ordinal,
                         range.start as u16,
                         range.end as u16,
                         &dest_node.node_id,
@@ -2239,9 +2243,7 @@ async fn execute_rebalance_slots(
     // This is critical because CLUSTER NODES returns nodes in arbitrary order,
     // but target_distribution assumes ordinal order.
     let mut masters_sorted: Vec<_> = masters.clone();
-    masters_sorted.sort_by_key(|m| {
-        ip_to_ordinal.get(&m.ip).copied().unwrap_or(i32::MAX)
-    });
+    masters_sorted.sort_by_key(|m| ip_to_ordinal.get(&m.ip).copied().unwrap_or(i32::MAX));
 
     // Collect all slot migrations grouped by source node
     // Key: source_node_id, Value: list of (slot, dest_node_id)
@@ -2346,16 +2348,31 @@ async fn execute_rebalance_slots(
                 );
 
                 // Execute CLUSTER MIGRATESLOTS from the source node
+                // Look up target ordinal from node_info map for slot verification
+                let target_ordinal = node_info
+                    .get(&dest_node_id)
+                    .map(|(_, ord)| *ord)
+                    .unwrap_or(0);
+
                 match source_client
                     .cluster_migrateslots(start, end, &dest_node_id)
                     .await
                 {
                     Ok(()) => {
-                        // Wait for migration to complete, reusing the existing connection
-                        // to avoid the expensive overhead of creating new port-forward
-                        // connections on each poll iteration
-                        if let Err(e) =
-                            wait_for_slot_migration(&source_client, start, end, &dest_node_id).await
+                        // Wait for migration to complete using dual-strategy verification:
+                        // 1. Poll GETSLOTMIGRATIONS on source to detect completion
+                        // 2. Connect to target node to verify it owns the slots
+                        if let Err(e) = wait_for_slot_migration(
+                            ctx,
+                            obj,
+                            namespace,
+                            &source_client,
+                            target_ordinal,
+                            start,
+                            end,
+                            &dest_node_id,
+                        )
+                        .await
                         {
                             let _ = source_client.close().await;
                             return Err(e);
@@ -2454,13 +2471,40 @@ fn owns_all_slots_in_range(slot_ranges: &[crate::client::SlotRange], start: u16,
     false
 }
 
-/// Wait for a slot migration to complete by polling cluster state.
+/// Check if slots are still being migrated based on GETSLOTMIGRATIONS output.
 ///
-/// This function reuses an existing client connection to avoid the overhead of
-/// creating new port-forward connections on each poll iteration. The caller
-/// should pass in a client that's already connected to a cluster node.
+/// Returns true if there's an active (non-terminal) migration for the given slot range.
+/// Terminal states (success, failed, cancelled) mean migration is done.
+/// Empty response means no active migrations.
+fn migrations_in_progress_for_range(
+    migrations: &[crate::client::SlotMigrationInfo],
+    start_slot: u16,
+    end_slot: u16,
+) -> bool {
+    migrations
+        .iter()
+        .any(|m| m.is_in_progress() && m.overlaps_range(start_slot, end_slot))
+}
+
+/// Wait for a slot migration to complete using dual-strategy verification.
+///
+/// Strategy 1: Poll `CLUSTER GETSLOTMIGRATIONS` on source node to detect when
+/// migration is complete (source node knows when it's done sending).
+///
+/// Strategy 2: Connect to target node and verify it actually owns the slots
+/// (confirms gossip has propagated and migration is truly complete).
+///
+/// The previous implementation polled `cluster_nodes()` from the source node,
+/// which had a stale view of cluster state since gossip hadn't propagated yet.
+/// This caused intermittent timeouts where the source still thought it owned
+/// the slots even after MIGRATESLOTS returned successfully.
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_slot_migration(
-    client: &crate::client::ValkeyClient,
+    ctx: &Context,
+    obj: &ValkeyCluster,
+    namespace: &str,
+    source_client: &crate::client::ValkeyClient,
+    target_ordinal: i32,
     start_slot: u16,
     end_slot: u16,
     target_node_id: &str,
@@ -2472,60 +2516,124 @@ async fn wait_for_slot_migration(
     const POLL_INTERVAL_SECS: u64 = 2;
     let start = Instant::now();
 
+    // Strategy 1: Poll GETSLOTMIGRATIONS on source node until no active migrations
     loop {
         if start.elapsed().as_secs() > MAX_WAIT_SECS {
             return Err(ValkeyError::Timeout {
                 operation: format!(
-                    "Slot migration {}-{} to {}",
+                    "Slot migration {}-{} to {} (GETSLOTMIGRATIONS check)",
                     start_slot, end_slot, target_node_id
                 ),
                 duration: Duration::from_secs(MAX_WAIT_SECS),
             });
         }
 
-        // Query cluster state using the existing connection
-        match client.cluster_nodes().await {
+        // Check GETSLOTMIGRATIONS on source node
+        // If no active migrations for our range, source is done sending
+        match source_client.cluster_getslotmigrations().await {
+            Ok(migrations) => {
+                if !migrations_in_progress_for_range(&migrations, start_slot, end_slot) {
+                    debug!(
+                        start_slot = start_slot,
+                        end_slot = end_slot,
+                        "Source node reports no active migrations for range"
+                    );
+                    break; // Source says migration is complete - verify with target
+                }
+                debug!(
+                    start_slot = start_slot,
+                    end_slot = end_slot,
+                    "Source node still has active migration for range"
+                );
+            }
+            Err(e) => {
+                // GETSLOTMIGRATIONS may not be supported or may fail
+                // Fall back to checking target node directly
+                debug!(
+                    error = %e,
+                    "GETSLOTMIGRATIONS failed, will verify with target node"
+                );
+                break;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+    }
+
+    // Strategy 2: Confirm target node has received the slots
+    // Connect to the target node directly to get an authoritative answer
+    let target_client = ctx
+        .connect_to_cluster(obj, namespace, target_ordinal)
+        .await
+        .map_err(|e| {
+            ValkeyError::Connection(format!(
+                "Failed to connect to target node (ordinal {}) for slot verification: {}",
+                target_ordinal, e
+            ))
+        })?;
+
+    // Retry a few times for gossip propagation
+    const MAX_TARGET_RETRIES: u32 = 10;
+    const TARGET_RETRY_INTERVAL_SECS: u64 = 1;
+
+    for attempt in 0..MAX_TARGET_RETRIES {
+        if start.elapsed().as_secs() > MAX_WAIT_SECS {
+            let _ = target_client.close().await;
+            return Err(ValkeyError::Timeout {
+                operation: format!(
+                    "Slot migration {}-{} to {} (target verification)",
+                    start_slot, end_slot, target_node_id
+                ),
+                duration: Duration::from_secs(MAX_WAIT_SECS),
+            });
+        }
+
+        match target_client.cluster_nodes().await {
             Ok(nodes) => {
                 if let Some(target) = nodes.get_node(target_node_id) {
-                    // Check if target node now owns ALL slots in the range using
-                    // the optimized O(m) algorithm instead of O(n*m)
                     if owns_all_slots_in_range(&target.slots, start_slot, end_slot) {
                         debug!(
                             start_slot = start_slot,
                             end_slot = end_slot,
-                            "Slot range migration verified"
+                            target_node = target_node_id,
+                            "Slot range migration verified on target node"
                         );
+                        let _ = target_client.close().await;
                         return Ok(());
                     }
-                    // Log current slot ranges for debugging at debug level (not just trace)
-                    // to help diagnose slow migrations
                     debug!(
+                        attempt = attempt,
                         target_node = target_node_id,
                         target_slots = ?target.slots.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>(),
                         expected_start = start_slot,
                         expected_end = end_slot,
-                        "Target does not yet own expected slot range"
+                        "Target node does not yet own expected slot range"
                     );
                 } else {
                     debug!(
+                        attempt = attempt,
                         target_node = target_node_id,
                         "Target node not found in cluster nodes response"
                     );
                 }
             }
             Err(e) => {
-                debug!(error = %e, "Failed to get cluster nodes, will retry");
+                debug!(
+                    attempt = attempt,
+                    error = %e,
+                    "Failed to get cluster nodes from target, will retry"
+                );
             }
         }
 
-        // Migration still in progress, wait and poll again
-        debug!(
-            start_slot = start_slot,
-            end_slot = end_slot,
-            "Slot migration in progress, waiting..."
-        );
-        tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        tokio::time::sleep(Duration::from_secs(TARGET_RETRY_INTERVAL_SECS)).await;
     }
+
+    let _ = target_client.close().await;
+    Err(ValkeyError::SlotMigrationFailed(format!(
+        "Target node {} did not receive slots {}-{} after {} retries",
+        target_node_id, start_slot, end_slot, MAX_TARGET_RETRIES
+    )))
 }
 
 /// Get the total number of nodes in the Valkey cluster.
@@ -3280,10 +3388,96 @@ mod tests {
     #[test]
     fn test_owns_all_slots_overlapping_ranges() {
         // Overlapping ranges should still work
-        let ranges = vec![
-            make_slot_range(0, 1500),
-            make_slot_range(1000, 2000),
-        ];
+        let ranges = vec![make_slot_range(0, 1500), make_slot_range(1000, 2000)];
         assert!(owns_all_slots_in_range(&ranges, 0, 2000));
+    }
+
+    // ==========================================================================
+    // migrations_in_progress_for_range() tests
+    // ==========================================================================
+
+    #[test]
+    fn test_migrations_in_progress_empty() {
+        let migrations: Vec<crate::client::SlotMigrationInfo> = vec![];
+        assert!(!migrations_in_progress_for_range(&migrations, 0, 1000));
+    }
+
+    #[test]
+    fn test_migrations_in_progress_active_overlapping() {
+        let migrations = vec![crate::client::SlotMigrationInfo {
+            slot_range: Some((0, 2730)),
+            state: Some("migrating".to_string()),
+            operation: Some("EXPORT".to_string()),
+        }];
+
+        // Overlapping ranges should return true
+        assert!(migrations_in_progress_for_range(&migrations, 0, 1000));
+        assert!(migrations_in_progress_for_range(&migrations, 1000, 2000));
+        assert!(migrations_in_progress_for_range(&migrations, 2000, 3000));
+
+        // Non-overlapping range should return false
+        assert!(!migrations_in_progress_for_range(&migrations, 3000, 4000));
+    }
+
+    #[test]
+    fn test_migrations_in_progress_completed_overlapping() {
+        let migrations = vec![crate::client::SlotMigrationInfo {
+            slot_range: Some((0, 2730)),
+            state: Some("success".to_string()),
+            operation: Some("EXPORT".to_string()),
+        }];
+
+        // Completed migration should not be considered in progress
+        assert!(!migrations_in_progress_for_range(&migrations, 0, 1000));
+    }
+
+    #[test]
+    fn test_migrations_in_progress_multiple_migrations() {
+        let migrations = vec![
+            crate::client::SlotMigrationInfo {
+                slot_range: Some((0, 1000)),
+                state: Some("success".to_string()),
+                operation: None,
+            },
+            crate::client::SlotMigrationInfo {
+                slot_range: Some((1001, 2000)),
+                state: Some("migrating".to_string()),
+                operation: None,
+            },
+            crate::client::SlotMigrationInfo {
+                slot_range: Some((2001, 3000)),
+                state: Some("failed".to_string()),
+                operation: None,
+            },
+        ];
+
+        // Only the second migration is in progress
+        assert!(!migrations_in_progress_for_range(&migrations, 0, 500)); // success
+        assert!(migrations_in_progress_for_range(&migrations, 1500, 1600)); // migrating
+        assert!(!migrations_in_progress_for_range(&migrations, 2500, 2600)); // failed
+    }
+
+    #[test]
+    fn test_migrations_in_progress_no_slot_range() {
+        let migrations = vec![crate::client::SlotMigrationInfo {
+            slot_range: None,
+            state: Some("migrating".to_string()),
+            operation: None,
+        }];
+
+        // Migration without slot range can't overlap anything
+        assert!(!migrations_in_progress_for_range(&migrations, 0, 1000));
+    }
+
+    #[test]
+    fn test_migrations_in_progress_cancelled_state() {
+        let migrations = vec![crate::client::SlotMigrationInfo {
+            slot_range: Some((0, 2730)),
+            state: Some("cancelled".to_string()),
+            operation: Some("EXPORT".to_string()),
+        }];
+
+        // Cancelled migration should not be considered in progress
+        assert!(!migrations_in_progress_for_range(&migrations, 0, 1000));
     }
 }
