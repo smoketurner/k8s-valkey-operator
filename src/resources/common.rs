@@ -59,6 +59,10 @@ pub fn standard_annotations(resource: &ValkeyCluster) -> BTreeMap<String, String
 ///
 /// This ensures that all created resources are garbage collected
 /// when the ValkeyCluster is deleted.
+///
+/// # Panics
+/// This function will return an invalid owner reference if the resource
+/// has no UID. Use [`try_owner_reference`] for fallible behavior.
 pub fn owner_reference(resource: &ValkeyCluster) -> OwnerReference {
     OwnerReference {
         api_version: "valkey-operator.smoketurner.com/v1alpha1".to_string(),
@@ -68,6 +72,25 @@ pub fn owner_reference(resource: &ValkeyCluster) -> OwnerReference {
         controller: Some(true),
         block_owner_deletion: Some(true),
     }
+}
+
+/// Try to create an owner reference for a ValkeyCluster.
+///
+/// Returns `None` if the resource has no UID (which can happen if the
+/// resource hasn't been persisted to the API server yet).
+///
+/// This is the safe version of [`owner_reference`] that explicitly handles
+/// the missing UID case.
+pub fn try_owner_reference(resource: &ValkeyCluster) -> Option<OwnerReference> {
+    let uid = resource.uid()?;
+    Some(OwnerReference {
+        api_version: "valkey-operator.smoketurner.com/v1alpha1".to_string(),
+        kind: "ValkeyCluster".to_string(),
+        name: resource.name_any(),
+        uid,
+        controller: Some(true),
+        block_owner_deletion: Some(true),
+    })
 }
 
 /// Pod selector labels (subset of standard labels used for service selectors).

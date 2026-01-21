@@ -6,8 +6,8 @@
 //! - Replica scaling (add replicas per master)
 //! - Degraded state handling
 
-use k8s_openapi::api::apps::v1::StatefulSet;
-use kube::api::{Api, Patch, PatchParams, PostParams};
+use k8s_openapi::api::core::v1::Pod;
+use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 
 use valkey_operator::crd::{ClusterPhase, ValkeyCluster, total_pods};
 
@@ -299,7 +299,7 @@ async fn test_degraded_state() {
     create_auth_secret(client.clone(), &ns_name).await;
 
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
-    let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns_name);
+    let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns_name);
 
     // Create resource with 3 masters and 0 replicas = 3 total pods
     let resource = test_cluster_with_config("degraded-test", 3, 0);
@@ -314,25 +314,13 @@ async fn test_degraded_state() {
         .await
         .expect("Resource should become operational");
 
-    // Scale StatefulSet directly to fewer replicas to simulate pod failure
-    // (This simulates a failure scenario where not all pods are available)
-    // With 3 pods, reduce by 1 to leave 2 pods (below quorum)
-    let reduced_pods = expected_pods - 1;
-    let sts_patch = serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "StatefulSet",
-        "spec": {
-            "replicas": reduced_pods
-        }
-    });
-    sts_api
-        .patch(
-            "degraded-test",
-            &PatchParams::apply("test-harness").force(),
-            &Patch::Apply(&sts_patch),
-        )
+    // Delete a pod to simulate failure (instead of patching StatefulSet)
+    // Pod deletion allows the StatefulSet to immediately recreate the pod,
+    // and the Valkey cluster can recover because slots aren't permanently lost.
+    pod_api
+        .delete("degraded-test-2", &DeleteParams::default())
         .await
-        .expect("Failed to patch StatefulSet");
+        .expect("Should delete pod");
 
     // Give the operator time to detect the degraded state
     // Note: The operator will try to restore the desired state,

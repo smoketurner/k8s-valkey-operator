@@ -25,7 +25,6 @@
 //! scale-down), eliminating the need for context-passing via pending_changes.
 
 use kube::Api;
-use std::cmp::Ordering;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -38,6 +37,11 @@ use crate::{
 };
 
 use super::cluster_reconciler::FIELD_MANAGER;
+
+/// Maximum number of reconciliations to attempt in VerifyingClusterHealth
+/// before transitioning to Degraded. This prevents infinite loops when
+/// the cluster can't reach a healthy state.
+const MAX_VERIFICATION_ATTEMPTS: i32 = 30;
 
 /// Result of a phase handler execution.
 #[derive(Debug)]
@@ -476,77 +480,84 @@ pub async fn handle_running(
 ) -> Result<PhaseResult, Error> {
     let name = &phase_ctx.name;
 
-    // Ensure resources are in sync
-    create_resources_fn.await?;
-
-    // Detect scale operations by comparing spec masters to cluster masters
-    match phase_ctx.target_masters.cmp(&phase_ctx.current_masters) {
-        Ordering::Greater => {
-            info!(
-                name = %name,
-                current = phase_ctx.current_masters,
-                target = phase_ctx.target_masters,
-                "Scale-up detected"
-            );
-            ctx.publish_normal_event(
-                obj,
-                "ScaleUpDetected",
-                "Running",
-                Some(format!(
-                    "Scaling up from {} to {} masters",
-                    phase_ctx.current_masters, phase_ctx.target_masters
-                )),
-            )
-            .await;
-            return Ok(ClusterPhase::ScalingUpStatefulSet.into());
-        }
-        Ordering::Less if phase_ctx.current_masters > 0 => {
-            info!(
-                name = %name,
-                current = phase_ctx.current_masters,
-                target = phase_ctx.target_masters,
-                "Scale-down detected"
-            );
-            ctx.publish_normal_event(
-                obj,
-                "ScaleDownDetected",
-                "Running",
-                Some(format!(
-                    "Scaling down from {} to {} masters",
-                    phase_ctx.current_masters, phase_ctx.target_masters
-                )),
-            )
-            .await;
-            return Ok(ClusterPhase::EvacuatingSlots.into());
-        }
-        _ => {}
+    // CRITICAL: Detect scale-down BEFORE applying resources to prevent race condition.
+    // For scale-down, we must NOT reduce StatefulSet replicas until slots are evacuated.
+    // If we call create_resources_fn first, Kubernetes immediately terminates pods
+    // before their slots can be migrated, causing data loss.
+    if phase_ctx.current_masters > 0 && phase_ctx.target_masters < phase_ctx.current_masters {
+        info!(
+            name = %name,
+            current = phase_ctx.current_masters,
+            target = phase_ctx.target_masters,
+            "Scale-down detected - deferring resource sync until slots evacuated"
+        );
+        ctx.publish_normal_event(
+            obj,
+            "ScaleDownDetected",
+            "Running",
+            Some(format!(
+                "Scaling down from {} to {} masters",
+                phase_ctx.current_masters, phase_ctx.target_masters
+            )),
+        )
+        .await;
+        return Ok(ClusterPhase::EvacuatingSlots.into());
     }
 
-    // Check for replica count changes (masters unchanged)
+    // Check for replica-only scale-down (masters unchanged) BEFORE resource sync.
+    // Replicas don't hold slots, so we skip EvacuatingSlots but still need to
+    // defer StatefulSet scaling until RemovingNodesFromCluster completes.
     let desired_replicas = phase_ctx.desired_replicas();
-    if phase_ctx.running_pods != desired_replicas && phase_ctx.current_masters > 0 {
-        if phase_ctx.running_pods > desired_replicas {
-            // Replica scale-DOWN: go directly to node removal (skip slot evacuation)
-            // Replicas don't hold slots, so EvacuatingSlots is unnecessary
-            debug!(
-                name = %name,
-                running = phase_ctx.running_pods,
-                desired = desired_replicas,
-                "Replica scale-down detected"
-            );
-            ctx.publish_normal_event(
-                obj,
-                "ReplicaScaleDownDetected",
-                "Running",
-                Some(format!(
-                    "Scaling down replicas from {} to {} pods",
-                    phase_ctx.running_pods, desired_replicas
-                )),
-            )
-            .await;
-            return Ok(ClusterPhase::RemovingNodesFromCluster.into());
-        }
-        // Replica scale-UP: existing path
+    if phase_ctx.running_pods > desired_replicas
+        && phase_ctx.current_masters > 0
+        && phase_ctx.current_masters == phase_ctx.target_masters
+    {
+        debug!(
+            name = %name,
+            running = phase_ctx.running_pods,
+            desired = desired_replicas,
+            "Replica scale-down detected - deferring resource sync"
+        );
+        ctx.publish_normal_event(
+            obj,
+            "ReplicaScaleDownDetected",
+            "Running",
+            Some(format!(
+                "Scaling down replicas from {} to {} pods",
+                phase_ctx.running_pods, desired_replicas
+            )),
+        )
+        .await;
+        return Ok(ClusterPhase::RemovingNodesFromCluster.into());
+    }
+
+    // Safe to apply resources now - no scale-down in progress.
+    // Scale-up operations add pods (safe), and no-change operations are idempotent.
+    create_resources_fn.await?;
+
+    // Detect scale-up operations (safe to apply resources first since we're adding pods)
+    if phase_ctx.target_masters > phase_ctx.current_masters {
+        info!(
+            name = %name,
+            current = phase_ctx.current_masters,
+            target = phase_ctx.target_masters,
+            "Scale-up detected"
+        );
+        ctx.publish_normal_event(
+            obj,
+            "ScaleUpDetected",
+            "Running",
+            Some(format!(
+                "Scaling up from {} to {} masters",
+                phase_ctx.current_masters, phase_ctx.target_masters
+            )),
+        )
+        .await;
+        return Ok(ClusterPhase::ScalingUpStatefulSet.into());
+    }
+
+    // Check for replica scale-up (masters unchanged, need more pods)
+    if phase_ctx.running_pods < desired_replicas && phase_ctx.current_masters > 0 {
         debug!(
             name = %name,
             running = phase_ctx.running_pods,
@@ -1015,22 +1026,72 @@ pub async fn handle_verifying_cluster_health(
             Ok(ClusterPhase::Running.into())
         }
         Ok(health) => {
+            // Check if we've exceeded max verification attempts
+            let reconcile_count = obj.status.as_ref().map(|s| s.reconcile_count).unwrap_or(0);
+
             warn!(
                 name = %name,
                 slots_assigned = health.slots_assigned,
                 healthy_masters = health.healthy_masters,
+                reconcile_count = reconcile_count,
+                max_attempts = MAX_VERIFICATION_ATTEMPTS,
                 "Cluster not yet healthy, waiting"
             );
 
             if health.healthy_masters == 0 {
+                Ok(ClusterPhase::Degraded.into())
+            } else if reconcile_count >= MAX_VERIFICATION_ATTEMPTS {
+                warn!(
+                    name = %name,
+                    reconcile_count = reconcile_count,
+                    "Max verification attempts reached, transitioning to Degraded"
+                );
+                ctx.publish_warning_event(
+                    obj,
+                    "VerificationTimeout",
+                    "VerifyingClusterHealth",
+                    Some(format!(
+                        "Cluster health verification timed out after {} attempts",
+                        reconcile_count
+                    )),
+                )
+                .await;
                 Ok(ClusterPhase::Degraded.into())
             } else {
                 Ok(ClusterPhase::VerifyingClusterHealth.into())
             }
         }
         Err(e) => {
-            warn!(name = %name, error = %e, "Health check failed during verification");
-            Ok(ClusterPhase::VerifyingClusterHealth.into())
+            // Check if we've exceeded max verification attempts even on error
+            let reconcile_count = obj.status.as_ref().map(|s| s.reconcile_count).unwrap_or(0);
+
+            warn!(
+                name = %name,
+                error = %e,
+                reconcile_count = reconcile_count,
+                "Health check failed during verification"
+            );
+
+            if reconcile_count >= MAX_VERIFICATION_ATTEMPTS {
+                warn!(
+                    name = %name,
+                    reconcile_count = reconcile_count,
+                    "Max verification attempts reached after errors, transitioning to Degraded"
+                );
+                ctx.publish_warning_event(
+                    obj,
+                    "VerificationTimeout",
+                    "VerifyingClusterHealth",
+                    Some(format!(
+                        "Cluster health verification timed out after {} attempts with errors",
+                        reconcile_count
+                    )),
+                )
+                .await;
+                Ok(ClusterPhase::Degraded.into())
+            } else {
+                Ok(ClusterPhase::VerifyingClusterHealth.into())
+            }
         }
     }
 }
@@ -1049,27 +1110,61 @@ pub async fn handle_degraded(
     phase_ctx: &PhaseContext,
     create_resources_fn: impl std::future::Future<Output = Result<(), Error>>,
 ) -> Result<PhaseResult, Error> {
-    // Ensure resources are in sync
-    create_resources_fn.await?;
-
     let desired_replicas = phase_ctx.desired_replicas();
 
-    // Check for scale operations even in degraded state
+    // CRITICAL: Detect scale-down BEFORE applying resources to prevent race condition.
+    // Same issue as handle_running - we must not reduce StatefulSet replicas until
+    // slots are evacuated to prevent data loss.
     if phase_ctx.current_masters > 0 {
-        match phase_ctx.target_masters.cmp(&phase_ctx.current_masters) {
-            Ordering::Greater => {
-                return Ok(ClusterPhase::ScalingUpStatefulSet.into());
-            }
-            Ordering::Less => {
-                return Ok(ClusterPhase::EvacuatingSlots.into());
-            }
-            Ordering::Equal => {
-                // Check for replica-only scale-down (masters unchanged)
-                if phase_ctx.running_pods > desired_replicas {
-                    return Ok(ClusterPhase::RemovingNodesFromCluster.into());
-                }
-            }
+        // Master scale-down: must evacuate slots first
+        if phase_ctx.target_masters < phase_ctx.current_masters {
+            info!(
+                current = phase_ctx.current_masters,
+                target = phase_ctx.target_masters,
+                "Scale-down detected in degraded state - deferring resource sync"
+            );
+            ctx.publish_normal_event(
+                obj,
+                "ScaleDownDetected",
+                "Degraded",
+                Some(format!(
+                    "Scaling down from {} to {} masters",
+                    phase_ctx.current_masters, phase_ctx.target_masters
+                )),
+            )
+            .await;
+            return Ok(ClusterPhase::EvacuatingSlots.into());
         }
+
+        // Replica-only scale-down (masters unchanged): skip slot evacuation
+        if phase_ctx.target_masters == phase_ctx.current_masters
+            && phase_ctx.running_pods > desired_replicas
+        {
+            debug!(
+                running = phase_ctx.running_pods,
+                desired = desired_replicas,
+                "Replica scale-down detected in degraded state - deferring resource sync"
+            );
+            ctx.publish_normal_event(
+                obj,
+                "ReplicaScaleDownDetected",
+                "Degraded",
+                Some(format!(
+                    "Scaling down replicas from {} to {} pods",
+                    phase_ctx.running_pods, desired_replicas
+                )),
+            )
+            .await;
+            return Ok(ClusterPhase::RemovingNodesFromCluster.into());
+        }
+    }
+
+    // Safe to apply resources now - no scale-down in progress
+    create_resources_fn.await?;
+
+    // Check for scale-up operations (safe after resource sync)
+    if phase_ctx.current_masters > 0 && phase_ctx.target_masters > phase_ctx.current_masters {
+        return Ok(ClusterPhase::ScalingUpStatefulSet.into());
     }
 
     if phase_ctx.ready_pods >= desired_replicas {

@@ -832,6 +832,16 @@ async fn create_owned_resources(
 ) -> Result<(), Error> {
     let name = obj.name_any();
 
+    // Validate UID exists before creating child resources.
+    // Without a valid UID, owner references won't work and garbage collection
+    // will fail when the ValkeyCluster is deleted.
+    if obj.uid().is_none() {
+        return Err(Error::Validation(format!(
+            "ValkeyCluster {} has no UID - cannot create child resources without valid owner reference",
+            name
+        )));
+    }
+
     // Apply StatefulSet
     let statefulset = statefulset::generate_statefulset(obj);
     let sts_api: Api<k8s_openapi::api::apps::v1::StatefulSet> =
@@ -2017,24 +2027,64 @@ async fn execute_scale_down(
         .copied()
         .collect();
 
-    if nodes_to_remove.is_empty() {
+    // Also find orphaned nodes (cluster nodes whose IP doesn't match any current pod).
+    // These are nodes that were in the cluster but their pods have been deleted.
+    let orphaned_nodes = topology.orphaned_nodes(cluster_nodes);
+    let orphaned_masters: Vec<_> = orphaned_nodes
+        .iter()
+        .filter(|n| n.flags.master)
+        .copied()
+        .collect();
+
+    // Log orphaned nodes for debugging
+    if !orphaned_masters.is_empty() {
+        info!(
+            orphan_count = orphaned_masters.len(),
+            orphan_ids = ?orphaned_masters.iter().map(|n| &n.node_id).collect::<Vec<_>>(),
+            "Found orphaned master nodes (no matching pods)"
+        );
+    }
+
+    // Check for orphaned nodes that still have slots - this is an error condition
+    // (data loss risk if we proceed without migrating those slots)
+    let orphans_with_slots: Vec<_> = orphaned_masters
+        .iter()
+        .filter(|n| !n.slots.is_empty())
+        .collect();
+
+    if !orphans_with_slots.is_empty() {
+        warn!(
+            orphans_with_slots = orphans_with_slots.len(),
+            orphan_ids = ?orphans_with_slots.iter().map(|n| &n.node_id).collect::<Vec<_>>(),
+            "Orphaned nodes have slots - cannot migrate from deleted pods. \
+             These nodes will be forgotten, which may cause data loss."
+        );
+    }
+
+    // If we have no regular nodes to remove AND no orphans, that's an error
+    if nodes_to_remove.is_empty() && orphaned_masters.is_empty() {
         return Err(ValkeyError::InvalidConfig(format!(
             "Scale-down failed: no nodes found to remove. Expected ordinals {:?}, but none matched IPs. \
-             Master IPs: {:?}, IP→ordinal map: {:?}. This may indicate orphan cluster nodes.",
+             Master IPs: {:?}, IP→ordinal map: {:?}. No orphan nodes found either.",
             ordinals_to_remove,
             masters.iter().map(|m| &m.ip).collect::<Vec<_>>(),
             ip_to_ordinal
         )));
     }
 
-    // Find remaining masters (those not being removed)
+    // Find remaining masters (those not being removed and not orphaned)
     let remaining_masters: Vec<_> = masters
         .iter()
-        .filter(|m| !nodes_to_remove.iter().any(|n| n.node_id == m.node_id))
+        .filter(|m| {
+            !nodes_to_remove.iter().any(|n| n.node_id == m.node_id)
+                && !orphaned_masters.iter().any(|n| n.node_id == m.node_id)
+        })
         .copied()
         .collect();
 
-    if remaining_masters.is_empty() {
+    // If we have no remaining masters but only orphans to remove, that's OK
+    // (the orphans can be forgotten without migrating slots anywhere)
+    if remaining_masters.is_empty() && !nodes_to_remove.is_empty() {
         return Err(ValkeyError::InvalidConfig(
             "Cannot scale down: no remaining masters to receive slots".to_string(),
         ));
@@ -2042,6 +2092,7 @@ async fn execute_scale_down(
 
     info!(
         nodes_to_remove = nodes_to_remove.len(),
+        orphaned_masters = orphaned_masters.len(),
         remaining_masters = remaining_masters.len(),
         "Starting scale-down slot migration"
     );
@@ -2154,11 +2205,31 @@ async fn execute_scale_down(
         .await
         .map_err(|e| ValkeyError::Connection(format!("Failed to connect for FORGET: {}", e)))?;
 
+    // Forget nodes that we migrated slots from
     for node in &nodes_to_remove {
         info!(node_id = %node.node_id, "Removing node from cluster via CLUSTER FORGET");
         if let Err(e) = client.cluster_forget(&node.node_id).await {
             warn!(node_id = %node.node_id, error = %e, "Failed to forget node, continuing");
             // Don't fail the whole operation if FORGET fails for one node
+        }
+        result.nodes_removed.push(node.node_id.clone());
+    }
+
+    // Also forget orphaned master nodes (those with no matching pods)
+    // These nodes couldn't have their slots migrated because the pods are gone,
+    // but they need to be removed from the cluster topology
+    for node in &orphaned_masters {
+        // Skip if we already processed this node (shouldn't happen, but be safe)
+        if result.nodes_removed.contains(&node.node_id) {
+            continue;
+        }
+        info!(
+            node_id = %node.node_id,
+            has_slots = !node.slots.is_empty(),
+            "Removing orphaned node from cluster via CLUSTER FORGET"
+        );
+        if let Err(e) = client.cluster_forget(&node.node_id).await {
+            warn!(node_id = %node.node_id, error = %e, "Failed to forget orphaned node, continuing");
         }
         result.nodes_removed.push(node.node_id.clone());
     }

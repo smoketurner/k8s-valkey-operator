@@ -654,3 +654,168 @@ fn test_phase_context_helpers() {
     let ctx = state.to_phase_context();
     assert_eq!(ctx.scale_direction(), ScaleDirection::Down);
 }
+
+// ============================================================================
+// Race Condition Prevention Tests
+// ============================================================================
+
+/// Test that scale-down from Running immediately transitions to EvacuatingSlots
+/// WITHOUT any intermediate phase that would apply resources and scale the StatefulSet.
+///
+/// This is a regression test for the race condition where pods were terminated
+/// before slots were evacuated because create_owned_resources was called
+/// before scale-down detection.
+#[test]
+fn test_scale_down_from_running_no_resource_sync_before_evacuation() {
+    let mut state = MockClusterState::running("race-condition-test", 6, 1);
+    assert_eq!(state.current_masters, 6);
+    assert_eq!(state.running_pods, 12);
+
+    // Simulate spec change to scale down (6 → 3 masters)
+    state.set_scale_down(3, 1);
+
+    // The FIRST event after scale-down spec change should be ScaleDownDetected
+    // which transitions directly to EvacuatingSlots
+    let result = state.apply_event(ClusterEvent::ScaleDownDetected);
+    match result {
+        TransitionResult::Success { from, to, .. } => {
+            assert_eq!(from, ClusterPhase::Running);
+            assert_eq!(
+                to,
+                ClusterPhase::EvacuatingSlots,
+                "Expected direct transition to EvacuatingSlots from Running"
+            );
+        }
+        _ => panic!("Expected successful transition to EvacuatingSlots"),
+    }
+
+    // CRITICAL: At this point, running_pods should still be 12 (unchanged)
+    // The pods should NOT have been scaled down yet
+    assert_eq!(
+        state.running_pods, 12,
+        "Running pods should NOT decrease until ScalingDownStatefulSet phase"
+    );
+}
+
+/// Test that scale-down from Degraded immediately transitions without resource sync.
+///
+/// Similar to the Running test, but validates the Degraded → EvacuatingSlots path.
+#[test]
+fn test_scale_down_from_degraded_no_resource_sync_before_evacuation() {
+    let mut state = MockClusterState::degraded("degraded-race-test", 6, 1, 10);
+    assert_eq!(state.current_masters, 6);
+
+    // Simulate spec change to scale down (6 → 3 masters)
+    state.set_scale_down(3, 1);
+
+    // The FIRST event should be ScaleDownDetected
+    let result = state.apply_event(ClusterEvent::ScaleDownDetected);
+    match result {
+        TransitionResult::Success { to, .. } => {
+            assert_eq!(to, ClusterPhase::EvacuatingSlots);
+        }
+        _ => panic!("Expected transition to EvacuatingSlots from Degraded"),
+    }
+}
+
+/// Test the complete scale-down phase sequence is correct.
+///
+/// Verifies: Running → EvacuatingSlots → RemovingNodesFromCluster →
+///           ScalingDownStatefulSet → VerifyingClusterHealth → Running
+#[test]
+fn test_scale_down_complete_phase_sequence() {
+    let mut state = MockClusterState::running("phase-sequence-test", 6, 1);
+
+    // Trigger scale-down
+    state.set_scale_down(3, 1);
+
+    // Capture phase sequence
+    let phases = state.run_until_running(20);
+
+    // Verify the EXACT expected sequence
+    let expected = vec![
+        ClusterPhase::Running,
+        ClusterPhase::EvacuatingSlots,
+        ClusterPhase::RemovingNodesFromCluster,
+        ClusterPhase::ScalingDownStatefulSet,
+        ClusterPhase::VerifyingClusterHealth,
+        ClusterPhase::Running,
+    ];
+
+    assert_eq!(
+        phases, expected,
+        "Scale-down phase sequence mismatch.\n\
+         Expected: {:?}\n\
+         Actual:   {:?}\n\
+         The StatefulSet should only be scaled in ScalingDownStatefulSet phase.",
+        expected, phases
+    );
+}
+
+/// Test that replica-only scale-down skips EvacuatingSlots.
+///
+/// Replicas don't hold slots, so EvacuatingSlots should be skipped.
+#[test]
+fn test_replica_only_scale_down_skips_evacuating_slots() {
+    let mut state = MockClusterState::running("replica-only-test", 3, 2);
+    assert_eq!(state.running_pods, 9); // 3 masters + 6 replicas
+
+    // Scale down replicas only (3m/2r → 3m/1r), masters unchanged
+    state.set_scale_down(3, 1);
+
+    // Event should be ReplicaScaleDownDetected, not ScaleDownDetected
+    let result = state.apply_event(ClusterEvent::ReplicaScaleDownDetected);
+    match result {
+        TransitionResult::Success { to, .. } => {
+            assert_eq!(
+                to,
+                ClusterPhase::RemovingNodesFromCluster,
+                "Replica-only scale-down should skip EvacuatingSlots"
+            );
+        }
+        _ => panic!("Expected transition to RemovingNodesFromCluster"),
+    }
+
+    // Complete the sequence and verify no EvacuatingSlots
+    let phases = state.run_until_running(20);
+    assert!(
+        !phases.contains(&ClusterPhase::EvacuatingSlots),
+        "Replica-only scale-down should NOT include EvacuatingSlots phase"
+    );
+}
+
+/// Test scale-down detection happens BEFORE scale-up detection.
+///
+/// If the user changes spec from 6 masters to 3 masters, we should detect
+/// scale-down immediately rather than trying to sync resources first.
+#[test]
+fn test_scale_down_detected_immediately_on_spec_change() {
+    use valkey_operator::controller::cluster_phases::ScaleDirection;
+
+    // Start with 6 masters running
+    let mut state = MockClusterState::running("immediate-detection", 6, 1);
+    assert_eq!(state.current_masters, 6);
+    assert_eq!(state.scale_direction(), ScaleDirection::None);
+
+    // Change spec to request 3 masters
+    state.set_scale_down(3, 1);
+
+    // Verify scale_direction immediately detects scale-down
+    assert_eq!(
+        state.scale_direction(),
+        ScaleDirection::Down,
+        "scale_direction should immediately detect scale-down when target < current"
+    );
+
+    // Verify we're still in Running phase (haven't transitioned yet)
+    assert_eq!(state.phase, ClusterPhase::Running);
+
+    // Running the state machine should go directly to EvacuatingSlots
+    let result = state.apply_event(ClusterEvent::ScaleDownDetected);
+    match result {
+        TransitionResult::Success { to, .. } => {
+            assert_eq!(to, ClusterPhase::EvacuatingSlots);
+        }
+        _ => panic!("Expected immediate transition to EvacuatingSlots"),
+    }
+}
