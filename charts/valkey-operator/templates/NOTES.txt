@@ -10,14 +10,28 @@ Getting Started
 
 2. Create a ValkeyCluster:
 
+   First, create a secret for authentication:
+
+   kubectl create secret generic valkey-auth --from-literal=password=<your-secure-password>
+
+   Then, create a ValkeyCluster (requires cert-manager with a ClusterIssuer named 'ca-issuer'):
+
    cat <<EOF | kubectl apply -f -
    apiVersion: valkey-operator.smoketurner.com/v1alpha1
    kind: ValkeyCluster
    metadata:
      name: example
    spec:
-     replicas: 3
-     message: "Hello from ValkeyCluster!"
+     masters: 3
+     replicasPerMaster: 1
+     tls:
+       issuerRef:
+         name: ca-issuer
+         kind: ClusterIssuer
+     auth:
+       secretRef:
+         name: valkey-auth
+         key: password
    EOF
 
 3. Check the resource status:

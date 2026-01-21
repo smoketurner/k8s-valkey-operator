@@ -57,6 +57,16 @@ spec:
                 targetVersion:
                   type: string
                   description: Target Valkey version (e.g., "9.0.1")
+                replicationSyncTimeoutSeconds:
+                  type: integer
+                  format: int64
+                  default: 300
+                  description: Timeout in seconds for waiting for replication sync before failover (default 5 minutes)
+                podReadyTimeoutSeconds:
+                  type: integer
+                  format: int64
+                  default: 600
+                  description: Timeout in seconds for waiting for pods to become ready after deletion (default 10 minutes)
             status:
               type: object
               properties:
@@ -97,6 +107,22 @@ spec:
                 observedGeneration:
                   type: integer
                   format: int64
+                syncStartedAt:
+                  type: string
+                  format: date-time
+                  description: Timestamp when replication sync check started for the current shard
+                syncElapsedSeconds:
+                  type: integer
+                  format: int64
+                  description: Elapsed time in seconds since sync check started
+                podReadyStartedAt:
+                  type: string
+                  format: date-time
+                  description: Timestamp when pod ready check started for the current shard
+                podReadyElapsedSeconds:
+                  type: integer
+                  format: int64
+                  description: Elapsed time in seconds since pod ready check started
                 shardStatuses:
                   type: array
                   items:
@@ -115,6 +141,7 @@ spec:
                           - UpgradingReplicas
                           - WaitingForSync
                           - FailingOver
+                          - WaitingForClusterStable
                           - UpgradingOldMaster
                           - Completed
                           - Failed
