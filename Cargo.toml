@@ -12,8 +12,8 @@ license = "MIT"
 # Note: kube-leader-election and kube-lease-manager are pinned to kube 2.x.
 # Upgrade to kube 3.x when leader election crates add support.
 # See kube-rs release notes: https://github.com/kube-rs/kube/releases
-kube = { version = "=2.0.1", default-features = false, features = ["runtime", "derive", "client", "rustls-tls", "aws-lc-rs", "ws", "unstable-runtime", "admission"] }
-k8s-openapi = { version = "=0.26.1", default-features = false, features = ["v1_34"] }
+kube = { version = "=3.0.0", default-features = false, features = ["runtime", "derive", "client", "rustls-tls", "aws-lc-rs", "ws", "unstable-runtime", "admission"] }
+k8s-openapi = { version = "=0.27.0", default-features = false, features = ["v1_34"] }
 
 # Async runtime
 tokio = { version = "=1.49.0", default-features = false, features = ["full"] }
