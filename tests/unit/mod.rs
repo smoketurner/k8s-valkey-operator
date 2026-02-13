@@ -214,12 +214,11 @@ mod error_tests {
 
     #[test]
     fn test_error_is_retryable() {
-        let kube_err = Error::Kube(kube::Error::Api(kube::error::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "timeout".to_string(),
-            reason: "Timeout".to_string(),
-            code: 504,
-        }));
+        let kube_err = Error::Kube(kube::Error::Api(
+            kube::core::Status::failure("timeout", "Timeout")
+                .with_code(504)
+                .boxed(),
+        ));
         assert!(kube_err.is_retryable());
 
         let validation_err = Error::Validation("invalid spec".to_string());

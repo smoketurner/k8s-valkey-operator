@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kube::Client;
-use kube_leader_election::{LeaseLock, LeaseLockParams};
+use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
 use tokio::signal;
 use tracing::{error, info, warn};
 
@@ -97,14 +97,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Waiting to acquire leadership...");
     loop {
         match lease_lock.try_acquire_or_renew().await {
-            Ok(result) => {
-                if result.acquired_lease {
-                    info!("Acquired leadership");
-                    is_leader.store(true, Ordering::SeqCst);
-                    break;
-                } else {
-                    info!("Another instance is leader, waiting...");
-                }
+            Ok(LeaseLockResult::Acquired(_)) => {
+                info!("Acquired leadership");
+                is_leader.store(true, Ordering::SeqCst);
+                break;
+            }
+            Ok(_) => {
+                info!("Another instance is leader, waiting...");
             }
             Err(e) => {
                 warn!("Failed to acquire lease: {}, retrying...", e);
@@ -132,13 +131,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::time::sleep(Duration::from_secs(LEASE_RENEW_INTERVAL_SECS)).await;
 
                 match lease_lock.try_acquire_or_renew().await {
-                    Ok(result) => {
-                        if !result.acquired_lease {
-                            error!("Lost leadership! Shutting down...");
-                            is_leader.store(false, Ordering::SeqCst);
-                            // Exit so Kubernetes restarts us and we re-enter election
-                            std::process::exit(1);
-                        }
+                    Ok(LeaseLockResult::Acquired(_)) => {}
+                    Ok(_) => {
+                        error!("Lost leadership! Shutting down...");
+                        is_leader.store(false, Ordering::SeqCst);
+                        // Exit so Kubernetes restarts us and we re-enter election
+                        std::process::exit(1);
                     }
                     Err(e) => {
                         error!("Failed to renew lease: {}. Shutting down...", e);

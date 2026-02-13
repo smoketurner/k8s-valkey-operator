@@ -78,7 +78,7 @@ where
     let stream = reflector(writer, watcher(api, watcher_config))
         .default_backoff()
         .applied_objects()
-        .predicate_filter(predicates::generation);
+        .predicate_filter(predicates::generation, Default::default());
     (reader, stream)
 }
 

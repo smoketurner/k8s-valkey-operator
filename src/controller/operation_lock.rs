@@ -12,7 +12,6 @@
 use jiff::Timestamp;
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta, OwnerReference};
-use k8s_openapi::chrono::{TimeZone, Utc};
 use kube::api::{Api, DeleteParams, Patch, PatchParams};
 use kube::{Client, Resource, ResourceExt};
 use tracing::{debug, info, warn};
@@ -84,16 +83,9 @@ impl OperationLock {
         format!("{}-operation-lock", self.cluster_name)
     }
 
-    /// Convert jiff::Timestamp to chrono MicroTime for Lease API.
+    /// Convert jiff::Timestamp to MicroTime for Lease API.
     fn timestamp_to_microtime(ts: Timestamp) -> MicroTime {
-        // Convert jiff timestamp to Unix seconds/nanos, then to chrono
-        let secs = ts.as_second();
-        let nanos = ts.subsec_nanosecond();
-        let chrono_dt = Utc
-            .timestamp_opt(secs, nanos as u32)
-            .single()
-            .unwrap_or_else(Utc::now);
-        MicroTime(chrono_dt)
+        MicroTime(ts)
     }
 
     /// Check if the lease is expired based on renew time and duration.
@@ -102,15 +94,9 @@ impl OperationLock {
             && let (Some(renew_time), Some(duration)) =
                 (&spec.renew_time, spec.lease_duration_seconds)
         {
-            // Convert chrono renew_time to jiff for comparison
-            let renew_secs = renew_time.0.timestamp();
-            let renew_nanos = renew_time.0.timestamp_subsec_nanos();
-
-            if let Ok(renew_ts) = Timestamp::new(renew_secs, renew_nanos as i32) {
-                let now = Timestamp::now();
-                let elapsed_secs = now.as_second() - renew_ts.as_second();
-                return elapsed_secs > i64::from(duration);
-            }
+            let now = Timestamp::now();
+            let elapsed_secs = now.as_second() - renew_time.0.as_second();
+            return elapsed_secs > i64::from(duration);
         }
         // No valid spec means expired (or never acquired)
         true
@@ -403,7 +389,6 @@ impl OperationLock {
 )]
 mod tests {
     use super::*;
-    use k8s_openapi::chrono::Utc;
 
     #[test]
     fn test_operation_type_display() {
@@ -467,7 +452,7 @@ mod tests {
             spec: Some(LeaseSpec {
                 holder_identity: Some("scaling".to_string()),
                 lease_duration_seconds: Some(300),
-                renew_time: Some(MicroTime(Utc::now())),
+                renew_time: Some(MicroTime(Timestamp::now())),
                 ..Default::default()
             }),
         };
@@ -476,8 +461,7 @@ mod tests {
 
     #[test]
     fn test_is_lease_expired_old() {
-        use k8s_openapi::chrono::Duration;
-        let old_time = Utc::now() - Duration::seconds(400);
+        let old_time = Timestamp::now() - jiff::SignedDuration::from_secs(400);
         let lease = Lease {
             metadata: ObjectMeta::default(),
             spec: Some(LeaseSpec {

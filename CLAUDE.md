@@ -14,7 +14,7 @@ This is a **Kubernetes operator for managing Valkey Clusters** built in Rust usi
 |-----------|-----------------|
 | Rust | 1.92+ (Edition 2024) |
 | Kubernetes | 1.35+ |
-| kube-rs | 2.x |
+| kube-rs | 3.x |
 | Valkey | 9.x |
 
 ## Build & Test Commands
