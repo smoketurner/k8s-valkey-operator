@@ -15,12 +15,12 @@ k8s-openapi = { version = "=0.27.0", default-features = false, features = ["v1_3
 
 # Async runtime
 tokio = { version = "=1.49.0", default-features = false, features = ["full"] }
-futures = { version = "=0.3.31", default-features = false }
+futures = { version = "=0.3.32", default-features = false }
 
 # Serialization
 serde = { version = "=1.0.228", default-features = false, features = ["derive"] }
 serde_json = { version = "=1.0.149", default-features = false }
-serde-saphyr = { version = "=0.0.18", default-features = false }
+serde-saphyr = { version = "=0.0.19", default-features = false }
 schemars = { version = "=1.2.1", default-features = false }
 
 # Error handling
@@ -60,7 +60,7 @@ hostname = { version = "=0.4.2", default-features = false }
 
 [dev-dependencies]
 tokio-test = { version = "=0.4.5", default-features = false }
-uuid = { version = "=1.20.0", default-features = false, features = ["v4"] }
+uuid = { version = "=1.21.0", default-features = false, features = ["v4"] }
 proptest = { version = "=1.10.0", default-features = false, features = ["std"] }
 
 [lints.clippy]
