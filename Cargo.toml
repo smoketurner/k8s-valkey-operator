@@ -2,7 +2,7 @@
 name = "valkey-operator"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.95"
 description = "A Kubernetes operator for managing Valkey Clusters"
 license = "MIT"
 
