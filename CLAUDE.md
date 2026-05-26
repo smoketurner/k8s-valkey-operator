@@ -12,9 +12,10 @@ This is a **Kubernetes operator for managing Valkey Clusters** built in Rust usi
 
 | Component | Minimum Version |
 |-----------|-----------------|
-| Rust | 1.92+ (Edition 2024) |
+| Rust | 1.95+ (Edition 2024) |
 | Kubernetes | 1.35+ |
 | kube-rs | 3.x |
+| k8s-openapi | 0.27.x (v1_35) |
 | Valkey | 9.x |
 
 ## Build & Test Commands
@@ -32,8 +33,19 @@ make lint               # Run clippy lints
 make check              # Run cargo check
 
 # Testing
-make test               # Run unit tests
-make test-integration   # Run integration tests
+make test               # Run unit tests (tests/unit/)
+make test-functional    # Run functional/state-machine tests (no cluster)
+make test-all           # Run unit + functional tests
+make test-integration   # Run integration tests (requires cluster, --ignored)
+make audit              # Run security audit (cargo audit)
+
+# Running a single test
+# Tests are split into separate binaries via [[test]] in Cargo.toml.
+# Pass the test binary name with --test, then the test path as a filter:
+cargo test --test unit -- some_test_name
+cargo test --test functional -- scenario_tests::scale_up
+cargo test --test proptest
+cargo test --test integration -- --ignored some_test_name
 
 # Installation
 make install            # Install CRD and RBAC
@@ -54,26 +66,79 @@ make clean-all          # Uninstall and clean
 
 ## Architecture
 
-### Source Files
+### Source Layout
+
+**Top-level**
 
 | File | Purpose |
 |------|---------|
 | `src/main.rs` | Entry point, leader election, startup |
 | `src/lib.rs` | Controller setup, stream configuration |
-| `src/crd/mod.rs` | Custom Resource Definitions |
-| `src/crd/valkey_cluster.rs` | ValkeyCluster CRD and ClusterPhase enum |
-| `src/crd/valkey_upgrade.rs` | ValkeyUpgrade CRD and UpgradePhase enum |
-| `src/controller/cluster_state_machine.rs` | Cluster phase transitions and events |
-| `src/controller/cluster_phases.rs` | Phase handler implementations |
-| `src/controller/cluster_reconciler.rs` | Cluster reconciliation logic |
-| `src/controller/upgrade_state_machine.rs` | Upgrade phase transitions |
-| `src/controller/upgrade_reconciler.rs` | Upgrade reconciliation logic |
-| `src/controller/error.rs` | Error types and classification |
-| `src/controller/status.rs` | Condition management |
-| `src/controller/context.rs` | Shared context (client, recorder) |
-| `src/resources/common.rs` | Resource generators |
-| `src/webhooks/server.rs` | Admission webhook server |
-| `src/health.rs` | Health endpoints and metrics |
+| `src/health.rs` | Health endpoints (`/healthz`, `/readyz`) and Prometheus metrics |
+
+**`src/crd/`** — Custom Resource Definitions
+
+| File | Purpose |
+|------|---------|
+| `valkey_cluster.rs` | ValkeyCluster CRD and ClusterPhase enum |
+| `valkey_upgrade.rs` | ValkeyUpgrade CRD and UpgradePhase enum |
+
+**`src/controller/`** — Reconciliation and state machines
+
+| File | Purpose |
+|------|---------|
+| `cluster_state_machine.rs` | Cluster phase transitions and events |
+| `cluster_phases.rs` | Phase handler implementations (`handle_<phase>`) |
+| `cluster_reconciler.rs` | Cluster reconciliation logic |
+| `cluster_init.rs` | Initial cluster formation (MEET, ADDSLOTS, REPLICATE) |
+| `cluster_topology.rs` | `ClusterTopology` struct correlating pods to Valkey nodes |
+| `cluster_validation.rs` | Spec validation logic |
+| `upgrade_state_machine.rs` | Upgrade phase transitions |
+| `upgrade_reconciler.rs` | Upgrade reconciliation logic |
+| `operation_coordination.rs` | Cross-resource operation coordination |
+| `operation_lock.rs` | Operation locks preventing concurrent scale/upgrade |
+| `error.rs` | Error types and transient/permanent classification |
+| `status.rs` | Condition management and generation tracking |
+| `context.rs` | Shared context (client, recorder) |
+| `diagnostic_hints.rs` | Actionable error hints surfaced via events |
+| `common.rs` | Shared controller helpers |
+
+**`src/client/`** — Valkey client wrappers (built on `fred`)
+
+| File | Purpose |
+|------|---------|
+| `valkey_client.rs` | Connection management and command primitives |
+| `cluster_ops.rs` | CLUSTER MEET, FORGET, FAILOVER, etc. |
+| `cluster_state.rs` | `CLUSTER NODES` / `CLUSTER INFO` parsing |
+| `scaling.rs` | Slot rebalance and node-removal helpers |
+| `parsing.rs` | Output parsers for Valkey responses |
+| `types.rs` | Client-side domain types |
+
+**`src/slots/`** — Slot distribution and migration
+
+| File | Purpose |
+|------|---------|
+| `distribution.rs` | Even distribution of 16384 slots across masters |
+| `migration.rs` | Slot migration execution |
+| `planner.rs` | Migration planning for scale operations |
+
+**`src/resources/`** — Kubernetes resource generators
+
+| File | Purpose |
+|------|---------|
+| `common.rs` | `owner_reference()` and shared helpers |
+| `statefulset.rs` | StatefulSet generation |
+| `services.rs` | Headless, client, and read services |
+| `pdb.rs` | PodDisruptionBudget |
+| `certificate.rs` | cert-manager Certificate resource |
+| `port_forward.rs` | Port-forward helpers for tests/dev |
+
+**`src/webhooks/`** — Admission webhook server
+
+| File | Purpose |
+|------|---------|
+| `server.rs` | Webhook HTTP server |
+| `policies/` | Individual admission policies |
 
 ### CRD Structure
 
@@ -258,11 +323,12 @@ Built fresh on each reconciliation by querying both Kubernetes API and `CLUSTER 
 
 ### Panic-Free Code
 
-The operator must **never panic** in production code:
+The operator must **never panic** in production code. Enforced by clippy lints in `Cargo.toml` (`unwrap_used`, `expect_used`, `panic`, `unreachable`, `todo`, `unimplemented`, `exit`, `unwrap_in_result`, `panic_in_result_fn`, `get_unwrap`, `indexing_slicing`). `unsafe_code` is also denied.
 
-- **Never use** `unwrap()`, `expect()`, or `panic!()`
+- **Never use** `unwrap()`, `expect()`, `panic!()`, or direct indexing (`items[0]`)
 - **Always use** `Result<T, Error>` with `?` operator
-- **For Options**, use `unwrap_or_default()`, `map()`, `and_then()`
+- **For Options**, use `unwrap_or_default()`, `ok_or()`, `map()`, `and_then()`
+- **For slices**, use `.first()`, `.get(i)`, `.iter()` — never `[i]`
 - **Test code** may use `unwrap()` where panicking is acceptable
 
 ### Error Handling
@@ -284,10 +350,12 @@ The operator must **never panic** in production code:
 | Directory | Purpose |
 |-----------|---------|
 | `tests/unit/` | Component tests (no cluster) |
-| `tests/functional/` | State machine simulation tests |
-| `tests/integration/` | End-to-end tests (requires cluster) |
-| `tests/proptest/` | Property-based tests |
-| `tests/common/fixtures.rs` | Test fixtures |
+| `tests/functional/` | State machine simulation tests (no cluster) |
+| `tests/integration/` | End-to-end tests (requires cluster, `--ignored`) |
+| `tests/proptest/` | Property-based tests (proptest crate) |
+| `tests/common/fixtures.rs` | Shared test fixtures (builder pattern) |
+
+Each directory is a separate test binary declared in `Cargo.toml` under `[[test]]`. Pick the right binary with `cargo test --test <name>`.
 
 ### Keeping Functional Tests in Sync
 
