@@ -398,12 +398,14 @@ impl ValkeyClient {
         );
 
         // Connect directly to the source node - CLUSTER MIGRATESLOTS must be executed
-        // on the node that currently owns the slots
+        // on the node that currently owns the slots. Reuse this client's TLS
+        // certificates so TLS-enabled clusters open a TLS connection instead of
+        // a plain TCP socket (issue #47).
         let source_client = ValkeyClient::connect_single(
             source_ip,
             source_port,
             self.config().password.as_deref(),
-            None,
+            self.tls_certs(),
         )
         .await
         .map_err(|e| {

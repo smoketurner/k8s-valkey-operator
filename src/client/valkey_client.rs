@@ -288,6 +288,12 @@ impl ValkeyClientConfig {
 pub struct ValkeyClient {
     client: Client,
     config: ValkeyClientConfig,
+    /// TLS certificate data used to establish this connection (if any).
+    ///
+    /// Stored so that follow-up connections derived from this client (e.g., direct
+    /// connections to a source node during slot migration) can reuse the same
+    /// TLS material instead of falling back to plain TCP.
+    tls_certs: Option<TlsCertData>,
 }
 
 impl ValkeyClient {
@@ -346,7 +352,11 @@ impl ValkeyClient {
         client.init().await?;
         debug!("Connected to Valkey cluster");
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            tls_certs: None,
+        })
     }
 
     /// Create a client for connecting to a single node (not clustered).
@@ -399,7 +409,11 @@ impl ValkeyClient {
             ..Default::default()
         };
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            tls_certs: tls_certs.cloned(),
+        })
     }
 
     /// Get the underlying fred client.
@@ -410,6 +424,16 @@ impl ValkeyClient {
     /// Get the client configuration.
     pub fn config(&self) -> &ValkeyClientConfig {
         &self.config
+    }
+
+    /// Get the TLS certificate data this client was constructed with, if any.
+    ///
+    /// Returns the certificates passed to [`Self::connect_single`] so that derived
+    /// connections (e.g., to a source node during slot migration) can reuse them.
+    /// Returns `None` for clients built via [`Self::connect`], which uses
+    /// path-based TLS configuration instead of in-memory certificate data.
+    pub fn tls_certs(&self) -> Option<&TlsCertData> {
+        self.tls_certs.as_ref()
     }
 
     /// Check if the client is connected.
@@ -1147,5 +1171,39 @@ mod tests {
         let response = Value::Array(vec![]);
         let result = parse_slot_migrations(response).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_tls_certs_accessor_default_for_connect_config() {
+        // Clients built without TLS data must report no certificates.
+        let client = ValkeyClient {
+            client: Builder::default_centralized().build().unwrap(),
+            config: ValkeyClientConfig::default(),
+            tls_certs: None,
+        };
+        assert!(client.tls_certs().is_none());
+    }
+
+    #[test]
+    fn test_tls_certs_accessor_roundtrips_value() {
+        // Mirrors what connect_single does: the value passed in must be
+        // accessible via the public accessor so derived connections (e.g.,
+        // migrate_slots_atomic's source-node client) can reuse it.
+        let certs = TlsCertData {
+            ca_cert_pem: b"-----BEGIN CERTIFICATE-----\nfake-ca\n-----END CERTIFICATE-----\n"
+                .to_vec(),
+            client_cert_pem: Some(b"client-cert".to_vec()),
+            client_key_pem: Some(b"client-key".to_vec()),
+        };
+        let client = ValkeyClient {
+            client: Builder::default_centralized().build().unwrap(),
+            config: ValkeyClientConfig::default(),
+            tls_certs: Some(certs.clone()),
+        };
+
+        let stored = client.tls_certs().expect("certs should be present");
+        assert_eq!(stored.ca_cert_pem, certs.ca_cert_pem);
+        assert_eq!(stored.client_cert_pem, certs.client_cert_pem);
+        assert_eq!(stored.client_key_pem, certs.client_key_pem);
     }
 }
