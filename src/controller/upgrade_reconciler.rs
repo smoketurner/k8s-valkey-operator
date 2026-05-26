@@ -292,10 +292,7 @@ async fn handle_prechecks_phase(
     let client = ctx.connect_to_cluster(cluster, namespace, 0).await?;
 
     // Check cluster health - always required before upgrade
-    let cluster_info = client
-        .cluster_info()
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let cluster_info = client.cluster_info().await?;
     if !cluster_info.is_healthy() {
         let _ = client.close().await;
         warn!(name = %name, "Cluster not healthy, waiting...");
@@ -303,10 +300,7 @@ async fn handle_prechecks_phase(
     }
 
     // Check slots are stable - always required before upgrade
-    let cluster_nodes = client
-        .cluster_nodes()
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let cluster_nodes = client.cluster_nodes().await?;
     if !cluster_nodes.all_slots_assigned() {
         let _ = client.close().await;
         warn!(name = %name, "Slots not fully assigned, waiting...");
@@ -1197,10 +1191,7 @@ async fn execute_failover(
             );
 
             // Get the replica's node ID for verification
-            let nodes = client
-                .cluster_nodes()
-                .await
-                .map_err(|e| Error::Valkey(e.to_string()))?;
+            let nodes = client.cluster_nodes().await?;
             let replica_node_id = nodes
                 .nodes
                 .iter()
@@ -2234,10 +2225,7 @@ async fn initialize_shard_statuses(
 ) -> Result<Vec<ShardUpgradeStatus>, Error> {
     let client = ctx.connect_to_cluster(cluster, namespace, 0).await?;
 
-    let cluster_nodes = client
-        .cluster_nodes()
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let cluster_nodes = client.cluster_nodes().await?;
     let _ = client.close().await;
 
     let masters = cluster_nodes.masters();

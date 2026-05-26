@@ -212,10 +212,7 @@ impl Context {
             namespace,
             &cluster.name_any(),
         );
-        let (connect_host, connect_port) = strategy
-            .get_connection(ordinal)
-            .await
-            .map_err(|e| Error::Valkey(e.to_string()))?;
+        let (connect_host, connect_port) = strategy.get_connection(ordinal).await?;
 
         ValkeyClient::connect_single(
             &connect_host,
@@ -224,7 +221,7 @@ impl Context {
             tls_certs.as_ref(),
         )
         .await
-        .map_err(|e| Error::Valkey(e.to_string()))
+        .map_err(Error::from)
     }
 
     /// Connect to a specific host/port using the cluster's auth and TLS config.
@@ -247,7 +244,7 @@ impl Context {
 
         ValkeyClient::connect_single(host, port, password.as_deref(), tls_certs.as_ref())
             .await
-            .map_err(|e| Error::Valkey(e.to_string()))
+            .map_err(Error::from)
     }
 
     /// Build shared connection context for cluster operations.

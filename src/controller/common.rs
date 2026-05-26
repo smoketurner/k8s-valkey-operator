@@ -5,48 +5,60 @@
 use kube::{Api, Resource, ResourceExt, api::PatchParams};
 use serde::de::DeserializeOwned;
 
+use crate::controller::context::FIELD_MANAGER;
 use crate::controller::error::Error;
 
-/// Add a finalizer to a resource.
+/// Add a finalizer to a resource using optimistic concurrency (resourceVersion check).
+///
+/// Uses JSON Merge Patch with resourceVersion for optimistic concurrency. If the resource
+/// was modified between our GET and PATCH, Kubernetes returns 409 Conflict and the
+/// controller retries on the next reconciliation.
 pub async fn add_finalizer<T>(api: &Api<T>, name: &str, finalizer: &str) -> Result<(), Error>
 where
     T: Resource + Clone + DeserializeOwned + std::fmt::Debug,
     <T as Resource>::DynamicType: Default,
 {
-    // Get current resource to check existing finalizers
     let resource = api.get(name).await?;
     let mut finalizers = resource.finalizers().to_vec();
 
-    // Only add if not already present
-    if !finalizers.contains(&finalizer.to_string()) {
-        finalizers.push(finalizer.to_string());
-
-        let patch = serde_json::json!({
-            "metadata": {
-                "finalizers": finalizers
-            }
-        });
-        api.patch(
-            name,
-            &PatchParams::default(),
-            &kube::api::Patch::Merge(&patch),
-        )
-        .await?;
+    if finalizers.contains(&finalizer.to_string()) {
+        return Ok(());
     }
+
+    finalizers.push(finalizer.to_string());
+    let resource_version = resource
+        .resource_version()
+        .ok_or_else(|| Error::MissingField("metadata.resourceVersion".to_string()))?;
+
+    let patch = serde_json::json!({
+        "metadata": {
+            "resourceVersion": resource_version,
+            "finalizers": finalizers
+        }
+    });
+    api.patch(
+        name,
+        &PatchParams::apply(FIELD_MANAGER),
+        &kube::api::Patch::Merge(&patch),
+    )
+    .await?;
+
     Ok(())
 }
 
-/// Remove a specific finalizer from a resource.
+/// Remove a specific finalizer from a resource using optimistic concurrency.
+///
+/// Uses JSON Merge Patch with resourceVersion for optimistic concurrency. If the resource
+/// was modified between our GET and PATCH, Kubernetes returns 409 Conflict and the
+/// controller retries on the next reconciliation.
 pub async fn remove_finalizer<T>(api: &Api<T>, name: &str, finalizer: &str) -> Result<(), Error>
 where
     T: Resource + Clone + DeserializeOwned + std::fmt::Debug,
     <T as Resource>::DynamicType: Default,
 {
-    // Get current resource to check existing finalizers
     let resource = match api.get(name).await {
         Ok(r) => r,
         Err(kube::Error::Api(e)) if e.code == 404 => {
-            // Resource already deleted, nothing to do
             return Ok(());
         }
         Err(e) => return Err(e.into()),
@@ -54,22 +66,28 @@ where
 
     let mut finalizers = resource.finalizers().to_vec();
 
-    // Only patch if the finalizer exists
-    if let Some(pos) = finalizers.iter().position(|f| f == finalizer) {
-        finalizers.remove(pos);
+    let Some(pos) = finalizers.iter().position(|f| f == finalizer) else {
+        return Ok(());
+    };
+    finalizers.remove(pos);
 
-        let patch = serde_json::json!({
-            "metadata": {
-                "finalizers": finalizers
-            }
-        });
-        api.patch(
-            name,
-            &PatchParams::default(),
-            &kube::api::Patch::Merge(&patch),
-        )
-        .await?;
-    }
+    let resource_version = resource
+        .resource_version()
+        .ok_or_else(|| Error::MissingField("metadata.resourceVersion".to_string()))?;
+
+    let patch = serde_json::json!({
+        "metadata": {
+            "resourceVersion": resource_version,
+            "finalizers": finalizers
+        }
+    });
+    api.patch(
+        name,
+        &PatchParams::apply(FIELD_MANAGER),
+        &kube::api::Patch::Merge(&patch),
+    )
+    .await?;
+
     Ok(())
 }
 
