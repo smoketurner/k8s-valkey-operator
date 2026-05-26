@@ -5,7 +5,6 @@
 use kube::{Api, Resource, ResourceExt, api::PatchParams};
 use serde::de::DeserializeOwned;
 
-use crate::controller::context::FIELD_MANAGER;
 use crate::controller::error::Error;
 
 /// Add a finalizer to a resource using optimistic concurrency (resourceVersion check).
@@ -38,7 +37,7 @@ where
     });
     api.patch(
         name,
-        &PatchParams::apply(FIELD_MANAGER),
+        &PatchParams::default(),
         &kube::api::Patch::Merge(&patch),
     )
     .await?;
@@ -83,7 +82,7 @@ where
     });
     api.patch(
         name,
-        &PatchParams::apply(FIELD_MANAGER),
+        &PatchParams::default(),
         &kube::api::Patch::Merge(&patch),
     )
     .await?;

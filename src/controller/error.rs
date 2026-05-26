@@ -76,7 +76,8 @@ impl Error {
                 ) || matches!(e, kube::Error::Service(_))
             }
             Error::Transient(_) => true,
-            Error::Valkey(_) | Error::Timeout(_) => true, // Valkey errors are typically transient
+            Error::Timeout(_) => true,
+            Error::Valkey(ve) => ve.is_retryable(),
             Error::Validation(_) | Error::Permanent(_) | Error::MissingField(_) => false,
             Error::Serialization(_) => false,
             // Lock contention is transient - can retry after lock is released
@@ -149,9 +150,45 @@ mod tests {
     }
 
     #[test]
-    fn test_is_retryable_valkey_error() {
+    fn test_is_retryable_valkey_cluster_not_ready() {
         let error = Error::Valkey(ValkeyError::ClusterNotReady("CLUSTERDOWN".to_string()));
         assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_valkey_connection() {
+        let error = Error::Valkey(ValkeyError::Connection("refused".to_string()));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_valkey_timeout() {
+        let error = Error::Valkey(ValkeyError::Timeout {
+            operation: "CLUSTER INFO".to_string(),
+            duration: std::time::Duration::from_secs(5),
+        });
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_valkey_parse_not_retryable() {
+        use crate::client::types::ParseError;
+        let error = Error::Valkey(ValkeyError::Parse(ParseError::MissingField(
+            "node_id".to_string(),
+        )));
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_valkey_invalid_config_not_retryable() {
+        let error = Error::Valkey(ValkeyError::InvalidConfig("No hosts".to_string()));
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_valkey_slot_migration_failed_not_retryable() {
+        let error = Error::Valkey(ValkeyError::SlotMigrationFailed("shard 0".to_string()));
+        assert!(!error.is_retryable());
     }
 
     #[test]

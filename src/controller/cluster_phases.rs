@@ -37,8 +37,6 @@ use crate::{
     slots::TOTAL_SLOTS,
 };
 
-use super::cluster_reconciler::FIELD_MANAGER;
-
 /// Maximum number of reconciliations to attempt in VerifyingClusterHealth
 /// before transitioning to Degraded. This prevents infinite loops when
 /// the cluster can't reach a healthy state.
@@ -228,6 +226,7 @@ pub enum InitResult {
 ///
 /// Creates owned Kubernetes resources (StatefulSet, Services, PDB, Certificate).
 /// Transitions to WaitingForPods after resources are applied.
+#[tracing::instrument(skip(obj, ctx, create_resources_fn), fields(name = %phase_ctx.name, namespace = %phase_ctx.namespace))]
 pub async fn handle_creating(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -255,6 +254,7 @@ pub async fn handle_creating(
 ///
 /// Waits for all desired pods to be in Running state.
 /// Transitions to InitializingCluster when all pods are running.
+#[tracing::instrument(skip(obj, ctx, create_resources_fn), fields(name = %phase_ctx.name, namespace = %phase_ctx.namespace))]
 pub async fn handle_waiting_for_pods(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -295,6 +295,7 @@ pub async fn handle_waiting_for_pods(
 ///
 /// Executes CLUSTER MEET to connect all cluster nodes.
 /// Transitions to AssigningSlots when successful.
+#[tracing::instrument(skip(obj, ctx, api, cluster_meet_fn), fields(name = %phase_ctx.name, namespace = %phase_ctx.namespace))]
 pub async fn handle_initializing_cluster(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -353,6 +354,7 @@ pub async fn handle_initializing_cluster(
 ///
 /// Executes CLUSTER ADDSLOTS to assign hash slots to master nodes.
 /// Transitions to ConfiguringReplicas or VerifyingClusterHealth.
+#[tracing::instrument(skip(obj, ctx, api, slot_assignment_fn), fields(name = %phase_ctx.name, namespace = %phase_ctx.namespace))]
 pub async fn handle_assigning_slots(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -424,6 +426,7 @@ pub async fn handle_assigning_slots(
 ///
 /// Executes CLUSTER REPLICATE to set up replica relationships.
 /// Transitions to VerifyingClusterHealth when successful.
+#[tracing::instrument(skip(obj, ctx, api, setup_replicas_fn), fields(name = %phase_ctx.name, namespace = %phase_ctx.namespace))]
 pub async fn handle_configuring_replicas(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -480,6 +483,7 @@ pub async fn handle_configuring_replicas(
 /// (which return `Ok(0)` on connection errors) — without that guard, a
 /// transient failure would spuriously flip the phase to `ScalingUpStatefulSet`
 /// (see issue #52).
+#[tracing::instrument(skip(obj, ctx, create_resources_fn), fields(name = %phase_ctx.name, namespace = %phase_ctx.namespace))]
 pub async fn handle_running(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -614,6 +618,7 @@ pub async fn handle_running(
 ///
 /// Updates the StatefulSet to increase replica count.
 /// Transitions to WaitingForNewPods after StatefulSet is updated.
+#[tracing::instrument(skip(obj, ctx, api, create_resources_fn), fields(name = %phase_ctx.name, namespace = %phase_ctx.namespace))]
 pub async fn handle_scaling_up_statefulset(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -849,6 +854,7 @@ pub async fn handle_configuring_new_replicas(
 ///
 /// Migrates slots off of nodes being removed using CLUSTER MIGRATESLOTS.
 /// Transitions to RemovingNodesFromCluster when evacuation is complete.
+#[tracing::instrument(skip(obj, ctx, api, evacuate_fn), fields(name = %phase_ctx.name, namespace = %phase_ctx.namespace))]
 pub async fn handle_evacuating_slots(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -902,6 +908,7 @@ pub async fn handle_evacuating_slots(
 ///
 /// Executes CLUSTER FORGET for nodes being removed.
 /// Transitions to ScalingDownStatefulSet when all nodes are forgotten.
+#[tracing::instrument(skip(obj, ctx, forget_nodes_fn), fields(name = %phase_ctx.name, namespace = %phase_ctx.namespace))]
 pub async fn handle_removing_nodes_from_cluster(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -996,6 +1003,7 @@ pub async fn handle_scaling_down_statefulset(
 /// Handle VerifyingClusterHealth phase.
 ///
 /// Performs final health check before transitioning to Running.
+#[tracing::instrument(skip(obj, ctx, api, health_check_fn), fields(name = %phase_ctx.name, namespace = %phase_ctx.namespace))]
 pub async fn handle_verifying_cluster_health(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -1024,7 +1032,7 @@ pub async fn handle_verifying_cluster_health(
             let _ = api
                 .patch_status(
                     name,
-                    &kube::api::PatchParams::apply(FIELD_MANAGER),
+                    &kube::api::PatchParams::default(),
                     &kube::api::Patch::Merge(&patch),
                 )
                 .await;
@@ -1118,6 +1126,7 @@ pub async fn handle_verifying_cluster_health(
 ///
 /// Monitors recovery and transitions back to Running when healthy.
 /// Transitions to Failed if no replicas available.
+#[tracing::instrument(skip(obj, ctx, create_resources_fn), fields(name = %phase_ctx.name, namespace = %phase_ctx.namespace))]
 pub async fn handle_degraded(
     obj: &ValkeyCluster,
     ctx: &Context,

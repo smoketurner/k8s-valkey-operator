@@ -20,7 +20,6 @@ use tracing::{debug, error, info, warn};
 use crate::{
     controller::{
         cluster_init::{master_pod_dns_names, replica_pod_dns_names_for_master},
-        cluster_reconciler::FIELD_MANAGER,
         cluster_validation::validate_image_change,
         common::{add_finalizer, extract_pod_name, remove_finalizer},
         context::Context,
@@ -41,6 +40,14 @@ pub const UPGRADE_FINALIZER: &str = "valkey-operator.smoketurner.com/upgrade-fin
 /// This is the main reconciliation function called by the controller.
 /// It handles the upgrade lifecycle: validation, pre-checks, per-shard upgrades,
 /// and completion/failure handling.
+#[tracing::instrument(
+    skip(obj, ctx),
+    fields(
+        name = %obj.name_any(),
+        namespace = obj.namespace().as_deref().unwrap_or("default"),
+        phase = ?obj.status.as_ref().map(|s| s.phase)
+    )
+)]
 pub async fn reconcile(obj: Arc<ValkeyUpgrade>, ctx: Arc<Context>) -> Result<Action, Error> {
     let name = obj.name_any();
     let namespace = obj.namespace().unwrap_or_else(|| "default".to_string());
@@ -2099,11 +2106,7 @@ async fn update_cluster_image(
     });
 
     cluster_api
-        .patch(
-            &name,
-            &PatchParams::apply(FIELD_MANAGER),
-            &Patch::Merge(&patch),
-        )
+        .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
         .await
         .map_err(Error::Kube)?;
 
@@ -2159,11 +2162,7 @@ async fn set_upgrade_annotation(
     });
 
     cluster_api
-        .patch(
-            cluster_name,
-            &PatchParams::apply(FIELD_MANAGER),
-            &Patch::Merge(&patch),
-        )
+        .patch(cluster_name, &PatchParams::default(), &Patch::Merge(&patch))
         .await
         .map_err(Error::Kube)?;
 
@@ -2189,11 +2188,7 @@ async fn clear_upgrade_annotation(
     });
 
     cluster_api
-        .patch(
-            cluster_name,
-            &PatchParams::apply(FIELD_MANAGER),
-            &Patch::Merge(&patch),
-        )
+        .patch(cluster_name, &PatchParams::default(), &Patch::Merge(&patch))
         .await
         .map_err(Error::Kube)?;
 
@@ -2486,12 +2481,8 @@ async fn update_status(
     let patch = serde_json::json!({
         "status": status
     });
-    api.patch_status(
-        name,
-        &PatchParams::apply(FIELD_MANAGER),
-        &Patch::Merge(&patch),
-    )
-    .await?;
+    api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
     Ok(())
 }
 

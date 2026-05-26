@@ -44,6 +44,38 @@ pub enum ValkeyError {
     SlotMigrationFailed(String),
 }
 
+impl ValkeyError {
+    /// Whether this error is transient and worth retrying.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            // Network and connectivity issues resolve without intervention
+            Self::Connection(_) => true,
+            // Timeout operations can succeed on a subsequent attempt
+            Self::Timeout { .. } => true,
+            // Cluster resharding or failover in progress - cluster will stabilize
+            Self::ClusterNotReady(_) => true,
+            // fred IO/Timeout/Cluster errors are transient; parse/protocol/config are not
+            Self::Redis(e) => {
+                use fred::error::ErrorKind;
+                matches!(
+                    e.kind(),
+                    ErrorKind::IO
+                        | ErrorKind::Timeout
+                        | ErrorKind::Cluster
+                        | ErrorKind::Canceled
+                        | ErrorKind::Backpressure
+                )
+            }
+            // Parse failures are deterministic - retrying the same data won't help
+            Self::Parse(_) => false,
+            // Misconfigured client - fix the config, not a transient issue
+            Self::InvalidConfig(_) => false,
+            // Slot migration errors require operator investigation
+            Self::SlotMigrationFailed(_) => false,
+        }
+    }
+}
+
 /// Information about a slot migration returned by CLUSTER GETSLOTMIGRATIONS.
 #[derive(Debug, Clone, Default)]
 pub struct SlotMigrationInfo {
