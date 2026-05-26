@@ -142,8 +142,18 @@ impl ClusterInfo {
     }
 
     /// Check if the cluster is healthy.
+    ///
+    /// Requires full slot coverage in addition to `cluster_state:ok`. Because
+    /// the operator runs with `--cluster-require-full-coverage no`, Valkey
+    /// will report `cluster_state:ok` even when slots are unassigned; without
+    /// the explicit `all_slots_assigned()` check the operator would mark the
+    /// cluster Running while clients receive CLUSTERDOWN errors on the
+    /// missing slots.
     pub fn is_healthy(&self) -> bool {
-        self.state == ClusterHealthState::Ok && self.slots_fail == 0 && self.slots_pfail == 0
+        self.state == ClusterHealthState::Ok
+            && self.all_slots_assigned()
+            && self.slots_fail == 0
+            && self.slots_pfail == 0
     }
 }
 
@@ -565,6 +575,35 @@ cluster_my_epoch:2
         assert_eq!(parsed.state, ClusterHealthState::Fail);
         assert!(!parsed.all_slots_assigned());
         assert!(!parsed.is_healthy());
+    }
+
+    #[test]
+    fn test_is_healthy_requires_full_slot_coverage() {
+        // cluster_state:ok with partial slot coverage occurs when running with
+        // --cluster-require-full-coverage no after a failed scale or rebalance.
+        // is_healthy() must return false so the operator does not mark the
+        // cluster Running while clients see CLUSTERDOWN errors on missing slots.
+        let info = r#"
+cluster_state:ok
+cluster_slots_assigned:16000
+cluster_slots_ok:16000
+cluster_slots_pfail:0
+cluster_slots_fail:0
+cluster_known_nodes:6
+cluster_size:3
+cluster_current_epoch:6
+cluster_my_epoch:2
+"#;
+
+        let parsed = ClusterInfo::parse(info).expect("should parse");
+        assert_eq!(parsed.state, ClusterHealthState::Ok);
+        assert_eq!(parsed.slots_fail, 0);
+        assert_eq!(parsed.slots_pfail, 0);
+        assert!(!parsed.all_slots_assigned());
+        assert!(
+            !parsed.is_healthy(),
+            "cluster with missing slots must not be reported healthy"
+        );
     }
 
     #[test]
