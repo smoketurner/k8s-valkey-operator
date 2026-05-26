@@ -195,9 +195,18 @@ async fn handle_pending_phase(
     )
     .await
     {
-        error!(name = %name, error = %e, "Operation coordination check failed");
-        update_phase(api, &name, UpgradePhase::Failed, Some(e.to_string())).await?;
-        return Err(e);
+        // Lock contention with another in-flight operation (scale, init,
+        // etc.) is transient: the cluster reconciler will release its lock
+        // when its operation finishes, and we should requeue rather than
+        // terminally Failing this upgrade. The FSM forbids Failed -> Pending,
+        // so a Failed transition here would require the user to delete and
+        // recreate the ValkeyUpgrade (issue #50).
+        warn!(
+            name = %name,
+            error = %e,
+            "Operation lock held by another operation, will retry"
+        );
+        return Ok(Action::requeue(Duration::from_secs(30)));
     }
 
     // Determine target image
