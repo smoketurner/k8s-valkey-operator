@@ -55,6 +55,9 @@ fn has_spec_changed(ctx: &ValidationContext<'_>) -> bool {
         || old.spec.replicas_per_master != new.spec.replicas_per_master
         || old.spec.image.repository != new.spec.image.repository
         || old.spec.image.tag != new.spec.image.tag
+        || old.spec.image.pull_policy != new.spec.image.pull_policy
+        || old.spec.image.pull_secrets != new.spec.image.pull_secrets
+        || old.spec.image.allow_downgrade != new.spec.image.allow_downgrade
         || old.spec.resources.requests.cpu != new.spec.resources.requests.cpu
         || old.spec.resources.requests.memory != new.spec.resources.requests.memory
         || old.spec.resources.limits.cpu != new.spec.resources.limits.cpu
@@ -259,5 +262,66 @@ mod tests {
 
         let result = validate(&ctx);
         assert!(!result.allowed);
+    }
+
+    // Regression: mid-upgrade pull-config edits must be blocked too (issue #49).
+    // The old has_spec_changed only diffed repository/tag, so changing
+    // pull_policy or pull_secrets silently slipped through and could cause
+    // ImagePullBackOff on recreated pods.
+    #[test]
+    fn test_upgrade_blocks_pull_policy_change() {
+        let mut old = create_resource_with_upgrade_annotation(3, "test-upgrade");
+        old.spec.image.pull_policy = "IfNotPresent".to_string();
+        let mut new = create_resource(3);
+        new.spec.image.pull_policy = "Always".to_string();
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = validate(&ctx);
+        assert!(!result.allowed, "pull_policy change should be blocked");
+        assert_eq!(result.reason.as_deref(), Some("UpgradeInProgress"));
+    }
+
+    #[test]
+    fn test_upgrade_blocks_pull_secrets_change() {
+        let mut old = create_resource_with_upgrade_annotation(3, "test-upgrade");
+        old.spec.image.pull_secrets = vec!["old-secret".to_string()];
+        let mut new = create_resource(3);
+        new.spec.image.pull_secrets = vec!["new-secret".to_string()];
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = validate(&ctx);
+        assert!(!result.allowed, "pull_secrets change should be blocked");
+        assert_eq!(result.reason.as_deref(), Some("UpgradeInProgress"));
+    }
+
+    #[test]
+    fn test_upgrade_blocks_allow_downgrade_change() {
+        let mut old = create_resource_with_upgrade_annotation(3, "test-upgrade");
+        old.spec.image.allow_downgrade = false;
+        let mut new = create_resource(3);
+        new.spec.image.allow_downgrade = true;
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = validate(&ctx);
+        assert!(!result.allowed, "allow_downgrade change should be blocked");
+        assert_eq!(result.reason.as_deref(), Some("UpgradeInProgress"));
     }
 }
