@@ -326,6 +326,14 @@ async fn handle_prechecks_phase(
     if let Err(e) = update_cluster_image(&ctx.client, cluster, &target_tag, cluster_namespace).await
     {
         error!(name = %name, error = %e, "Failed to update cluster image tag");
+        // Release the operation lock acquired above so the cluster is not
+        // permanently blocked from future scale/upgrade operations (issue #48).
+        let _ = operation_coordination::complete_operation(
+            &cluster_api,
+            &obj.spec.cluster_ref.name,
+            OperationType::Upgrading,
+        )
+        .await;
         // Clear upgrade annotation on failure
         let _ = clear_upgrade_annotation(&ctx.client, &cluster.name_any(), cluster_namespace).await;
         update_phase(api, &name, UpgradePhase::Failed, Some(e.to_string())).await?;
@@ -1701,11 +1709,26 @@ async fn check_rollback_completion(
 ) -> Result<Action, Error> {
     let name = obj.name_any();
     let cluster_name = cluster.name_any();
+    let cluster_namespace = obj
+        .spec
+        .cluster_ref
+        .namespace
+        .as_deref()
+        .unwrap_or(namespace);
+    let cluster_api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), cluster_namespace);
 
     // Get original image version
     let Some(original_version) = obj.status.as_ref().and_then(|s| s.current_version.as_ref())
     else {
         error!(name = %name, "Cannot check rollback: original version not found");
+        // Release the operation lock so the cluster is not permanently blocked
+        // from future scale/upgrade operations (issue #48).
+        let _ = operation_coordination::complete_operation(
+            &cluster_api,
+            &obj.spec.cluster_ref.name,
+            OperationType::Upgrading,
+        )
+        .await;
         let mut status = obj.status.clone().unwrap_or_default();
         status.phase = UpgradePhase::Failed;
         status.error_message = Some(
@@ -1824,13 +1847,17 @@ async fn check_rollback_completion(
     // Rollback complete - all pods have original image and cluster is healthy
     info!(name = %name, "Rollback completed successfully");
 
+    // Release the operation lock now that the rollback path is finished
+    // (issue #48). Without this, the cluster would remain marked as
+    // "upgrading" indefinitely and block all future scale operations.
+    let _ = operation_coordination::complete_operation(
+        &cluster_api,
+        &obj.spec.cluster_ref.name,
+        OperationType::Upgrading,
+    )
+    .await;
+
     // Clear upgrade annotation from cluster
-    let cluster_namespace = obj
-        .spec
-        .cluster_ref
-        .namespace
-        .as_deref()
-        .unwrap_or(namespace);
     if let Err(e) =
         clear_upgrade_annotation(&ctx.client, &cluster.name_any(), cluster_namespace).await
     {
