@@ -40,9 +40,12 @@ use kube::api::ListParams;
 use kube::{Api, Client};
 
 use crate::client::ValkeyError;
-use crate::client::types::{ParsedClusterNodes, SlotRange as ClusterSlotRange};
+use crate::client::types::{ParsedClusterNodes, SlotRange};
 use crate::crd::ValkeyClusterSpec;
 use crate::slots::TOTAL_SLOTS;
+
+// Re-export so callers that import NodeRole from this module still compile.
+pub use crate::client::types::NodeRole;
 
 // ============================================================================
 // Utility Functions
@@ -185,28 +188,6 @@ impl From<(String, u16)> for Endpoint {
     }
 }
 
-/// Role of a cluster node from the topology perspective.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NodeRole {
-    /// Pod exists but not yet in cluster (unknown state).
-    #[default]
-    Unknown,
-    /// Node is a master serving hash slots.
-    Master,
-    /// Node is a replica of a master.
-    Replica,
-}
-
-impl std::fmt::Display for NodeRole {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NodeRole::Unknown => write!(f, "unknown"),
-            NodeRole::Master => write!(f, "master"),
-            NodeRole::Replica => write!(f, "replica"),
-        }
-    }
-}
-
 /// Information about a single node in the cluster.
 ///
 /// Correlates Kubernetes pod information with Valkey cluster node state.
@@ -248,36 +229,6 @@ pub struct ClusterNodeInfo {
     pub is_failed: bool,
 }
 
-/// A hash slot range.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SlotRange {
-    /// Start of the slot range (inclusive).
-    pub start: i32,
-    /// End of the slot range (inclusive).
-    pub end: i32,
-}
-
-impl SlotRange {
-    /// Create a new slot range.
-    pub fn new(start: i32, end: i32) -> Self {
-        Self { start, end }
-    }
-
-    /// Get the number of slots in this range.
-    pub fn count(&self) -> i32 {
-        self.end - self.start + 1
-    }
-}
-
-impl From<&ClusterSlotRange> for SlotRange {
-    fn from(r: &ClusterSlotRange) -> Self {
-        Self {
-            start: r.start,
-            end: r.end,
-        }
-    }
-}
-
 impl ClusterNodeInfo {
     /// Check if this node is in the Valkey cluster.
     pub fn is_in_cluster(&self) -> bool {
@@ -291,7 +242,7 @@ impl ClusterNodeInfo {
 
     /// Get total number of slots owned by this node.
     pub fn slot_count(&self) -> i32 {
-        self.slots.iter().map(|r| r.count()).sum()
+        self.slots.iter().map(|r| i32::from(r.count())).sum()
     }
 
     /// Check if the node is healthy.
@@ -421,7 +372,7 @@ impl ClusterTopology {
                     } else {
                         NodeRole::Unknown
                     };
-                    let slots: Vec<SlotRange> = cn.slots.iter().map(SlotRange::from).collect();
+                    let slots: Vec<SlotRange> = cn.slots.clone();
                     (
                         Some(cn.node_id.clone()),
                         role,
@@ -522,7 +473,7 @@ impl ClusterTopology {
                     } else {
                         NodeRole::Unknown
                     };
-                    let slots: Vec<SlotRange> = cn.slots.iter().map(SlotRange::from).collect();
+                    let slots: Vec<SlotRange> = cn.slots.clone();
                     (
                         Some(cn.node_id.clone()),
                         role,

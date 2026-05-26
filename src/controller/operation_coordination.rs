@@ -12,7 +12,7 @@ use crate::controller::error::Error;
 use crate::crd::ValkeyCluster;
 
 /// Types of operations that can be performed on a cluster.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationType {
     /// Cluster initialization (CLUSTER MEET, slot assignment, replica setup).
     Initializing,
@@ -28,6 +28,19 @@ impl std::fmt::Display for OperationType {
             OperationType::Initializing => write!(f, "initializing"),
             OperationType::Scaling => write!(f, "scaling"),
             OperationType::Upgrading => write!(f, "upgrading"),
+        }
+    }
+}
+
+impl std::str::FromStr for OperationType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "initializing" => Ok(OperationType::Initializing),
+            "scaling" => Ok(OperationType::Scaling),
+            "upgrading" => Ok(OperationType::Upgrading),
+            _ => Err(format!("Unknown operation type: {}", s)),
         }
     }
 }

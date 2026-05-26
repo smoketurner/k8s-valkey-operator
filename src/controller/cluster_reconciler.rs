@@ -2072,7 +2072,7 @@ async fn execute_scale_down(
 
             // Execute CLUSTER MIGRATESLOTS from the source node
             match source_client
-                .cluster_migrateslots(range.start as u16, range.end as u16, &dest_node.node_id)
+                .cluster_migrateslots(range.start, range.end, &dest_node.node_id)
                 .await
             {
                 Ok(()) => {
@@ -2085,8 +2085,8 @@ async fn execute_scale_down(
                         namespace,
                         &source_client,
                         target_ordinal,
-                        range.start as u16,
-                        range.end as u16,
+                        range.start,
+                        range.end,
                         &dest_node.node_id,
                     )
                     .await
@@ -2094,7 +2094,7 @@ async fn execute_scale_down(
                         let _ = source_client.close().await;
                         return Err(e);
                     }
-                    result.slots_moved += range.end - range.start + 1;
+                    result.slots_moved += i32::from(range.end - range.start + 1);
                     debug!(range = ?range, "Slot range migration completed");
                 }
                 Err(e) => {
@@ -2218,7 +2218,7 @@ async fn execute_rebalance_slots(
         }
         for range in &master.slots {
             for slot in range.start..=range.end {
-                current_ownership.insert(slot as u16, master.node_id.clone());
+                current_ownership.insert(slot, master.node_id.clone());
             }
         }
     }
@@ -2434,7 +2434,7 @@ fn owns_all_slots_in_range(slot_ranges: &[crate::client::SlotRange], start: u16,
     // Sort ranges by start (usually already sorted, but be safe)
     let mut sorted_ranges: Vec<_> = slot_ranges
         .iter()
-        .map(|r| (r.start as u16, r.end as u16))
+        .map(|r| (r.start, r.end))
         .collect();
     sorted_ranges.sort_by_key(|r| r.0);
 
@@ -3265,8 +3265,8 @@ mod tests {
     // owns_all_slots_in_range() tests
     // ==========================================================================
 
-    fn make_slot_range(start: i32, end: i32) -> crate::client::SlotRange {
-        crate::client::SlotRange { start, end }
+    fn make_slot_range(start: u16, end: u16) -> crate::client::SlotRange {
+        crate::client::SlotRange::new(start, end)
     }
 
     #[test]

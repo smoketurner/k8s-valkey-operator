@@ -160,20 +160,41 @@ impl ClusterInfo {
 }
 
 /// Role of a cluster node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NodeRole {
     /// Node is a master serving hash slots.
     Master,
     /// Node is a replica of a master.
     Replica,
+    /// Node state is unknown (pod exists but not yet in cluster).
+    #[default]
+    Unknown,
+}
+
+impl NodeRole {
+    /// Returns the role string as used in the Valkey wire protocol.
+    /// Masters are "master", replicas are "slave" (legacy Redis/Valkey protocol name).
+    pub fn as_valkey_str(&self) -> &'static str {
+        match self {
+            NodeRole::Master => "master",
+            NodeRole::Replica => "slave",
+            NodeRole::Unknown => "?",
+        }
+    }
+
+    /// Returns the human-readable display string.
+    pub(crate) fn as_display_str(&self) -> &'static str {
+        match self {
+            NodeRole::Master => "master",
+            NodeRole::Replica => "replica",
+            NodeRole::Unknown => "unknown",
+        }
+    }
 }
 
 impl std::fmt::Display for NodeRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NodeRole::Master => write!(f, "master"),
-            NodeRole::Replica => write!(f, "slave"),
-        }
+        f.write_str(self.as_display_str())
     }
 }
 
@@ -222,8 +243,10 @@ impl NodeFlags {
     pub fn role(&self) -> NodeRole {
         if self.master {
             NodeRole::Master
-        } else {
+        } else if self.slave {
             NodeRole::Replica
+        } else {
+            NodeRole::Unknown
         }
     }
 
@@ -234,73 +257,10 @@ impl NodeFlags {
 }
 
 /// A hash slot range owned by a master node.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SlotRange {
-    /// Start of the slot range (inclusive).
-    pub start: i32,
-    /// End of the slot range (inclusive).
-    pub end: i32,
-}
-
-impl SlotRange {
-    /// Create a new slot range.
-    pub fn new(start: i32, end: i32) -> Self {
-        Self { start, end }
-    }
-
-    /// Create a single-slot range.
-    pub fn single(slot: i32) -> Self {
-        Self {
-            start: slot,
-            end: slot,
-        }
-    }
-
-    /// Get the number of slots in this range.
-    pub fn count(&self) -> i32 {
-        self.end - self.start + 1
-    }
-
-    /// Parse a slot range from string (e.g., "0-5460" or "5461").
-    pub fn parse(s: &str) -> Result<Self, ParseError> {
-        let s = s.trim();
-
-        // Check for importing/migrating state markers
-        if s.starts_with('[') {
-            // [slot-<-importing-node-id] or [slot->-migrating-node-id]
-            // Skip these for now
-            return Err(ParseError::InvalidSlotRange(format!(
-                "Slot in migration: {}",
-                s
-            )));
-        }
-
-        if let Some((start_str, end_str)) = s.split_once('-') {
-            let start = start_str.parse().map_err(|_| {
-                ParseError::InvalidSlotRange(format!("Invalid start slot: {}", start_str))
-            })?;
-            let end = end_str.parse().map_err(|_| {
-                ParseError::InvalidSlotRange(format!("Invalid end slot: {}", end_str))
-            })?;
-            Ok(SlotRange::new(start, end))
-        } else {
-            let slot = s
-                .parse()
-                .map_err(|_| ParseError::InvalidSlotRange(format!("Invalid slot: {}", s)))?;
-            Ok(SlotRange::single(slot))
-        }
-    }
-}
-
-impl std::fmt::Display for SlotRange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.start == self.end {
-            write!(f, "{}", self.start)
-        } else {
-            write!(f, "{}-{}", self.start, self.end)
-        }
-    }
-}
+///
+/// Re-exported from [`crate::slots::distribution::SlotRange`]. All code should
+/// use this canonical type; the fields are `u16` because slots are 0..=16383.
+pub use crate::slots::distribution::SlotRange;
 
 /// A cluster node as reported by `CLUSTER NODES`.
 #[derive(Debug, Clone)]
@@ -364,7 +324,7 @@ impl ClusterNode {
 
     /// Get total number of slots owned by this node.
     pub fn slot_count(&self) -> i32 {
-        self.slots.iter().map(|r| r.count()).sum()
+        self.slots.iter().map(|r| i32::from(r.count())).sum()
     }
 
     /// Parse a single line from `CLUSTER NODES` output.
@@ -440,7 +400,7 @@ impl ClusterNode {
             .get(8..)
             .unwrap_or_default()
             .iter()
-            .filter_map(|s| SlotRange::parse(s).ok())
+            .filter_map(|s| SlotRange::parse_valkey(s))
             .collect();
 
         Ok(ClusterNode {
@@ -610,12 +570,19 @@ cluster_my_epoch:2
 
     #[test]
     fn test_parse_slot_range() {
-        assert_eq!(SlotRange::parse("0-5460").unwrap(), SlotRange::new(0, 5460));
-        assert_eq!(SlotRange::parse("5461").unwrap(), SlotRange::single(5461));
         assert_eq!(
-            SlotRange::parse("10923-16383").unwrap(),
+            SlotRange::parse_valkey("0-5460").unwrap(),
+            SlotRange::new(0, 5460)
+        );
+        assert_eq!(
+            SlotRange::parse_valkey("5461").unwrap(),
+            SlotRange::single(5461)
+        );
+        assert_eq!(
+            SlotRange::parse_valkey("10923-16383").unwrap(),
             SlotRange::new(10923, 16383)
         );
+        assert!(SlotRange::parse_valkey("[100-<-node]").is_none());
     }
 
     #[test]
