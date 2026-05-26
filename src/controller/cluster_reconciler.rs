@@ -29,6 +29,7 @@ use crate::{
     },
     crd::{ClusterPhase, Condition, ValkeyCluster, ValkeyClusterStatus, total_pods},
     resources::{certificate, common, pdb, services, statefulset},
+    slots::TOTAL_SLOTS,
 };
 
 /// Field manager name for server-side apply
@@ -956,9 +957,7 @@ async fn execute_cluster_init(
     let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
 
     // Build topology to get pod IPs for CLUSTER MEET
-    let topology = ClusterTopology::build(&ctx.client, namespace, &name, None)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let topology = ClusterTopology::build(&ctx.client, namespace, &name, None).await?;
 
     // Execute cluster meet
     cluster_init::execute_cluster_meet(
@@ -968,8 +967,7 @@ async fn execute_cluster_init(
         tls_certs.as_ref(),
         &strategy,
     )
-    .await
-    .map_err(|e| Error::Valkey(e.to_string()))?;
+    .await?;
 
     Ok(())
 }
@@ -988,9 +986,7 @@ async fn execute_stale_ip_recovery(
     let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
 
     // Build topology to get current pod IPs
-    let topology = ClusterTopology::build(&ctx.client, namespace, &name, None)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let topology = ClusterTopology::build(&ctx.client, namespace, &name, None).await?;
 
     // Execute recovery via CLUSTER MEET
     cluster_init::recover_stale_ips(
@@ -1000,8 +996,7 @@ async fn execute_stale_ip_recovery(
         tls_certs.as_ref(),
         &strategy,
     )
-    .await
-    .map_err(|e| Error::Valkey(e.to_string()))?;
+    .await?;
 
     Ok(())
 }
@@ -1017,8 +1012,7 @@ async fn execute_slot_assignment_no_replicas(
 
     // Assign slots to masters only
     cluster_init::assign_slots_to_masters(obj, password.as_deref(), tls_certs.as_ref(), &strategy)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+        .await?;
 
     Ok(())
 }
@@ -1036,9 +1030,7 @@ async fn execute_replica_setup(
 
     let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
 
-    cluster_init::setup_replicas(obj, password.as_deref(), tls_certs.as_ref(), &strategy)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    cluster_init::setup_replicas(obj, password.as_deref(), tls_certs.as_ref(), &strategy).await?;
 
     Ok(())
 }
@@ -1056,7 +1048,7 @@ async fn execute_scale_up_rebalance(
 
     // Check if scaling is complete
     if let Some(ref e) = result.error {
-        return Err(Error::Valkey(e.clone()));
+        return Err(crate::client::ValkeyError::SlotMigrationFailed(e.clone()).into());
     }
     // Operation is complete when it succeeds and all slots have been moved
     Ok(result.success)
@@ -1078,7 +1070,7 @@ async fn execute_scale_down_evacuation(
 
     // Check if scaling is complete
     if let Some(ref e) = result.error {
-        return Err(Error::Valkey(e.clone()));
+        return Err(crate::client::ValkeyError::SlotMigrationFailed(e.clone()).into());
     }
     // Operation is complete when it succeeds
     Ok(result.success)
@@ -1095,10 +1087,7 @@ async fn execute_forget_removed_nodes(
     let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
 
     // Connect to cluster
-    let (host, port) = strategy
-        .get_connection(0)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let (host, port) = strategy.get_connection(0).await?;
 
     let client = crate::client::ValkeyClient::connect_single(
         &host,
@@ -1106,22 +1095,16 @@ async fn execute_forget_removed_nodes(
         password.as_deref(),
         tls_certs.as_ref(),
     )
-    .await
-    .map_err(|e| Error::Valkey(e.to_string()))?;
+    .await?;
 
-    let cluster_nodes = client
-        .cluster_nodes()
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let cluster_nodes = client.cluster_nodes().await?;
 
     let _ = client.close().await;
 
     // Build ClusterTopology to find orphaned nodes
     let cluster_name = obj.name_any();
     let topology =
-        ClusterTopology::build(&ctx.client, namespace, &cluster_name, Some(&cluster_nodes))
-            .await
-            .map_err(|e| Error::Valkey(e.to_string()))?;
+        ClusterTopology::build(&ctx.client, namespace, &cluster_name, Some(&cluster_nodes)).await?;
 
     // Find orphaned nodes: cluster nodes whose IP is NOT in our current pod list
     let orphaned = topology.orphaned_nodes(&cluster_nodes);
@@ -1169,10 +1152,7 @@ async fn verify_scale_down_quorum(
     let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
 
     // Get total master count from cluster state
-    let (host, port) = strategy
-        .get_connection(0)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let (host, port) = strategy.get_connection(0).await?;
 
     let client = crate::client::ValkeyClient::connect_single(
         &host,
@@ -1180,13 +1160,9 @@ async fn verify_scale_down_quorum(
         password.as_deref(),
         tls_certs.as_ref(),
     )
-    .await
-    .map_err(|e| Error::Valkey(e.to_string()))?;
+    .await?;
 
-    let cluster_nodes = client
-        .cluster_nodes()
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let cluster_nodes = client.cluster_nodes().await?;
 
     let _ = client.close().await;
 
@@ -1231,10 +1207,7 @@ async fn forget_nodes_with_quorum(
     let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
 
     // Get all current nodes
-    let (host, port) = strategy
-        .get_connection(0)
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let (host, port) = strategy.get_connection(0).await?;
 
     let client = crate::client::ValkeyClient::connect_single(
         &host,
@@ -1242,13 +1215,9 @@ async fn forget_nodes_with_quorum(
         password.as_deref(),
         tls_certs.as_ref(),
     )
-    .await
-    .map_err(|e| Error::Valkey(e.to_string()))?;
+    .await?;
 
-    let cluster_nodes = client
-        .cluster_nodes()
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let cluster_nodes = client.cluster_nodes().await?;
 
     let _ = client.close().await;
 
@@ -1543,14 +1512,18 @@ async fn update_status(
     // Calculate assigned slots string from health status or defaults
     let (assigned_slots, topology, ready_masters) = if let Some(health) = health_status {
         (
-            format!("{}/16384", health.slots_assigned),
+            format!("{}/{TOTAL_SLOTS}", health.slots_assigned),
             health.topology.clone(),
             health.healthy_masters,
         )
     } else if phase == ClusterPhase::Running {
-        ("16384/16384".to_string(), None, obj.spec.masters)
+        (
+            format!("{TOTAL_SLOTS}/{TOTAL_SLOTS}"),
+            None,
+            obj.spec.masters,
+        )
     } else {
-        ("0/16384".to_string(), None, 0)
+        (format!("0/{TOTAL_SLOTS}"), None, 0)
     };
 
     // Get TLS secret name from certificate
@@ -1604,12 +1577,14 @@ async fn update_status(
     // Set last_error and summary based on phase and health
     let (last_error, summary) = if phase == ClusterPhase::Running {
         // Healthy - clear error and set healthy summary
-        let slots = health_status.map(|h| h.slots_assigned).unwrap_or(16384);
+        let slots = health_status
+            .map(|h| h.slots_assigned)
+            .unwrap_or_else(|| i32::from(TOTAL_SLOTS));
         let healthy_replicas = health_status.map(|h| h.healthy_replicas).unwrap_or(0);
         (
             None,
             Some(format!(
-                "Healthy: {} masters, {} replicas, {}/16384 slots",
+                "Healthy: {} masters, {} replicas, {}/{TOTAL_SLOTS} slots",
                 ready_masters, healthy_replicas, slots
             )),
         )
@@ -1737,23 +1712,16 @@ async fn promote_replicas_to_masters(
     let mut promoted = Vec::new();
 
     // Get current cluster topology
-    let client = ctx
-        .connect_to_cluster(obj, namespace, 0)
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to connect for promotion check: {}", e)))?;
+    let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
 
-    let cluster_nodes = client
-        .cluster_nodes()
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to get cluster nodes: {}", e)))?;
+    let cluster_nodes = client.cluster_nodes().await?;
 
     let _ = client.close().await;
 
     // Build ClusterTopology to correlate pods with cluster nodes via IP matching
     // This fixes the bug where extract_ordinal_from_address fails on IP addresses
-    let topology = ClusterTopology::build(&ctx.client, namespace, &name, Some(&cluster_nodes))
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to build topology: {}", e)))?;
+    let topology =
+        ClusterTopology::build(&ctx.client, namespace, &name, Some(&cluster_nodes)).await?;
 
     // Use topology to find replicas that should be masters
     // This correctly handles all ordinals 0..target_masters, not just new ones
@@ -1768,12 +1736,7 @@ async fn promote_replicas_to_masters(
         );
 
         // Connect to this specific pod and reset it
-        let replica_client = ctx
-            .connect_to_cluster(obj, namespace, node.ordinal)
-            .await
-            .map_err(|e| {
-                Error::Valkey(format!("Failed to connect to pod {}: {}", node.ordinal, e))
-            })?;
+        let replica_client = ctx.connect_to_cluster(obj, namespace, node.ordinal).await?;
 
         match replica_client.cluster_reset(false).await {
             Ok(()) => {
@@ -1804,10 +1767,7 @@ async fn promote_replicas_to_masters(
         // Re-meet the promoted nodes back into the cluster
         // (CLUSTER RESET removes them from the cluster configuration)
         // Connect to master 0 to issue CLUSTER MEET
-        let client = ctx
-            .connect_to_cluster(obj, namespace, 0)
-            .await
-            .map_err(|e| Error::Valkey(format!("Failed to connect for CLUSTER MEET: {}", e)))?;
+        let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
 
         for &ordinal in &promoted {
             // Use topology to get the IP for this ordinal
@@ -1854,19 +1814,16 @@ async fn execute_scaling_operation(
     // Build host list for connecting to the cluster
     let pod_addresses = cluster_init::master_pod_dns_names(obj);
     if pod_addresses.is_empty() {
-        return Err(Error::Valkey("No pod addresses available".to_string()));
+        return Err(crate::client::ValkeyError::InvalidConfig(
+            "No pod addresses available".to_string(),
+        )
+        .into());
     }
 
-    let client = ctx
-        .connect_to_cluster(obj, namespace, 0)
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to connect for scaling: {}", e)))?;
+    let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
 
     // Get current master count
-    let cluster_nodes = client
-        .cluster_nodes()
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to get cluster nodes: {}", e)))?;
+    let cluster_nodes = client.cluster_nodes().await?;
 
     let current_masters = cluster_nodes.masters().len() as i32;
     let target_masters = obj.spec.masters;
@@ -1886,17 +1843,9 @@ async fn execute_scaling_operation(
     }
 
     // Re-connect and get updated cluster state after promotions
-    let client = ctx
-        .connect_to_cluster(obj, namespace, 0)
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to reconnect for scaling: {}", e)))?;
+    let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
 
-    let cluster_nodes = client.cluster_nodes().await.map_err(|e| {
-        Error::Valkey(format!(
-            "Failed to get cluster nodes after promotion: {}",
-            e
-        ))
-    })?;
+    let cluster_nodes = client.cluster_nodes().await?;
 
     let current_masters = cluster_nodes.masters().len() as i32;
 
@@ -1943,7 +1892,7 @@ async fn execute_scaling_operation(
         execute_rebalance_slots(obj, ctx, namespace, &cluster_nodes, target_masters).await
     };
 
-    result.map_err(|e| Error::Valkey(format!("Scaling operation failed: {}", e)))
+    result.map_err(Error::from)
 }
 
 /// Execute a scale-down operation with proper per-node connections.
@@ -2712,15 +2661,9 @@ async fn add_new_replicas_to_cluster(
     let replicas_per_master = obj.spec.replicas_per_master;
 
     // First, get the current cluster state
-    let client = ctx
-        .connect_to_cluster(obj, namespace, 0)
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
+    let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
 
-    let cluster_nodes = client
-        .cluster_nodes()
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to get cluster nodes: {}", e)))?;
+    let cluster_nodes = client.cluster_nodes().await?;
 
     let current_node_count = cluster_nodes.nodes.len() as i32;
     let desired_total = total_pods(masters, replicas_per_master);
@@ -2732,9 +2675,8 @@ async fn add_new_replicas_to_cluster(
     }
 
     // Build ClusterTopology to find pods not yet in cluster
-    let topology = ClusterTopology::build(&ctx.client, namespace, &name, Some(&cluster_nodes))
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let topology =
+        ClusterTopology::build(&ctx.client, namespace, &name, Some(&cluster_nodes)).await?;
 
     // Get pods not yet in cluster
     let new_pods: Vec<_> = topology.nodes_not_in_cluster().collect();
@@ -2750,10 +2692,7 @@ async fn add_new_replicas_to_cluster(
     );
 
     // Connect to first master and run CLUSTER MEET for each new node
-    let client = ctx
-        .connect_to_cluster(obj, namespace, 0)
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
+    let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
 
     // Execute CLUSTER MEET for each new pod
     for node in &new_pods {
@@ -2762,12 +2701,7 @@ async fn add_new_replicas_to_cluster(
             continue;
         };
         info!(pod = %node.pod_name, ip = %endpoint.ip(), "Executing CLUSTER MEET");
-        client
-            .cluster_meet(endpoint.ip(), endpoint.port())
-            .await
-            .map_err(|e| {
-                Error::Valkey(format!("CLUSTER MEET failed for {}: {}", node.pod_name, e))
-            })?;
+        client.cluster_meet(endpoint.ip(), endpoint.port()).await?;
     }
 
     let _ = client.close().await;
@@ -2782,22 +2716,15 @@ async fn add_new_replicas_to_cluster(
     //   - pod-6 is replica of pod-0, pod-7 is replica of pod-1, pod-8 is replica of pod-2, etc.
 
     // Get updated cluster nodes to get node IDs
-    let client = ctx
-        .connect_to_cluster(obj, namespace, 0)
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to connect: {}", e)))?;
+    let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
 
-    let cluster_nodes = client
-        .cluster_nodes()
-        .await
-        .map_err(|e| Error::Valkey(format!("Failed to get cluster nodes: {}", e)))?;
+    let cluster_nodes = client.cluster_nodes().await?;
 
     let _ = client.close().await;
 
     // Rebuild topology with updated cluster nodes after CLUSTER MEET
-    let topology = ClusterTopology::build(&ctx.client, namespace, &name, Some(&cluster_nodes))
-        .await
-        .map_err(|e| Error::Valkey(e.to_string()))?;
+    let topology =
+        ClusterTopology::build(&ctx.client, namespace, &name, Some(&cluster_nodes)).await?;
 
     // Get master node IDs (from ordinal 0 to masters-1)
     // IMPORTANT: Only include nodes that are ACTUALLY masters in the cluster topology.
@@ -2866,10 +2793,7 @@ async fn add_new_replicas_to_cluster(
             "Configuring replica"
         );
 
-        let replica_client = ctx
-            .connect_to_cluster(obj, namespace, node.ordinal)
-            .await
-            .map_err(|e| Error::Valkey(format!("Failed to connect to replica: {}", e)))?;
+        let replica_client = ctx.connect_to_cluster(obj, namespace, node.ordinal).await?;
 
         match replica_client.cluster_replicate(master_node_id).await {
             Ok(()) => {

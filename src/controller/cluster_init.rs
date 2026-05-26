@@ -20,7 +20,7 @@ use crate::client::valkey_client::{TlsCertData, ValkeyClient, ValkeyError};
 use crate::controller::cluster_topology::{ClusterTopology, extract_ordinal_from_address};
 use crate::crd::ValkeyCluster;
 use crate::resources::port_forward::{PortForward, PortForwardError, PortForwardTarget};
-use crate::slots::calculate_distribution;
+use crate::slots::{TOTAL_SLOTS, calculate_distribution};
 
 /// Build the DNS name for a pod in the StatefulSet.
 ///
@@ -535,7 +535,7 @@ pub async fn assign_slots_to_masters(
         );
     }
 
-    info!("All 16384 slots assigned to masters");
+    info!("All {TOTAL_SLOTS} slots assigned to masters");
     Ok(())
 }
 

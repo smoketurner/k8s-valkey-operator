@@ -5,6 +5,7 @@
 
 use crate::client::types::{ClusterInfo, ParsedClusterNodes};
 use crate::crd::ClusterTopology;
+use crate::slots::distribution::TOTAL_SLOTS;
 
 /// Cluster state combining all state information.
 ///
@@ -25,7 +26,7 @@ impl ClusterState {
     ///
     /// A cluster is healthy when:
     /// - cluster_state is "ok"
-    /// - All 16384 slots are assigned
+    /// - All TOTAL_SLOTS (16384) slots are assigned
     /// - No slots in migrating/importing state (unless actively migrating)
     /// - Cluster size matches expected masters
     /// - No failed nodes
@@ -34,7 +35,7 @@ impl ClusterState {
         use crate::client::types::ClusterHealthState;
 
         let cluster_state_ok = self.cluster_info.state == ClusterHealthState::Ok;
-        let all_slots_assigned = self.cluster_info.slots_assigned == 16384;
+        let all_slots_assigned = self.cluster_info.slots_assigned == i32::from(TOTAL_SLOTS);
         let cluster_size_matches = self.cluster_nodes.masters().len() as i32 == expected_masters;
         let no_failed_nodes = self
             .cluster_nodes
@@ -120,7 +121,7 @@ impl ClusterState {
 
         if !self.all_slots_assigned() {
             issues.push(format!(
-                "not all slots assigned ({}/16384)",
+                "not all slots assigned ({}/{TOTAL_SLOTS})",
                 self.cluster_info.slots_assigned
             ));
         }

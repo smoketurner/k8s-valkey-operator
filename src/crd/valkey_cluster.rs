@@ -1111,9 +1111,6 @@ pub struct OperationProgress {
     pub last_error: Option<String>,
 }
 
-/// Total number of hash slots in a Valkey cluster.
-pub const TOTAL_HASH_SLOTS: i32 = 16384;
-
 /// Default client port for Valkey.
 pub const DEFAULT_CLIENT_PORT: i32 = 6379;
 

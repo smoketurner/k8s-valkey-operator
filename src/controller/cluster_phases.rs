@@ -34,6 +34,7 @@ use crate::{
         operation_coordination::{self, OperationType},
     },
     crd::{ClusterPhase, ValkeyCluster, total_pods},
+    slots::TOTAL_SLOTS,
 };
 
 use super::cluster_reconciler::FIELD_MANAGER;
@@ -387,7 +388,7 @@ pub async fn handle_assigning_slots(
                 obj,
                 "SlotsAssigned",
                 "AssigningSlots",
-                Some("All 16384 hash slots assigned to masters".to_string()),
+                Some(format!("All {TOTAL_SLOTS} hash slots assigned to masters")),
             )
             .await;
 

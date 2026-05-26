@@ -42,6 +42,7 @@ use kube::{Api, Client};
 use crate::client::ValkeyError;
 use crate::client::types::{ParsedClusterNodes, SlotRange as ClusterSlotRange};
 use crate::crd::ValkeyClusterSpec;
+use crate::slots::TOTAL_SLOTS;
 
 // ============================================================================
 // Utility Functions
@@ -834,7 +835,7 @@ impl ClusterTopology {
         }
 
         // Calculate expected slots per master
-        let expected_per_master = 16384 / target_masters;
+        let expected_per_master = i32::from(TOTAL_SLOTS) / target_masters;
         let tolerance = expected_per_master / 10; // 10% tolerance
 
         // Check if any master has significantly different slot count

@@ -34,7 +34,7 @@ pub enum Error {
 
     /// Valkey client error
     #[error("Valkey error: {0}")]
-    Valkey(String),
+    Valkey(#[from] crate::client::ValkeyError),
 
     /// Timeout error
     #[error("Timeout: {0}")]
@@ -67,10 +67,12 @@ impl Error {
     pub fn is_retryable(&self) -> bool {
         match self {
             Error::Kube(e) => {
-                // Retry on network errors, rate limiting, and server errors
+                // Retry on network errors, rate limiting, server errors, and optimistic concurrency
+                // conflicts (409 = resourceVersion mismatch from concurrent reconciliations).
                 matches!(
                     e,
-                    kube::Error::Api(api_err) if api_err.code >= 500 || api_err.code == 429
+                    kube::Error::Api(api_err)
+                        if api_err.code >= 500 || api_err.code == 429 || api_err.code == 409
                 ) || matches!(e, kube::Error::Service(_))
             }
             Error::Transient(_) => true,
@@ -134,6 +136,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 )]
 mod tests {
     use super::*;
+    use crate::client::ValkeyError;
 
     // ==========================================================================
     // Error::is_retryable() tests
@@ -147,7 +150,19 @@ mod tests {
 
     #[test]
     fn test_is_retryable_valkey_error() {
-        let error = Error::Valkey("CLUSTERDOWN".to_string());
+        let error = Error::Valkey(ValkeyError::ClusterNotReady("CLUSTERDOWN".to_string()));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_kube_409_conflict() {
+        let status = kube::core::Status {
+            code: 409,
+            message: "the object has been modified".to_string(),
+            reason: "Conflict".to_string(),
+            ..Default::default()
+        };
+        let error = Error::Kube(kube::Error::Api(Box::new(status)));
         assert!(error.is_retryable());
     }
 
@@ -202,7 +217,7 @@ mod tests {
 
     #[test]
     fn test_requeue_after_valkey_error() {
-        let error = Error::Valkey("CLUSTERDOWN".to_string());
+        let error = Error::Valkey(ValkeyError::ClusterNotReady("CLUSTERDOWN".to_string()));
         let duration = error.requeue_after();
         assert_eq!(duration.as_secs(), 30); // Retryable
     }
@@ -263,8 +278,11 @@ mod tests {
 
     #[test]
     fn test_error_display_valkey() {
-        let error = Error::Valkey("ERR CLUSTERDOWN".to_string());
-        assert_eq!(error.to_string(), "Valkey error: ERR CLUSTERDOWN");
+        let error = Error::Valkey(ValkeyError::ClusterNotReady("ERR CLUSTERDOWN".to_string()));
+        assert_eq!(
+            error.to_string(),
+            "Valkey error: Cluster not ready: ERR CLUSTERDOWN"
+        );
     }
 
     #[test]
@@ -326,7 +344,11 @@ mod tests {
         // Test all error types and their classification
         let test_cases = vec![
             (Error::Transient("test".to_string()), true, false),
-            (Error::Valkey("test".to_string()), true, false),
+            (
+                Error::Valkey(ValkeyError::ClusterNotReady("test".to_string())),
+                true,
+                false,
+            ),
             (Error::Timeout("test".to_string()), true, false),
             (Error::Validation("test".to_string()), false, false),
             (Error::Permanent("test".to_string()), false, false),

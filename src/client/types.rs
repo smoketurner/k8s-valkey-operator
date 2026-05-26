@@ -8,6 +8,8 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
+use crate::slots::distribution::TOTAL_SLOTS;
+
 /// Errors that can occur when parsing cluster data.
 #[derive(Error, Debug)]
 pub enum ParseError {
@@ -138,7 +140,7 @@ impl ClusterInfo {
 
     /// Check if all slots are assigned.
     pub fn all_slots_assigned(&self) -> bool {
-        self.slots_assigned == 16384
+        self.slots_assigned == i32::from(TOTAL_SLOTS)
     }
 
     /// Check if the cluster is healthy.
@@ -512,7 +514,7 @@ impl ParsedClusterNodes {
 
     /// Check if all slots are assigned.
     pub fn all_slots_assigned(&self) -> bool {
-        self.total_slots_assigned() == 16384
+        self.total_slots_assigned() == i32::from(TOTAL_SLOTS)
     }
 
     /// Get all healthy nodes.
