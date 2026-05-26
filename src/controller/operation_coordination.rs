@@ -7,7 +7,6 @@ use jiff::Timestamp;
 use kube::api::{Api, Patch, PatchParams};
 use tracing::{debug, info, warn};
 
-use crate::controller::cluster_reconciler::FIELD_MANAGER;
 use crate::controller::error::Error;
 use crate::crd::ValkeyCluster;
 
@@ -126,7 +125,7 @@ pub async fn start_operation(
 
     api.patch_status(
         cluster_name,
-        &PatchParams::apply(FIELD_MANAGER),
+        &PatchParams::default(),
         &Patch::Merge(&patch),
     )
     .await?;
@@ -166,7 +165,7 @@ pub async fn complete_operation(
 
             api.patch_status(
                 cluster_name,
-                &PatchParams::apply(FIELD_MANAGER),
+                &PatchParams::default(),
                 &Patch::Merge(&patch),
             )
             .await?;

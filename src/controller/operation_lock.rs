@@ -266,7 +266,7 @@ impl OperationLock {
 
         api.patch(
             &lease_name,
-            &PatchParams::apply(FIELD_MANAGER),
+            &PatchParams::default(),
             &Patch::Merge(&patch),
         )
         .await?;
