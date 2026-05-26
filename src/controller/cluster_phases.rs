@@ -472,6 +472,13 @@ pub async fn handle_configuring_replicas(
 ///
 /// Monitors cluster health and detects spec changes.
 /// Transitions to scale-up or scale-down phases when masters count changes.
+///
+/// Dispatches on [`PhaseContext::scale_direction`] for master-count detection.
+/// `scale_direction()` requires `current_masters > 0` for both `Up` and `Down`,
+/// which protects against transient `get_current_master_count` failures
+/// (which return `Ok(0)` on connection errors) — without that guard, a
+/// transient failure would spuriously flip the phase to `ScalingUpStatefulSet`
+/// (see issue #52).
 pub async fn handle_running(
     obj: &ValkeyCluster,
     ctx: &Context,
@@ -479,92 +486,98 @@ pub async fn handle_running(
     create_resources_fn: impl std::future::Future<Output = Result<(), Error>>,
 ) -> Result<PhaseResult, Error> {
     let name = &phase_ctx.name;
+    let desired_replicas = phase_ctx.desired_replicas();
+    let direction = phase_ctx.scale_direction();
 
     // CRITICAL: Detect scale-down BEFORE applying resources to prevent race condition.
     // For scale-down, we must NOT reduce StatefulSet replicas until slots are evacuated.
     // If we call create_resources_fn first, Kubernetes immediately terminates pods
     // before their slots can be migrated, causing data loss.
-    if phase_ctx.current_masters > 0 && phase_ctx.target_masters < phase_ctx.current_masters {
-        info!(
-            name = %name,
-            current = phase_ctx.current_masters,
-            target = phase_ctx.target_masters,
-            "Scale-down detected - deferring resource sync until slots evacuated"
-        );
-        ctx.publish_normal_event(
-            obj,
-            "ScaleDownDetected",
-            "Running",
-            Some(format!(
-                "Scaling down from {} to {} masters",
-                phase_ctx.current_masters, phase_ctx.target_masters
-            )),
-        )
-        .await;
-        return Ok(ClusterPhase::EvacuatingSlots.into());
-    }
-
-    // Check for replica-only scale-down (masters unchanged) BEFORE resource sync.
-    // Replicas don't hold slots, so we skip EvacuatingSlots but still need to
-    // defer StatefulSet scaling until RemovingNodesFromCluster completes.
-    let desired_replicas = phase_ctx.desired_replicas();
-    if phase_ctx.running_pods > desired_replicas
-        && phase_ctx.current_masters > 0
-        && phase_ctx.current_masters == phase_ctx.target_masters
-    {
-        debug!(
-            name = %name,
-            running = phase_ctx.running_pods,
-            desired = desired_replicas,
-            "Replica scale-down detected - deferring resource sync"
-        );
-        ctx.publish_normal_event(
-            obj,
-            "ReplicaScaleDownDetected",
-            "Running",
-            Some(format!(
-                "Scaling down replicas from {} to {} pods",
-                phase_ctx.running_pods, desired_replicas
-            )),
-        )
-        .await;
-        return Ok(ClusterPhase::RemovingNodesFromCluster.into());
+    match direction {
+        ScaleDirection::Down => {
+            info!(
+                name = %name,
+                current = phase_ctx.current_masters,
+                target = phase_ctx.target_masters,
+                "Scale-down detected - deferring resource sync until slots evacuated"
+            );
+            ctx.publish_normal_event(
+                obj,
+                "ScaleDownDetected",
+                "Running",
+                Some(format!(
+                    "Scaling down from {} to {} masters",
+                    phase_ctx.current_masters, phase_ctx.target_masters
+                )),
+            )
+            .await;
+            return Ok(ClusterPhase::EvacuatingSlots.into());
+        }
+        ScaleDirection::ReplicaChange
+            if phase_ctx.current_masters > 0 && phase_ctx.running_pods > desired_replicas =>
+        {
+            // Replica-only scale-down (masters unchanged): replicas don't hold
+            // slots, so we skip EvacuatingSlots but still defer StatefulSet
+            // scaling until RemovingNodesFromCluster completes.
+            debug!(
+                name = %name,
+                running = phase_ctx.running_pods,
+                desired = desired_replicas,
+                "Replica scale-down detected - deferring resource sync"
+            );
+            ctx.publish_normal_event(
+                obj,
+                "ReplicaScaleDownDetected",
+                "Running",
+                Some(format!(
+                    "Scaling down replicas from {} to {} pods",
+                    phase_ctx.running_pods, desired_replicas
+                )),
+            )
+            .await;
+            return Ok(ClusterPhase::RemovingNodesFromCluster.into());
+        }
+        _ => {}
     }
 
     // Safe to apply resources now - no scale-down in progress.
     // Scale-up operations add pods (safe), and no-change operations are idempotent.
     create_resources_fn.await?;
 
-    // Detect scale-up operations (safe to apply resources first since we're adding pods)
-    if phase_ctx.target_masters > phase_ctx.current_masters {
-        info!(
-            name = %name,
-            current = phase_ctx.current_masters,
-            target = phase_ctx.target_masters,
-            "Scale-up detected"
-        );
-        ctx.publish_normal_event(
-            obj,
-            "ScaleUpDetected",
-            "Running",
-            Some(format!(
-                "Scaling up from {} to {} masters",
-                phase_ctx.current_masters, phase_ctx.target_masters
-            )),
-        )
-        .await;
-        return Ok(ClusterPhase::ScalingUpStatefulSet.into());
-    }
-
-    // Check for replica scale-up (masters unchanged, need more pods)
-    if phase_ctx.running_pods < desired_replicas && phase_ctx.current_masters > 0 {
-        debug!(
-            name = %name,
-            running = phase_ctx.running_pods,
-            desired = desired_replicas,
-            "Replica scale-up detected"
-        );
-        return Ok(ClusterPhase::ScalingUpStatefulSet.into());
+    // Detect scale-up operations (safe to apply resources first since we're adding pods).
+    match direction {
+        ScaleDirection::Up => {
+            info!(
+                name = %name,
+                current = phase_ctx.current_masters,
+                target = phase_ctx.target_masters,
+                "Scale-up detected"
+            );
+            ctx.publish_normal_event(
+                obj,
+                "ScaleUpDetected",
+                "Running",
+                Some(format!(
+                    "Scaling up from {} to {} masters",
+                    phase_ctx.current_masters, phase_ctx.target_masters
+                )),
+            )
+            .await;
+            return Ok(ClusterPhase::ScalingUpStatefulSet.into());
+        }
+        ScaleDirection::ReplicaChange
+            if phase_ctx.current_masters > 0 && phase_ctx.running_pods < desired_replicas =>
+        {
+            // Replica-only scale-up (masters unchanged, need more pods).
+            debug!(
+                name = %name,
+                running = phase_ctx.running_pods,
+                desired = desired_replicas,
+                "Replica scale-up detected"
+            );
+            return Ok(ClusterPhase::ScalingUpStatefulSet.into());
+        }
+        _ => {}
     }
 
     // Check for degraded state
@@ -1438,6 +1451,50 @@ mod tests {
 
         // With 0 current_masters, we should not report scale up/down
         assert_eq!(ctx.scale_direction(), ScaleDirection::ReplicaChange);
+    }
+
+    #[test]
+    fn test_phase_context_transient_query_failure_not_scale_up() {
+        // Regression for issue #52: when get_current_master_count() returns
+        // Ok(0) on a transient connection error during Running phase, the
+        // scale direction must NOT flip to Up. This was the root cause of
+        // spurious ScalingUpStatefulSet transitions.
+        let ctx = PhaseContext {
+            name: "test".to_string(),
+            namespace: "default".to_string(),
+            target_masters: 3,
+            target_replicas_per_master: 1,
+            current_masters: 0, // Simulated transient query failure.
+            running_pods: 6,    // Cluster is actually healthy.
+            ready_pods: 6,
+            nodes_in_cluster: 6,
+            spec_changed: false,
+            generation: 1,
+        };
+
+        // current_masters=0 must not be misclassified as a real scale gap.
+        // 6 == desired_replicas (3 * (1 + 1)), so the result is None.
+        assert_eq!(ctx.scale_direction(), ScaleDirection::None);
+    }
+
+    #[test]
+    fn test_phase_context_real_master_scale_up_detected() {
+        // Sanity check: a legitimate master scale-up (current > 0) still
+        // routes to Up.
+        let ctx = PhaseContext {
+            name: "test".to_string(),
+            namespace: "default".to_string(),
+            target_masters: 6,
+            target_replicas_per_master: 1,
+            current_masters: 3,
+            running_pods: 6,
+            ready_pods: 6,
+            nodes_in_cluster: 6,
+            spec_changed: true,
+            generation: 1,
+        };
+
+        assert_eq!(ctx.scale_direction(), ScaleDirection::Up);
     }
 
     // ========================================================================
