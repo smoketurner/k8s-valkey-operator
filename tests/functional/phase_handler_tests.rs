@@ -211,6 +211,41 @@ mod phase_context_tests {
         // Should not report scale up/down, just replica change (or none if pods match)
         assert_eq!(ctx.scale_direction(), ScaleDirection::ReplicaChange);
     }
+
+    /// Regression test for issue #52.
+    ///
+    /// `get_current_master_count()` returns `Ok(0)` on a transient Valkey
+    /// connection error. Before the fix, `handle_running` would observe
+    /// `target_masters > current_masters` and spuriously transition to
+    /// `ScalingUpStatefulSet`. By dispatching on `scale_direction()` (which
+    /// guards both `Up` and `Down` with `current_masters > 0`), a transient
+    /// query failure now resolves to `None` or `ReplicaChange` (handled
+    /// inside `handle_running` with the same guard), keeping the cluster
+    /// in `Running`.
+    #[test]
+    fn test_scale_direction_transient_master_query_failure_does_not_signal_scale_up() {
+        // target=3, current=0 (transient query failure), pods all healthy.
+        let ctx = make_context(3, 1, 0, 6);
+        // Pods match desired (3 * (1 + 1) = 6), so this should be None, NOT Up.
+        assert_eq!(ctx.scale_direction(), ScaleDirection::None);
+    }
+
+    #[test]
+    fn test_scale_direction_real_master_scale_up_still_detected() {
+        // Sanity check: a legitimate scale-up (current > 0) is still flagged.
+        let ctx = make_context(6, 1, 3, 6);
+        assert_eq!(ctx.scale_direction(), ScaleDirection::Up);
+    }
+
+    #[test]
+    fn test_scale_direction_replica_change_with_zero_current_masters() {
+        // Transient failure during initial creation: current_masters=0 and
+        // pods don't match desired. handle_running's ReplicaChange branches
+        // require current_masters > 0, so this won't trigger a spurious
+        // replica scale event either.
+        let ctx = make_context(3, 1, 0, 5);
+        assert_eq!(ctx.scale_direction(), ScaleDirection::ReplicaChange);
+    }
 }
 
 // ============================================================================

@@ -401,12 +401,16 @@ impl MockClusterState {
         // For Running and Degraded phases, use production scale_direction() for scale detection
         match self.phase {
             ClusterPhase::Running | ClusterPhase::Degraded => {
-                // Use production scale_direction() method from PhaseContext
+                // Use production scale_direction() method from PhaseContext.
+                // Mirrors handle_running/handle_degraded in cluster_phases.rs:
+                // ReplicaChange branches require current_masters > 0 so a
+                // transient master-count query failure (Ok(0)) does not get
+                // misclassified as a real replica scale change (see #52).
                 let phase_ctx = self.to_phase_context();
                 match phase_ctx.scale_direction() {
                     ScaleDirection::Up => return ClusterEvent::ScaleUpDetected,
                     ScaleDirection::Down => return ClusterEvent::ScaleDownDetected,
-                    ScaleDirection::ReplicaChange => {
+                    ScaleDirection::ReplicaChange if self.current_masters > 0 => {
                         // Replica change without master change - determine direction by pod count
                         let current_pods = self.running_pods;
                         let desired_pods = phase_ctx.desired_replicas();
@@ -420,7 +424,7 @@ impl MockClusterState {
                         }
                         // If pods match, fall through to determine_event
                     }
-                    ScaleDirection::None => {}
+                    ScaleDirection::ReplicaChange | ScaleDirection::None => {}
                 }
             }
             // Phase-driven transitions return PhaseComplete
