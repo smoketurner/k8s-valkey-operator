@@ -21,6 +21,7 @@ use crate::{
         cluster_phases::{self, ClusterHealthResult, PhaseContext},
         cluster_state_machine::ClusterStateMachine,
         cluster_topology::{ClusterTopology, NodeRole},
+        cluster_validation::validate_spec,
         common::{add_finalizer, extract_pod_name, remove_finalizer},
         context::Context,
         diagnostic_hints::DiagnosticHint,
@@ -767,42 +768,6 @@ pub fn error_policy(obj: Arc<ValkeyCluster>, error: &Error, ctx: Arc<Context>) -
         error!(name = %name, error = %error, "Non-retryable error");
         Action::requeue(std::time::Duration::from_secs(300))
     }
-}
-
-/// Validate the resource spec
-fn validate_spec(obj: &ValkeyCluster) -> Result<(), Error> {
-    // Valkey cluster requires minimum 3 masters for proper quorum
-    if obj.spec.masters < 3 {
-        return Err(Error::Validation(
-            "masters must be at least 3 for cluster quorum".to_string(),
-        ));
-    }
-    if obj.spec.masters > 100 {
-        return Err(Error::Validation("masters cannot exceed 100".to_string()));
-    }
-    if obj.spec.replicas_per_master < 0 {
-        return Err(Error::Validation(
-            "replicasPerMaster cannot be negative".to_string(),
-        ));
-    }
-    if obj.spec.replicas_per_master > 5 {
-        return Err(Error::Validation(
-            "replicasPerMaster cannot exceed 5".to_string(),
-        ));
-    }
-    // TLS is required - validate issuer ref
-    if obj.spec.tls.issuer_ref.name.is_empty() {
-        return Err(Error::Validation(
-            "tls.issuerRef.name is required".to_string(),
-        ));
-    }
-    // Auth is required - validate secret ref
-    if obj.spec.auth.secret_ref.name.is_empty() {
-        return Err(Error::Validation(
-            "auth.secretRef.name is required".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// Handle deletion of a ValkeyCluster
@@ -3011,7 +2976,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
-        assert!(err.to_string().contains("masters must be at least 3"));
+        assert!(err.to_string().contains("below minimum 3"));
     }
 
     #[test]
@@ -3019,12 +2984,7 @@ mod tests {
         let cluster = create_test_cluster("test", 1, 1);
         let result = validate_spec(&cluster);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("masters must be at least 3")
-        );
+        assert!(result.unwrap_err().to_string().contains("below minimum 3"));
     }
 
     #[test]
@@ -3032,12 +2992,7 @@ mod tests {
         let cluster = create_test_cluster("test", 2, 1);
         let result = validate_spec(&cluster);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("masters must be at least 3")
-        );
+        assert!(result.unwrap_err().to_string().contains("below minimum 3"));
     }
 
     #[test]
@@ -3049,7 +3004,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("masters cannot exceed 100")
+                .contains("exceeds maximum 100")
         );
     }
 
@@ -3062,7 +3017,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("replicasPerMaster cannot be negative")
+                .contains("replicas per master cannot be negative")
         );
     }
 
@@ -3075,7 +3030,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("replicasPerMaster cannot exceed 5")
+                .contains("exceeds maximum 5")
         );
     }
 

@@ -21,6 +21,7 @@ use crate::{
     controller::{
         cluster_init::{master_pod_dns_names, replica_pod_dns_names_for_master},
         cluster_reconciler::FIELD_MANAGER,
+        cluster_validation::validate_image_change,
         common::{add_finalizer, extract_pod_name, remove_finalizer},
         context::Context,
         error::Error,
@@ -1970,6 +1971,14 @@ async fn validate_upgrade_spec(
         )));
     }
 
+    // Reject downgrades unless the cluster opted in via image.allowDowngrade
+    // (issue #45). validate_image_change inspects the synthetic "new" spec's
+    // allow_downgrade flag, which mirrors what the cluster currently has set.
+    let target_tag = resolve_target_tag(spec);
+    let mut synthetic_new_spec = cluster.spec.clone();
+    synthetic_new_spec.image.tag = target_tag;
+    validate_image_change(&cluster.spec, &synthetic_new_spec)?;
+
     // Check for concurrent upgrades targeting the same cluster
     // This check is skipped if ctx is None (e.g., in unit tests)
     if let Some(ctx) = ctx {
@@ -2752,6 +2761,54 @@ mod tests {
                 .to_string()
                 .contains("0 replicas per master")
         );
+    }
+
+    // Regression: an upgrade targeting an older version must be rejected when
+    // the cluster has not opted in via image.allowDowngrade (issue #45).
+    // Without this, the CRD's documented gate is ignored and a downgrade would
+    // proceed silently.
+    #[tokio::test]
+    async fn test_validate_upgrade_spec_rejects_downgrade_without_flag() {
+        let mut cluster = create_test_cluster("test", ClusterPhase::Running);
+        cluster.spec.image.tag = "9.0.1-alpine".to_string();
+        cluster.spec.image.allow_downgrade = false;
+        // Target an older version
+        let spec = create_test_upgrade_spec("9.0.0");
+
+        let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
+        assert!(result.is_err(), "downgrade should be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("allowDowngrade"),
+            "error should mention allowDowngrade: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_upgrade_spec_allows_downgrade_with_flag() {
+        let mut cluster = create_test_cluster("test", ClusterPhase::Running);
+        cluster.spec.image.tag = "9.0.1-alpine".to_string();
+        cluster.spec.image.allow_downgrade = true;
+        let spec = create_test_upgrade_spec("9.0.0");
+
+        let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
+        assert!(
+            result.is_ok(),
+            "downgrade with flag should pass: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_upgrade_spec_allows_upgrade_without_flag() {
+        let mut cluster = create_test_cluster("test", ClusterPhase::Running);
+        cluster.spec.image.tag = "9.0.0-alpine".to_string();
+        cluster.spec.image.allow_downgrade = false;
+        let spec = create_test_upgrade_spec("9.0.1");
+
+        let result = validate_upgrade_spec(&spec, &cluster, None, None, "default").await;
+        assert!(result.is_ok(), "upgrade should always pass: {:?}", result);
     }
 
     // ==========================================================================

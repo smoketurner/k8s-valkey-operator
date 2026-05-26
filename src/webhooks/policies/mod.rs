@@ -4,6 +4,7 @@
 //! - Tier 1 (Critical): Always enforced (replica validation)
 //! - Tier 2 (Update): Only enforced on UPDATE operations (immutability, upgrade protection)
 
+pub mod image_change;
 pub mod immutability;
 pub mod replicas;
 pub mod upgrade_protection;
@@ -78,6 +79,12 @@ pub fn validate_all(ctx: &ValidationContext<'_>) -> ValidationResult {
         }
 
         let result = immutability::validate(ctx);
+        if !result.allowed {
+            return result;
+        }
+
+        // Block direct image downgrades unless allow_downgrade is set
+        let result = image_change::validate(ctx);
         if !result.allowed {
             return result;
         }
