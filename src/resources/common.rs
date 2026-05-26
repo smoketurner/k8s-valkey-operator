@@ -17,10 +17,19 @@ use crate::crd::ValkeyCluster;
 /// - `app.kubernetes.io/component`: "valkeycluster"
 /// - `app.kubernetes.io/instance`: The cluster name (for Helm compatibility)
 ///
-/// User-defined labels from the spec are merged in.
+/// User-defined labels from the spec are merged in first, but cannot override
+/// operator-managed standard labels. This protects the pod selector identity
+/// (which always uses the cluster name) from being broken by user input.
 pub fn standard_labels(resource: &ValkeyCluster) -> BTreeMap<String, String> {
     let name = resource.name_any();
-    let mut labels = BTreeMap::new();
+
+    // Start with user-defined labels so operator labels can overwrite them.
+    let mut labels: BTreeMap<String, String> = resource
+        .spec
+        .labels
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     labels.insert("app.kubernetes.io/name".to_string(), name.clone());
     labels.insert("app.kubernetes.io/instance".to_string(), name);
@@ -32,11 +41,6 @@ pub fn standard_labels(resource: &ValkeyCluster) -> BTreeMap<String, String> {
         "app.kubernetes.io/component".to_string(),
         "valkeycluster".to_string(),
     );
-
-    // Merge user-defined labels
-    for (key, value) in &resource.spec.labels {
-        labels.insert(key.clone(), value.clone());
-    }
 
     labels
 }
@@ -176,6 +180,73 @@ mod tests {
         assert_eq!(
             labels.get("app.kubernetes.io/component"),
             Some(&"valkeycluster".to_string())
+        );
+    }
+
+    #[test]
+    fn test_standard_labels_user_cannot_override_operator_labels() {
+        // User attempts to override every operator-managed label.
+        let mut resource = test_resource("my-cluster");
+        resource
+            .spec
+            .labels
+            .insert("app.kubernetes.io/name".to_string(), "evil".to_string());
+        resource.spec.labels.insert(
+            "app.kubernetes.io/instance".to_string(),
+            "evil-instance".to_string(),
+        );
+        resource.spec.labels.insert(
+            "app.kubernetes.io/managed-by".to_string(),
+            "imposter".to_string(),
+        );
+        resource.spec.labels.insert(
+            "app.kubernetes.io/component".to_string(),
+            "not-a-cluster".to_string(),
+        );
+
+        let labels = standard_labels(&resource);
+
+        // Operator labels must win — otherwise the selector/template label
+        // mismatch breaks StatefulSet creation (see issue #51).
+        assert_eq!(
+            labels.get("app.kubernetes.io/name"),
+            Some(&"my-cluster".to_string())
+        );
+        assert_eq!(
+            labels.get("app.kubernetes.io/instance"),
+            Some(&"my-cluster".to_string())
+        );
+        assert_eq!(
+            labels.get("app.kubernetes.io/managed-by"),
+            Some(&"valkey-operator".to_string())
+        );
+        assert_eq!(
+            labels.get("app.kubernetes.io/component"),
+            Some(&"valkeycluster".to_string())
+        );
+    }
+
+    #[test]
+    fn test_standard_labels_user_labels_preserved() {
+        // User-defined non-reserved labels must coexist with operator labels.
+        let mut resource = test_resource("my-cluster");
+        resource
+            .spec
+            .labels
+            .insert("team".to_string(), "platform".to_string());
+        resource
+            .spec
+            .labels
+            .insert("environment".to_string(), "production".to_string());
+
+        let labels = standard_labels(&resource);
+
+        assert_eq!(labels.get("team"), Some(&"platform".to_string()));
+        assert_eq!(labels.get("environment"), Some(&"production".to_string()));
+        // Operator labels still present alongside user labels.
+        assert_eq!(
+            labels.get("app.kubernetes.io/name"),
+            Some(&"my-cluster".to_string())
         );
     }
 
