@@ -20,3 +20,5 @@ kubeconfig
 
 # Test credentials
 config/test/*
+
+.local/
