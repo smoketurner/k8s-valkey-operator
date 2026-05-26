@@ -401,20 +401,27 @@ fn build_valkey_extra_flags(
 
     // Replica health thresholds - secure by default
     // When replicas are configured, require at least 1 replica to acknowledge writes
-    // to prevent silent data loss. Users can explicitly set to 0 to disable.
-    let min_replicas_to_write = resource
+    // to prevent silent data loss. Users can explicitly set a positive value to override.
+    //
+    // ReplicationSpec.min_replicas_to_write uses #[serde(default)] (= 0), so when the
+    // user specifies any other replication field (e.g. disklessSync: true) the field
+    // arrives as Some(0). Treating Some(0) as "user opted out" would bypass the secure
+    // default; instead we apply the default whenever the user did not specify a
+    // positive value.
+    let user_specified = resource
         .spec
         .replication
         .as_ref()
         .map(|r| r.min_replicas_to_write)
-        .unwrap_or_else(|| {
-            // Secure default: require 1 replica ack when replicas exist
-            if resource.spec.replicas_per_master > 0 {
-                1
-            } else {
-                0
-            }
-        });
+        .unwrap_or(0);
+
+    let min_replicas_to_write = if user_specified > 0 {
+        user_specified
+    } else if resource.spec.replicas_per_master > 0 {
+        1
+    } else {
+        0
+    };
 
     let min_replicas_max_lag = resource
         .spec
@@ -846,7 +853,9 @@ fn generate_pvc_template(resource: &ValkeyCluster) -> PersistentVolumeClaim {
 )]
 mod tests {
     use super::*;
-    use crate::crd::{AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyClusterSpec};
+    use crate::crd::{
+        AuthSpec, IssuerRef, ReplicationSpec, SecretKeyRef, TlsSpec, ValkeyClusterSpec,
+    };
 
     fn test_resource(name: &str) -> ValkeyCluster {
         ValkeyCluster {
@@ -928,5 +937,59 @@ mod tests {
         assert_eq!(pvc.metadata.name, Some("data".to_string()));
         let spec = pvc.spec.unwrap();
         assert_eq!(spec.access_modes, Some(vec!["ReadWriteOnce".to_string()]));
+    }
+
+    #[test]
+    fn test_min_replicas_to_write_secure_default_with_replication_block() {
+        // ReplicationSpec.min_replicas_to_write uses #[serde(default)] = 0.
+        // When the user sets any other replication field, min_replicas_to_write
+        // arrives as 0 — the secure default must still apply because the user
+        // did not opt out of write durability explicitly.
+        let mut resource = test_resource("my-cluster");
+        resource.spec.replicas_per_master = 2;
+        resource.spec.replication = Some(ReplicationSpec {
+            diskless_sync: true,
+            min_replicas_to_write: 0,
+            ..Default::default()
+        });
+
+        let flags = build_valkey_extra_flags(&resource, "default", "my-cluster-headless");
+        assert!(
+            flags.contains("--min-replicas-to-write 1"),
+            "expected secure default of 1 to apply, got flags: {flags}"
+        );
+    }
+
+    #[test]
+    fn test_min_replicas_to_write_user_override_wins() {
+        let mut resource = test_resource("my-cluster");
+        resource.spec.replicas_per_master = 2;
+        resource.spec.replication = Some(ReplicationSpec {
+            min_replicas_to_write: 3,
+            ..Default::default()
+        });
+
+        let flags = build_valkey_extra_flags(&resource, "default", "my-cluster-headless");
+        assert!(
+            flags.contains("--min-replicas-to-write 3"),
+            "expected user value 3 to win, got flags: {flags}"
+        );
+        assert!(
+            !flags.contains("--min-replicas-to-write 1"),
+            "secure default must not override explicit user value, got flags: {flags}"
+        );
+    }
+
+    #[test]
+    fn test_min_replicas_to_write_omitted_when_no_replicas() {
+        let mut resource = test_resource("my-cluster");
+        resource.spec.replicas_per_master = 0;
+        resource.spec.replication = None;
+
+        let flags = build_valkey_extra_flags(&resource, "default", "my-cluster-headless");
+        assert!(
+            !flags.contains("--min-replicas-to-write"),
+            "no flag should be emitted when no replicas exist, got flags: {flags}"
+        );
     }
 }
