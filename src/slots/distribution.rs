@@ -53,6 +53,24 @@ impl SlotRange {
     pub fn iter(&self) -> impl Iterator<Item = u16> {
         self.start..=self.end
     }
+
+    /// Parse a slot range from a Valkey CLUSTER NODES token (e.g., "0-5460" or "5461").
+    ///
+    /// Returns `None` for migration-state markers like `[slot-<-node-id]`.
+    pub fn parse_valkey(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.starts_with('[') {
+            return None;
+        }
+        if let Some((start_str, end_str)) = s.split_once('-') {
+            let start: u16 = start_str.parse().ok()?;
+            let end: u16 = end_str.parse().ok()?;
+            Some(Self::new(start, end))
+        } else {
+            let slot: u16 = s.parse().ok()?;
+            Some(Self::single(slot))
+        }
+    }
 }
 
 impl std::fmt::Display for SlotRange {

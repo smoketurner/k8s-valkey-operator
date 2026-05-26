@@ -249,7 +249,7 @@ impl ValkeyClient {
             );
             for range in &master.slots {
                 for slot in range.start..=range.end {
-                    current_ownership.insert(slot as u16, master.node_id.clone());
+                    current_ownership.insert(slot, master.node_id.clone());
                 }
             }
         }
@@ -452,7 +452,7 @@ impl ValkeyClient {
                     target
                         .slots
                         .iter()
-                        .any(|range| range.start <= slot as i32 && range.end >= slot as i32)
+                        .any(|range| range.start <= slot && range.end >= slot)
                 });
 
                 if owns_all_slots {
