@@ -189,7 +189,7 @@ fn default_image_repository() -> String {
 }
 
 fn default_image_tag() -> String {
-    "9.0.1-alpine".to_string()
+    "9.1.0-alpine".to_string()
 }
 
 fn default_image_pull_policy() -> String {
@@ -1216,7 +1216,7 @@ mod tests {
         assert_eq!(spec.masters, 3);
         assert_eq!(spec.replicas_per_master, 1);
         assert_eq!(spec.image.repository, "valkey/valkey");
-        assert_eq!(spec.image.tag, "9.0.1-alpine");
+        assert_eq!(spec.image.tag, "9.1.0-alpine");
         assert!(spec.persistence.enabled);
         assert_eq!(spec.persistence.size, "10Gi");
         assert!(spec.persistence.aof.enabled);

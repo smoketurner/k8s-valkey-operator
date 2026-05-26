@@ -76,7 +76,7 @@ spec:
                       default: "valkey/valkey"
                     tag:
                       type: string
-                      default: "9.0.1-alpine"
+                      default: "9.1.0-alpine"
                     pullPolicy:
                       type: string
                       default: "IfNotPresent"
