@@ -27,9 +27,10 @@ pub fn generate_pod_disruption_budget(resource: &ValkeyCluster) -> PodDisruption
 
     // Calculate maxUnavailable to maintain quorum
     // For Valkey cluster, we need at least half + 1 masters available
-    // maxUnavailable = floor(masters / 2)
+    // maxUnavailable = floor((masters - 1) / 2) preserves majority quorum for
+    // both odd and even master counts (e.g., 6 masters: maxUnavailable=2, so 4 stay alive).
     let masters = resource.spec.masters;
-    let max_unavailable = masters / 2;
+    let max_unavailable = (masters - 1) / 2;
 
     PodDisruptionBudget {
         metadata: ObjectMeta {
@@ -102,7 +103,17 @@ mod tests {
         assert_eq!(pdb.metadata.namespace, Some("default".to_string()));
 
         let spec = pdb.spec.unwrap();
-        // 3 masters: maxUnavailable = 3 / 2 = 1
+        // 3 masters: maxUnavailable = floor((3 - 1) / 2) = 1; keeps 2 of 3 alive
+        assert_eq!(spec.max_unavailable, Some(IntOrString::Int(1)));
+    }
+
+    #[test]
+    fn test_generate_pdb_4_masters() {
+        let resource = test_resource("my-cluster", 4);
+        let pdb = generate_pod_disruption_budget(&resource);
+
+        let spec = pdb.spec.unwrap();
+        // 4 masters: maxUnavailable = floor((4 - 1) / 2) = 1; keeps 3 of 4 alive (majority quorum)
         assert_eq!(spec.max_unavailable, Some(IntOrString::Int(1)));
     }
 
@@ -112,8 +123,8 @@ mod tests {
         let pdb = generate_pod_disruption_budget(&resource);
 
         let spec = pdb.spec.unwrap();
-        // 6 masters: maxUnavailable = 6 / 2 = 3
-        assert_eq!(spec.max_unavailable, Some(IntOrString::Int(3)));
+        // 6 masters: maxUnavailable = floor((6 - 1) / 2) = 2; keeps 4 of 6 alive (majority quorum)
+        assert_eq!(spec.max_unavailable, Some(IntOrString::Int(2)));
     }
 
     #[test]
@@ -122,7 +133,7 @@ mod tests {
         let pdb = generate_pod_disruption_budget(&resource);
 
         let spec = pdb.spec.unwrap();
-        // 9 masters: maxUnavailable = 9 / 2 = 4
+        // 9 masters: maxUnavailable = floor((9 - 1) / 2) = 4; keeps 5 of 9 alive (majority quorum)
         assert_eq!(spec.max_unavailable, Some(IntOrString::Int(4)));
     }
 
