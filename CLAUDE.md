@@ -89,7 +89,10 @@ make clean-all          # Uninstall and clean
 |------|---------|
 | `cluster_state_machine.rs` | Cluster phase transitions and events |
 | `cluster_phases.rs` | Phase handler implementations (`handle_<phase>`) |
-| `cluster_reconciler.rs` | Cluster reconciliation logic |
+| `cluster_reconciler.rs` | Cluster reconciliation entry point and dispatch |
+| `cluster_reconciler/scaling.rs` | Scale-down, slot rebalancing, replica promotion |
+| `cluster_reconciler/deletion.rs` | Cluster deletion and node forgetting |
+| `cluster_reconciler/status.rs` | `StatusUpdate` struct and `ClusterHealthStatus` |
 | `cluster_init.rs` | Initial cluster formation (MEET, ADDSLOTS, REPLICATE) |
 | `cluster_topology.rs` | `ClusterTopology` struct correlating pods to Valkey nodes |
 | `cluster_validation.rs` | Spec validation logic |
