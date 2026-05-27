@@ -42,7 +42,7 @@ spec:
 spec:
   image:
     repository: "valkey/valkey"    # Default
-    tag: "9.0.1-alpine"            # Default
+    tag: "9.1.0-alpine"            # Default
     pullPolicy: "IfNotPresent"     # Always, IfNotPresent, Never
     pullSecrets:                   # Optional
       - my-registry-secret
@@ -459,7 +459,7 @@ spec:
   # Image
   image:
     repository: valkey/valkey
-    tag: "9.0.1-alpine"
+    tag: "9.1.0-alpine"
     pullPolicy: IfNotPresent
 
   # TLS (required)
