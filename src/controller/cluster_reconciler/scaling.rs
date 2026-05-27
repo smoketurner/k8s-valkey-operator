@@ -619,10 +619,7 @@ fn owns_all_slots_in_range(slot_ranges: &[crate::client::SlotRange], start: u16,
         return false;
     }
 
-    let mut sorted_ranges: Vec<_> = slot_ranges
-        .iter()
-        .map(|r| (r.start, r.end))
-        .collect();
+    let mut sorted_ranges: Vec<_> = slot_ranges.iter().map(|r| (r.start, r.end)).collect();
     sorted_ranges.sort_by_key(|r| r.0);
 
     let mut current = start;

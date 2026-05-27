@@ -264,12 +264,8 @@ impl OperationLock {
             }
         });
 
-        api.patch(
-            &lease_name,
-            &PatchParams::default(),
-            &Patch::Merge(&patch),
-        )
-        .await?;
+        api.patch(&lease_name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
 
         debug!(
             cluster = %self.cluster_name,

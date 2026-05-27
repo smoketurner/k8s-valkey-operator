@@ -123,12 +123,8 @@ pub async fn start_operation(
         }
     });
 
-    api.patch_status(
-        cluster_name,
-        &PatchParams::default(),
-        &Patch::Merge(&patch),
-    )
-    .await?;
+    api.patch_status(cluster_name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
 
     info!(
         cluster = %cluster_name,
@@ -163,12 +159,8 @@ pub async fn complete_operation(
                 }
             });
 
-            api.patch_status(
-                cluster_name,
-                &PatchParams::default(),
-                &Patch::Merge(&patch),
-            )
-            .await?;
+            api.patch_status(cluster_name, &PatchParams::default(), &Patch::Merge(&patch))
+                .await?;
 
             info!(
                 cluster = %cluster_name,
