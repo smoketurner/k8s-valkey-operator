@@ -479,7 +479,7 @@ pub async fn assign_slots_to_masters(
     for master in cluster_nodes.masters() {
         for slot_range in &master.slots {
             for slot in slot_range.start..=slot_range.end {
-                assigned_slots.insert(slot as u16);
+                assigned_slots.insert(slot);
             }
         }
     }

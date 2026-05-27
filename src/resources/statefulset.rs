@@ -346,8 +346,17 @@ fn build_valkey_extra_flags(
     namespace: &str,
     headless_svc: &str,
 ) -> String {
-    let mut flags = vec![
-        // Cluster mode
+    let mut flags = base_cluster_flags();
+    append_replication_flags(resource, &mut flags);
+    append_min_replicas_flags(resource, &mut flags);
+    append_acl_flags(resource, &mut flags);
+    append_tls_flags(namespace, headless_svc, &mut flags);
+    flags.join(" ")
+}
+
+/// Static cluster, persistence, bind, auth, and memory flags.
+fn base_cluster_flags() -> Vec<String> {
+    vec![
         "--cluster-enabled yes".to_string(),
         "--cluster-config-file /data/nodes.conf".to_string(),
         "--cluster-node-timeout 5000".to_string(),
@@ -362,52 +371,42 @@ fn build_valkey_extra_flags(
         "--cluster-migration-barrier 1".to_string(),
         // Don't allow reads when cluster is down (consistency over availability)
         "--cluster-allow-reads-when-down no".to_string(),
-        // Persistence
         "--appendonly yes".to_string(),
         "--appendfsync everysec".to_string(),
         // RDB snapshots for backup redundancy (in addition to AOF)
-        // Save if at least 1 key changed in 900 seconds (15 minutes)
         "--save 900 1".to_string(),
-        // Save if at least 10 keys changed in 300 seconds (5 minutes)
         "--save 300 10".to_string(),
-        // Save if at least 10000 keys changed in 60 seconds (1 minute)
         "--save 60 10000".to_string(),
-        // Bind to all interfaces
         "--bind 0.0.0.0".to_string(),
-        // Authentication
         "--requirepass $(VALKEY_PASSWORD)".to_string(),
         "--masterauth $(VALKEY_PASSWORD)".to_string(),
-        // Memory management - prevent OOM
-        // Note: maxmemory should be set based on resource limits, but we don't have
-        // that info here. Consider adding it to the CRD spec or calculating from
-        // resource requests/limits. For now, we'll set a reasonable default.
-        // maxmemory-policy: evict least recently used keys when memory limit reached
         "--maxmemory-policy allkeys-lru".to_string(),
-    ];
+    ]
+}
 
-    // Replication configuration
-    if let Some(replication) = &resource.spec.replication {
-        // Diskless sync configuration
-        if replication.diskless_sync {
-            flags.push("--repl-diskless-sync yes".to_string());
-            flags.push(format!(
-                "--repl-diskless-sync-delay {}",
-                replication.diskless_sync_delay
-            ));
-        } else {
-            flags.push("--repl-diskless-sync no".to_string());
-        }
+/// Append diskless-sync replication flags if the replication spec is set.
+fn append_replication_flags(resource: &ValkeyCluster, flags: &mut Vec<String>) {
+    let Some(replication) = &resource.spec.replication else {
+        return;
+    };
+    if replication.diskless_sync {
+        flags.push("--repl-diskless-sync yes".to_string());
+        flags.push(format!(
+            "--repl-diskless-sync-delay {}",
+            replication.diskless_sync_delay
+        ));
+    } else {
+        flags.push("--repl-diskless-sync no".to_string());
     }
+}
 
-    // Replica health thresholds - secure by default
-    // When replicas are configured, require at least 1 replica to acknowledge writes
-    // to prevent silent data loss. Users can explicitly set a positive value to override.
-    //
-    // ReplicationSpec.min_replicas_to_write uses #[serde(default)] (= 0), so when the
-    // user specifies any other replication field (e.g. disklessSync: true) the field
-    // arrives as Some(0). Treating Some(0) as "user opted out" would bypass the secure
-    // default; instead we apply the default whenever the user did not specify a
-    // positive value.
+/// Append min-replicas-to-write / min-replicas-max-lag flags.
+///
+/// Secure-by-default: when replicas exist and the user has not set a positive
+/// min_replicas_to_write, defaults to 1 to prevent silent data loss.
+/// See: ReplicationSpec.min_replicas_to_write uses #[serde(default)] (= 0),
+/// so Some(0) means "not explicitly set", not "user opted out".
+fn append_min_replicas_flags(resource: &ValkeyCluster, flags: &mut Vec<String>) {
     let user_specified = resource
         .spec
         .replication
@@ -423,6 +422,10 @@ fn build_valkey_extra_flags(
         0
     };
 
+    if min_replicas_to_write == 0 {
+        return;
+    }
+
     let min_replicas_max_lag = resource
         .spec
         .replication
@@ -430,20 +433,22 @@ fn build_valkey_extra_flags(
         .map(|r| r.min_replicas_max_lag)
         .unwrap_or(10);
 
-    if min_replicas_to_write > 0 {
-        flags.push(format!("--min-replicas-to-write {}", min_replicas_to_write));
-        flags.push(format!("--min-replicas-max-lag {}", min_replicas_max_lag));
-    }
+    flags.push(format!("--min-replicas-to-write {}", min_replicas_to_write));
+    flags.push(format!("--min-replicas-max-lag {}", min_replicas_max_lag));
+}
 
-    // ACL configuration
+/// Append ACL file flag if ACL is enabled and a config secret is provided.
+fn append_acl_flags(resource: &ValkeyCluster, flags: &mut Vec<String>) {
     if let Some(acl) = &resource.spec.auth.acl
         && acl.enabled
         && acl.config_secret_ref.is_some()
     {
         flags.push("--aclfile /etc/valkey/acl/acl.conf".to_string());
     }
+}
 
-    // TLS configuration
+/// Append TLS flags and the cluster-announce-hostname flag.
+fn append_tls_flags(namespace: &str, headless_svc: &str, flags: &mut Vec<String>) {
     flags.push("--tls-port 6379".to_string());
     flags.push("--port 0".to_string()); // Disable non-TLS port
     flags.push("--tls-cluster yes".to_string());
@@ -453,15 +458,11 @@ fn build_valkey_extra_flags(
     flags.push("--tls-ca-cert-file /etc/valkey/certs/ca.crt".to_string());
     // Allow clients without TLS certs (server-only TLS)
     flags.push("--tls-auth-clients optional".to_string());
-
-    // Announce the cluster-accessible hostname
     // Format: $(POD_NAME).{headless_svc}.{namespace}.svc.cluster.local
     flags.push(format!(
         "--cluster-announce-hostname $(POD_NAME).{}.{}.svc.cluster.local",
         headless_svc, namespace
     ));
-
-    flags.join(" ")
 }
 
 /// Generate resource requirements from the spec.
@@ -614,20 +615,51 @@ fn generate_metrics_exporter_container(resource: &ValkeyCluster) -> Option<Conta
 
     let port = exporter_spec.port;
     let default_resources = ExporterResourcesSpec::default();
-    let resources = exporter_spec
+    let exporter_resources = exporter_spec
         .resources
         .as_ref()
         .unwrap_or(&default_resources);
 
-    // Build environment variables for the exporter
+    Some(Container {
+        name: "metrics-exporter".to_string(),
+        image: Some(exporter_spec.image.clone()),
+        image_pull_policy: Some("IfNotPresent".to_string()),
+        ports: Some(vec![ContainerPort {
+            container_port: port,
+            name: Some("metrics".to_string()),
+            protocol: Some("TCP".to_string()),
+            ..Default::default()
+        }]),
+        env: Some(build_exporter_env_vars(resource, exporter_spec)),
+        resources: Some(build_exporter_resource_requirements(exporter_resources)),
+        security_context: Some(SecurityContext {
+            allow_privilege_escalation: Some(false),
+            read_only_root_filesystem: Some(true),
+            run_as_non_root: Some(true),
+            run_as_user: Some(VALKEY_USER_ID),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        liveness_probe: Some(build_exporter_http_probe(port, 10, 30)),
+        readiness_probe: Some(build_exporter_http_probe(port, 5, 10)),
+        ..Default::default()
+    })
+}
+
+/// Build environment variables for the metrics exporter container.
+fn build_exporter_env_vars(
+    resource: &ValkeyCluster,
+    exporter_spec: &crate::crd::MetricsExporterSpec,
+) -> Vec<EnvVar> {
     let mut env = vec![
-        // Valkey connection URL with TLS
         EnvVar {
             name: "REDIS_ADDR".to_string(),
             value: Some("rediss://localhost:6379".to_string()),
             ..Default::default()
         },
-        // Password from secret
         EnvVar {
             name: "REDIS_PASSWORD".to_string(),
             value_from: Some(EnvVarSource {
@@ -640,13 +672,11 @@ fn generate_metrics_exporter_container(resource: &ValkeyCluster) -> Option<Conta
             }),
             ..Default::default()
         },
-        // Skip TLS verification for localhost
         EnvVar {
             name: "REDIS_EXPORTER_SKIP_TLS_VERIFICATION".to_string(),
             value: Some("true".to_string()),
             ..Default::default()
         },
-        // Disable checking keys for performance
         EnvVar {
             name: "REDIS_EXPORTER_CHECK_KEYS".to_string(),
             value: Some("".to_string()),
@@ -654,7 +684,6 @@ fn generate_metrics_exporter_container(resource: &ValkeyCluster) -> Option<Conta
         },
     ];
 
-    // Add user-defined environment variables
     for (key, value) in &exporter_spec.extra_env {
         env.push(EnvVar {
             name: key.clone(),
@@ -663,76 +692,48 @@ fn generate_metrics_exporter_container(resource: &ValkeyCluster) -> Option<Conta
         });
     }
 
-    Some(Container {
-        name: "metrics-exporter".to_string(),
-        image: Some(exporter_spec.image.clone()),
-        image_pull_policy: Some("IfNotPresent".to_string()),
-        ports: Some(vec![ContainerPort {
-            container_port: port,
-            name: Some("metrics".to_string()),
-            protocol: Some("TCP".to_string()),
-            ..Default::default()
-        }]),
-        env: Some(env),
-        resources: Some(ResourceRequirements {
-            limits: Some({
-                let mut limits = BTreeMap::new();
-                limits.insert("cpu".to_string(), Quantity(resources.cpu_limit.clone()));
-                limits.insert(
-                    "memory".to_string(),
-                    Quantity(resources.memory_limit.clone()),
-                );
-                limits
-            }),
-            requests: Some({
-                let mut requests = BTreeMap::new();
-                requests.insert("cpu".to_string(), Quantity(resources.cpu_request.clone()));
-                requests.insert(
-                    "memory".to_string(),
-                    Quantity(resources.memory_request.clone()),
-                );
-                requests
-            }),
-            ..Default::default()
+    env
+}
+
+/// Build resource requirements for the metrics exporter from its resource spec.
+fn build_exporter_resource_requirements(resources: &ExporterResourcesSpec) -> ResourceRequirements {
+    ResourceRequirements {
+        limits: Some({
+            let mut limits = BTreeMap::new();
+            limits.insert("cpu".to_string(), Quantity(resources.cpu_limit.clone()));
+            limits.insert(
+                "memory".to_string(),
+                Quantity(resources.memory_limit.clone()),
+            );
+            limits
         }),
-        security_context: Some(SecurityContext {
-            allow_privilege_escalation: Some(false),
-            read_only_root_filesystem: Some(true),
-            run_as_non_root: Some(true),
-            run_as_user: Some(VALKEY_USER_ID),
-            capabilities: Some(Capabilities {
-                drop: Some(vec!["ALL".to_string()]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        // Simple liveness/readiness probes for the exporter
-        liveness_probe: Some(Probe {
-            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                path: Some("/health".to_string()),
-                port: IntOrString::Int(port),
-                ..Default::default()
-            }),
-            initial_delay_seconds: Some(10),
-            period_seconds: Some(30),
-            timeout_seconds: Some(5),
-            failure_threshold: Some(3),
-            ..Default::default()
-        }),
-        readiness_probe: Some(Probe {
-            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                path: Some("/health".to_string()),
-                port: IntOrString::Int(port),
-                ..Default::default()
-            }),
-            initial_delay_seconds: Some(5),
-            period_seconds: Some(10),
-            timeout_seconds: Some(5),
-            failure_threshold: Some(3),
-            ..Default::default()
+        requests: Some({
+            let mut requests = BTreeMap::new();
+            requests.insert("cpu".to_string(), Quantity(resources.cpu_request.clone()));
+            requests.insert(
+                "memory".to_string(),
+                Quantity(resources.memory_request.clone()),
+            );
+            requests
         }),
         ..Default::default()
-    })
+    }
+}
+
+/// Build an HTTP health probe for the metrics exporter.
+fn build_exporter_http_probe(port: i32, initial_delay: i32, period: i32) -> Probe {
+    Probe {
+        http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
+            path: Some("/health".to_string()),
+            port: IntOrString::Int(port),
+            ..Default::default()
+        }),
+        initial_delay_seconds: Some(initial_delay),
+        period_seconds: Some(period),
+        timeout_seconds: Some(5),
+        failure_threshold: Some(3),
+        ..Default::default()
+    }
 }
 
 /// Generate volumes for the pod.

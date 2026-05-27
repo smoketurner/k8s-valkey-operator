@@ -24,40 +24,8 @@ use crate::crd::ValkeyCluster;
 /// If the operator crashes, the lock will be released after this time.
 const LEASE_DURATION_SECONDS: i32 = 300; // 5 minutes
 
-/// Types of operations that can be performed on a cluster.
-/// These are stored as the lease holder identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperationType {
-    /// Cluster initialization (CLUSTER MEET, slot assignment, replica setup).
-    Initializing,
-    /// Scaling operation (adding/removing nodes, slot migration).
-    Scaling,
-    /// Upgrade operation (rolling upgrade with failover).
-    Upgrading,
-}
-
-impl std::fmt::Display for OperationType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OperationType::Initializing => write!(f, "initializing"),
-            OperationType::Scaling => write!(f, "scaling"),
-            OperationType::Upgrading => write!(f, "upgrading"),
-        }
-    }
-}
-
-impl std::str::FromStr for OperationType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "initializing" => Ok(OperationType::Initializing),
-            "scaling" => Ok(OperationType::Scaling),
-            "upgrading" => Ok(OperationType::Upgrading),
-            _ => Err(format!("Unknown operation type: {}", s)),
-        }
-    }
-}
+// Re-export the canonical OperationType from operation_coordination.
+pub use crate::controller::operation_coordination::OperationType;
 
 /// Operation lock using Kubernetes Lease resources.
 ///
@@ -296,12 +264,8 @@ impl OperationLock {
             }
         });
 
-        api.patch(
-            &lease_name,
-            &PatchParams::apply(FIELD_MANAGER),
-            &Patch::Merge(&patch),
-        )
-        .await?;
+        api.patch(&lease_name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
 
         debug!(
             cluster = %self.cluster_name,
