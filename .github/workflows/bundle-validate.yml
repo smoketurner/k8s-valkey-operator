@@ -1,0 +1,65 @@
+name: Bundle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bundle/**'
+      - 'bundle.Dockerfile'
+      - 'config/crd/**'
+      - 'config/rbac/**'
+      - 'config/deploy/**'
+      - 'src/crd/**'
+      - '.github/workflows/bundle-validate.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'bundle/**'
+      - 'bundle.Dockerfile'
+      - 'config/crd/**'
+      - 'config/rbac/**'
+      - 'config/deploy/**'
+      - 'src/crd/**'
+      - '.github/workflows/bundle-validate.yml'
+
+env:
+  OPERATOR_SDK_VERSION: v1.43.0
+
+jobs:
+  validate:
+    name: Validate OLM Bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install operator-sdk
+        run: |
+          set -euo pipefail
+          curl -fsSL -o operator-sdk \
+            "https://github.com/operator-framework/operator-sdk/releases/download/${OPERATOR_SDK_VERSION}/operator-sdk_linux_amd64"
+          curl -fsSL -o checksums.txt \
+            "https://github.com/operator-framework/operator-sdk/releases/download/${OPERATOR_SDK_VERSION}/checksums.txt"
+          # Pull the published checksum for our binary and verify.
+          grep " operator-sdk_linux_amd64$" checksums.txt | awk '{print $1"  operator-sdk"}' > expected.sha256
+          sha256sum --check expected.sha256
+          chmod +x operator-sdk
+          sudo mv operator-sdk /usr/local/bin/operator-sdk
+          operator-sdk version
+
+      - name: Sync bundle manifests from config/
+        run: make bundle-sync
+
+      - name: Detect drift between config/ and bundle/manifests/
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- bundle/manifests/; then
+            echo "::error::bundle/manifests/ is out of sync with config/. Run 'make bundle-sync' and commit the result."
+            git diff -- bundle/manifests/
+            exit 1
+          fi
+
+      - name: Validate bundle
+        run: make bundle-validate
+
+      - name: Build bundle image
+        run: make bundle-build BUNDLE_IMG=valkey-operator-bundle:ci
