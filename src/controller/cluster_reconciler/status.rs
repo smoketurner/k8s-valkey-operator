@@ -7,7 +7,7 @@ use kube::{
 use tracing::debug;
 
 use crate::{
-    controller::error::Error,
+    controller::{error::Error, tls_status::TlsObservation},
     crd::{
         ClusterPhase, Condition, ValkeyCluster, ValkeyClusterStatus, new_condition, total_pods,
         tri_state_condition,
@@ -46,24 +46,6 @@ fn is_degraded(phase: ClusterPhase, ready_pods: i32, desired_pods: i32) -> bool 
     phase == ClusterPhase::Degraded
         || phase == ClusterPhase::Failed
         || (phase == ClusterPhase::Running && ready_pods < desired_pods)
-}
-
-fn is_cluster_formed(phase: ClusterPhase) -> bool {
-    !matches!(
-        phase,
-        ClusterPhase::Pending
-            | ClusterPhase::Creating
-            | ClusterPhase::WaitingForPods
-            | ClusterPhase::InitializingCluster
-    )
-}
-
-fn slots_are_assigned(phase: ClusterPhase) -> bool {
-    is_cluster_formed(phase)
-        && !matches!(
-            phase,
-            ClusterPhase::AssigningSlots | ClusterPhase::EvacuatingSlots
-        )
 }
 
 fn slots_are_stable(phase: ClusterPhase) -> bool {
@@ -122,11 +104,11 @@ fn ready_reason(phase: ClusterPhase) -> (&'static str, &'static str) {
 
 /// Derive the canonical condition set for a ValkeyCluster.
 ///
-/// Five phase-and-pod-count-driven conditions (`Ready`, `Progressing`,
-/// `Degraded`, `ClusterFormed`, `SlotsAssigned`, `SlotsStable`) plus two
-/// tri-state observation-driven conditions (`ClusterHealthy`,
-/// `ReplicasInSync`). The tri-state conditions use status `"Unknown"` when
-/// `health_status` is `None` (no observation this reconcile).
+/// Three phase-driven conditions (`Ready`, `Progressing`, `Degraded`), one
+/// phase-driven slot-migration signal (`SlotsStable`), and two tri-state
+/// observation-driven conditions (`ReplicasInSync`, `TLSReady`). Tri-state
+/// conditions use status `"Unknown"` when the operator has no observation
+/// for them this reconcile.
 ///
 /// # Example
 ///
@@ -134,9 +116,9 @@ fn ready_reason(phase: ClusterPhase) -> (&'static str, &'static str) {
 /// use valkey_operator::controller::cluster_reconciler::derive_cluster_conditions;
 /// use valkey_operator::crd::ClusterPhase;
 ///
-/// let conditions = derive_cluster_conditions(ClusterPhase::Running, 6, 6, Some(1), None);
+/// let conditions = derive_cluster_conditions(ClusterPhase::Running, 6, 6, Some(1), None, None);
 /// assert!(conditions.iter().any(|c| c.type_ == "Ready" && c.status == "True"));
-/// assert!(conditions.iter().any(|c| c.type_ == "ClusterHealthy" && c.status == "Unknown"));
+/// assert!(conditions.iter().any(|c| c.type_ == "TLSReady" && c.status == "Unknown"));
 /// ```
 pub fn derive_cluster_conditions(
     phase: ClusterPhase,
@@ -144,14 +126,12 @@ pub fn derive_cluster_conditions(
     desired_pods: i32,
     generation: Option<i64>,
     health_status: Option<&ClusterHealthStatus>,
+    tls: Option<&TlsObservation>,
 ) -> Vec<Condition> {
     let ready = phase == ClusterPhase::Running && ready_pods == desired_pods && desired_pods > 0;
     let progressing = is_progressing(phase);
     let degraded = is_degraded(phase, ready_pods, desired_pods);
-    let cluster_formed = is_cluster_formed(phase);
-    let slots_assigned = slots_are_assigned(phase);
     let slots_stable = slots_are_stable(phase);
-    let cluster_healthy = health_status.map(|h| h.is_healthy);
     let replicas_in_sync = health_status
         .and_then(|h| h.max_replica_lag)
         .map(|lag| lag < REPLICATION_LAG_TOLERANCE_BYTES);
@@ -162,6 +142,15 @@ pub fn derive_cluster_conditions(
         )
     } else {
         ready_reason(phase)
+    };
+
+    let (tls_ready, tls_reason, tls_message) = match tls {
+        Some(obs) => (obs.ready, obs.reason, obs.message.clone()),
+        None => (
+            None,
+            "NotObserved",
+            "TLS certificate has not been observed this reconcile.".to_string(),
+        ),
     };
 
     vec![
@@ -197,36 +186,6 @@ pub fn derive_cluster_conditions(
             generation,
         ),
         new_condition(
-            "ClusterFormed",
-            cluster_formed,
-            if cluster_formed {
-                "ClusterFormed"
-            } else {
-                "ClusterNotFormed"
-            },
-            if cluster_formed {
-                "Cluster nodes have been connected via CLUSTER MEET."
-            } else {
-                "Cluster nodes have not yet been connected."
-            },
-            generation,
-        ),
-        new_condition(
-            "SlotsAssigned",
-            slots_assigned,
-            if slots_assigned {
-                "SlotsAssigned"
-            } else {
-                "SlotsNotAssigned"
-            },
-            if slots_assigned {
-                "All 16384 hash slots have been assigned."
-            } else {
-                "Hash slots have not yet been fully assigned."
-            },
-            generation,
-        ),
-        new_condition(
             "SlotsStable",
             slots_stable,
             if slots_stable {
@@ -238,21 +197,6 @@ pub fn derive_cluster_conditions(
                 "No slot migration is in progress."
             } else {
                 "Slot migration is in progress."
-            },
-            generation,
-        ),
-        tri_state_condition(
-            "ClusterHealthy",
-            cluster_healthy,
-            match cluster_healthy {
-                Some(true) => "ClusterHealthy",
-                Some(false) => "ClusterUnhealthy",
-                None => "NotObserved",
-            },
-            match cluster_healthy {
-                Some(true) => "Cluster reports state=ok and all expected masters are reachable.",
-                Some(false) => "Cluster reports state=fail or has unreachable masters.",
-                None => "Cluster health has not been observed this reconcile.",
             },
             generation,
         ),
@@ -271,6 +215,7 @@ pub fn derive_cluster_conditions(
             },
             generation,
         ),
+        tri_state_condition("TLSReady", tls_ready, tls_reason, &tls_message, generation),
     ]
 }
 
@@ -332,6 +277,7 @@ pub(crate) struct StatusUpdate<'a> {
     pub(crate) ready_replicas: i32,
     pub(crate) error_message: Option<&'a str>,
     pub(crate) health_status: Option<&'a ClusterHealthStatus>,
+    pub(crate) tls: Option<&'a TlsObservation>,
     /// The generation captured at reconcile start — prevents racing against concurrent spec changes.
     pub(crate) generation: Option<i64>,
 }
@@ -356,6 +302,7 @@ impl<'a> StatusUpdate<'a> {
             desired_replicas,
             generation,
             self.health_status,
+            self.tls,
         );
         let conditions = merge_conditions(existing_conditions, new_conditions);
 
@@ -525,19 +472,17 @@ mod tests {
 
     #[test]
     fn test_running_all_ready() {
-        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, Some(1), None);
-        assert_eq!(c.len(), 8);
+        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, Some(1), None, None);
+        assert_eq!(c.len(), 6);
         assert_true(&c, "Ready");
         assert_false(&c, "Progressing");
         assert_false(&c, "Degraded");
-        assert_true(&c, "ClusterFormed");
-        assert_true(&c, "SlotsAssigned");
         assert_true(&c, "SlotsStable");
     }
 
     #[test]
     fn test_running_pods_not_ready() {
-        let c = derive_cluster_conditions(ClusterPhase::Running, 4, 6, Some(1), None);
+        let c = derive_cluster_conditions(ClusterPhase::Running, 4, 6, Some(1), None, None);
         assert_false(&c, "Ready");
         assert_false(&c, "Progressing");
         assert_true(&c, "Degraded");
@@ -545,134 +490,133 @@ mod tests {
 
     #[test]
     fn test_pending() {
-        let c = derive_cluster_conditions(ClusterPhase::Pending, 0, 6, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::Pending, 0, 6, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
         assert_false(&c, "Degraded");
-        assert_false(&c, "ClusterFormed");
-        assert_false(&c, "SlotsAssigned");
     }
 
     #[test]
     fn test_creating() {
-        let c = derive_cluster_conditions(ClusterPhase::Creating, 0, 6, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::Creating, 0, 6, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
-        assert_false(&c, "ClusterFormed");
-        assert_false(&c, "SlotsAssigned");
     }
 
     #[test]
     fn test_waiting_for_pods() {
-        let c = derive_cluster_conditions(ClusterPhase::WaitingForPods, 0, 6, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::WaitingForPods, 0, 6, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
-        assert_false(&c, "ClusterFormed");
-        assert_false(&c, "SlotsAssigned");
     }
 
     #[test]
     fn test_initializing_cluster() {
-        let c = derive_cluster_conditions(ClusterPhase::InitializingCluster, 6, 6, None, None);
+        let c =
+            derive_cluster_conditions(ClusterPhase::InitializingCluster, 6, 6, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
-        assert_false(&c, "ClusterFormed");
-        assert_false(&c, "SlotsAssigned");
     }
 
     #[test]
     fn test_assigning_slots() {
-        let c = derive_cluster_conditions(ClusterPhase::AssigningSlots, 6, 6, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::AssigningSlots, 6, 6, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
-        assert_true(&c, "ClusterFormed");
-        assert_false(&c, "SlotsAssigned");
     }
 
     #[test]
     fn test_configuring_replicas() {
-        let c = derive_cluster_conditions(ClusterPhase::ConfiguringReplicas, 6, 6, None, None);
+        let c =
+            derive_cluster_conditions(ClusterPhase::ConfiguringReplicas, 6, 6, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
-        assert_true(&c, "ClusterFormed");
-        assert_true(&c, "SlotsAssigned");
     }
 
     #[test]
     fn test_scaling_up_statefulset() {
-        let c = derive_cluster_conditions(ClusterPhase::ScalingUpStatefulSet, 6, 12, None, None);
+        let c =
+            derive_cluster_conditions(ClusterPhase::ScalingUpStatefulSet, 6, 12, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
-        assert_true(&c, "ClusterFormed");
-        assert_true(&c, "SlotsAssigned");
     }
 
     #[test]
     fn test_waiting_for_new_pods() {
-        let c = derive_cluster_conditions(ClusterPhase::WaitingForNewPods, 6, 12, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::WaitingForNewPods, 6, 12, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
     }
 
     #[test]
     fn test_adding_nodes_to_cluster() {
-        let c = derive_cluster_conditions(ClusterPhase::AddingNodesToCluster, 12, 12, None, None);
+        let c =
+            derive_cluster_conditions(ClusterPhase::AddingNodesToCluster, 12, 12, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
     }
 
     #[test]
     fn test_rebalancing_slots() {
-        let c = derive_cluster_conditions(ClusterPhase::RebalancingSlots, 12, 12, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::RebalancingSlots, 12, 12, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
     }
 
     #[test]
     fn test_configuring_new_replicas() {
-        let c = derive_cluster_conditions(ClusterPhase::ConfiguringNewReplicas, 12, 12, None, None);
+        let c = derive_cluster_conditions(
+            ClusterPhase::ConfiguringNewReplicas,
+            12,
+            12,
+            None,
+            None,
+            None,
+        );
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
     }
 
     #[test]
     fn test_evacuating_slots() {
-        let c = derive_cluster_conditions(ClusterPhase::EvacuatingSlots, 12, 12, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::EvacuatingSlots, 12, 12, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
-        assert_true(&c, "ClusterFormed");
-        assert_false(&c, "SlotsAssigned");
     }
 
     #[test]
     fn test_removing_nodes_from_cluster() {
-        let c =
-            derive_cluster_conditions(ClusterPhase::RemovingNodesFromCluster, 12, 12, None, None);
+        let c = derive_cluster_conditions(
+            ClusterPhase::RemovingNodesFromCluster,
+            12,
+            12,
+            None,
+            None,
+            None,
+        );
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
-        assert_true(&c, "ClusterFormed");
-        assert_true(&c, "SlotsAssigned");
     }
 
     #[test]
     fn test_scaling_down_statefulset() {
-        let c = derive_cluster_conditions(ClusterPhase::ScalingDownStatefulSet, 6, 6, None, None);
+        let c =
+            derive_cluster_conditions(ClusterPhase::ScalingDownStatefulSet, 6, 6, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
     }
 
     #[test]
     fn test_verifying_cluster_health() {
-        let c = derive_cluster_conditions(ClusterPhase::VerifyingClusterHealth, 6, 6, None, None);
+        let c =
+            derive_cluster_conditions(ClusterPhase::VerifyingClusterHealth, 6, 6, None, None, None);
         assert_false(&c, "Ready");
         assert_true(&c, "Progressing");
-        assert_true(&c, "ClusterFormed");
-        assert_true(&c, "SlotsAssigned");
     }
 
     #[test]
     fn test_degraded() {
-        let c = derive_cluster_conditions(ClusterPhase::Degraded, 4, 6, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::Degraded, 4, 6, None, None, None);
         assert_false(&c, "Ready");
         assert_false(&c, "Progressing");
         assert_true(&c, "Degraded");
@@ -680,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_failed() {
-        let c = derive_cluster_conditions(ClusterPhase::Failed, 0, 6, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::Failed, 0, 6, None, None, None);
         assert_false(&c, "Ready");
         assert_false(&c, "Progressing");
         assert_true(&c, "Degraded");
@@ -688,14 +632,14 @@ mod tests {
 
     #[test]
     fn test_deleting() {
-        let c = derive_cluster_conditions(ClusterPhase::Deleting, 0, 0, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::Deleting, 0, 0, None, None, None);
         assert_false(&c, "Ready");
         assert_false(&c, "Progressing");
     }
 
     #[test]
     fn test_running_desired_zero_not_ready() {
-        let c = derive_cluster_conditions(ClusterPhase::Running, 0, 0, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::Running, 0, 0, None, None, None);
         assert_false(&c, "Ready");
     }
 
@@ -796,45 +740,25 @@ mod tests {
 
     #[test]
     fn test_slots_stable_during_rebalance_is_false() {
-        let c = derive_cluster_conditions(ClusterPhase::RebalancingSlots, 12, 12, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::RebalancingSlots, 12, 12, None, None, None);
         assert_false(&c, "SlotsStable");
     }
 
     #[test]
     fn test_slots_stable_during_evacuation_is_false() {
-        let c = derive_cluster_conditions(ClusterPhase::EvacuatingSlots, 12, 12, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::EvacuatingSlots, 12, 12, None, None, None);
         assert_false(&c, "SlotsStable");
     }
 
     #[test]
     fn test_slots_stable_in_steady_state_is_true() {
-        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, None, None);
         assert_true(&c, "SlotsStable");
     }
 
     #[test]
-    fn test_cluster_healthy_unknown_when_no_observation() {
-        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, None);
-        assert_eq!(find_condition(&c, "ClusterHealthy").status, "Unknown");
-    }
-
-    #[test]
-    fn test_cluster_healthy_true_when_observed_healthy() {
-        let h = healthy();
-        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, Some(&h));
-        assert_true(&c, "ClusterHealthy");
-    }
-
-    #[test]
-    fn test_cluster_healthy_false_when_observed_unhealthy() {
-        let h = unhealthy_with_lag(0);
-        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, Some(&h));
-        assert_false(&c, "ClusterHealthy");
-    }
-
-    #[test]
     fn test_replicas_in_sync_unknown_when_no_observation() {
-        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, None);
+        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, None, None);
         assert_eq!(find_condition(&c, "ReplicasInSync").status, "Unknown");
     }
 
@@ -842,14 +766,14 @@ mod tests {
     fn test_replicas_in_sync_unknown_when_no_lag_observed() {
         let mut h = healthy();
         h.max_replica_lag = None;
-        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, Some(&h));
+        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, Some(&h), None);
         assert_eq!(find_condition(&c, "ReplicasInSync").status, "Unknown");
     }
 
     #[test]
     fn test_replicas_in_sync_true_below_threshold() {
         let h = healthy();
-        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, Some(&h));
+        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, Some(&h), None);
         assert_true(&c, "ReplicasInSync");
     }
 
@@ -857,7 +781,7 @@ mod tests {
     fn test_replicas_in_sync_true_just_below_threshold() {
         let mut h = healthy();
         h.max_replica_lag = Some(REPLICATION_LAG_TOLERANCE_BYTES - 1);
-        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, Some(&h));
+        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, Some(&h), None);
         assert_true(&c, "ReplicasInSync");
     }
 
@@ -865,14 +789,53 @@ mod tests {
     fn test_replicas_in_sync_false_at_threshold() {
         let mut h = healthy();
         h.max_replica_lag = Some(REPLICATION_LAG_TOLERANCE_BYTES);
-        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, Some(&h));
+        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, Some(&h), None);
         assert_false(&c, "ReplicasInSync");
     }
 
     #[test]
     fn test_replicas_in_sync_false_above_threshold() {
         let h = unhealthy_with_lag(REPLICATION_LAG_TOLERANCE_BYTES * 4);
-        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, Some(&h));
+        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, Some(&h), None);
         assert_false(&c, "ReplicasInSync");
+    }
+
+    fn tls_observation(ready: Option<bool>, reason: &'static str) -> TlsObservation {
+        TlsObservation {
+            ready,
+            reason,
+            message: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_tls_ready_unknown_when_no_observation() {
+        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, None, None);
+        assert_eq!(find_condition(&c, "TLSReady").status, "Unknown");
+    }
+
+    #[test]
+    fn test_tls_ready_unknown_when_observation_unknown() {
+        let obs = tls_observation(None, "CertificateNotObserved");
+        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, None, Some(&obs));
+        assert_eq!(find_condition(&c, "TLSReady").status, "Unknown");
+        assert_eq!(
+            find_condition(&c, "TLSReady").reason,
+            "CertificateNotObserved"
+        );
+    }
+
+    #[test]
+    fn test_tls_ready_true_when_observation_true() {
+        let obs = tls_observation(Some(true), "CertificateReady");
+        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, None, Some(&obs));
+        assert_true(&c, "TLSReady");
+    }
+
+    #[test]
+    fn test_tls_ready_false_when_observation_false() {
+        let obs = tls_observation(Some(false), "CertificateExpired");
+        let c = derive_cluster_conditions(ClusterPhase::Running, 6, 6, None, None, Some(&obs));
+        assert_false(&c, "TLSReady");
     }
 }
