@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     controller::{
         cluster_init::{master_pod_dns_names, replica_pod_dns_names_for_master},
+        cluster_reconciler::merge_conditions,
         cluster_validation::validate_image_change,
         common::{add_finalizer, extract_pod_name, remove_finalizer},
         context::Context,
@@ -236,13 +237,9 @@ async fn handle_pending_phase(
         ..Default::default()
     };
 
-    // Set conditions based on phase
-    status.conditions = compute_upgrade_conditions(
+    merge_into_status(
+        &mut status,
         UpgradePhase::PreChecks,
-        total_shards,
-        0,
-        0,
-        None,
         obj.metadata.generation,
     );
 
@@ -357,12 +354,9 @@ async fn handle_prechecks_phase(
     let mut status = obj.status.clone().unwrap_or_default();
     status.phase = UpgradePhase::InProgress;
     status.current_shard = 0;
-    status.conditions = compute_upgrade_conditions(
+    merge_into_status(
+        &mut status,
         UpgradePhase::InProgress,
-        status.total_shards,
-        status.upgraded_shards,
-        status.failed_shards,
-        status.error_message.as_deref(),
         obj.metadata.generation,
     );
     update_status(api, &name, status).await?;
@@ -431,12 +425,9 @@ async fn handle_inprogress_phase(
         new_status.phase = UpgradePhase::Completed;
         new_status.progress = format!("{}/{} shards upgraded", total_shards, total_shards);
         new_status.completed_at = Some(Timestamp::now().to_string());
-        new_status.conditions = compute_upgrade_conditions(
+        merge_into_status(
+            &mut new_status,
             UpgradePhase::Completed,
-            total_shards,
-            total_shards,
-            0,
-            None,
             obj.metadata.generation,
         );
         update_status(api, &name, new_status).await?;
@@ -502,12 +493,9 @@ async fn handle_inprogress_phase(
             // Clear sync tracking when moving to next shard
             new_status.sync_started_at = None;
             new_status.sync_elapsed_seconds = None;
-            new_status.conditions = compute_upgrade_conditions(
+            merge_into_status(
+                &mut new_status,
                 UpgradePhase::InProgress,
-                new_status.total_shards,
-                new_status.upgraded_shards,
-                new_status.failed_shards,
-                new_status.error_message.as_deref(),
                 obj.metadata.generation,
             );
             update_status(api, &name, new_status).await?;
@@ -557,12 +545,9 @@ async fn handle_inprogress_phase(
             let mut new_status = status.clone();
             new_status.phase = UpgradePhase::RollingBack;
             new_status.failed_shards += 1;
-            new_status.conditions = compute_upgrade_conditions(
+            merge_into_status(
+                &mut new_status,
                 UpgradePhase::RollingBack,
-                new_status.total_shards,
-                new_status.upgraded_shards,
-                new_status.failed_shards,
-                new_status.error_message.as_deref(),
                 obj.metadata.generation,
             );
             update_status(api, &name, new_status).await?;
@@ -572,12 +557,9 @@ async fn handle_inprogress_phase(
             // Move to next shard
             let mut new_status = status.clone();
             new_status.current_shard = current_shard + 1;
-            new_status.conditions = compute_upgrade_conditions(
+            merge_into_status(
+                &mut new_status,
                 UpgradePhase::InProgress,
-                new_status.total_shards,
-                new_status.upgraded_shards,
-                new_status.failed_shards,
-                new_status.error_message.as_deref(),
                 obj.metadata.generation,
             );
             update_status(api, &name, new_status).await?;
@@ -734,12 +716,9 @@ async fn check_replicas_upgraded(
                 "Pod ready timeout exceeded for shard {} after {}s",
                 shard_index, elapsed
             ));
-            new_status.conditions = compute_upgrade_conditions(
+            merge_into_status(
+                &mut new_status,
                 UpgradePhase::RollingBack,
-                new_status.total_shards,
-                new_status.upgraded_shards,
-                new_status.failed_shards,
-                new_status.error_message.as_deref(),
                 obj.metadata.generation,
             );
             update_status(api, &name, new_status).await?;
@@ -1742,14 +1721,7 @@ async fn check_rollback_completion(
         status.error_message = Some(
             "Cannot verify rollback completion: original image version not found in upgrade status. Check the upgrade status.currentVersion field and manually verify cluster image if needed.".to_string()
         );
-        status.conditions = compute_upgrade_conditions(
-            UpgradePhase::Failed,
-            status.total_shards,
-            status.upgraded_shards,
-            status.failed_shards,
-            status.error_message.as_deref(),
-            obj.metadata.generation,
-        );
+        merge_into_status(&mut status, UpgradePhase::Failed, obj.metadata.generation);
         update_status(api, &name, status).await?;
         return Ok(Action::requeue(Duration::from_secs(300)));
     };
@@ -1881,12 +1853,9 @@ async fn check_rollback_completion(
         original_version
     );
     status.error_message = Some("Upgrade rolled back successfully".to_string());
-    status.conditions = compute_upgrade_conditions(
+    merge_into_status(
+        &mut status,
         UpgradePhase::RolledBack,
-        status.total_shards,
-        status.upgraded_shards,
-        status.failed_shards,
-        status.error_message.as_deref(),
         obj.metadata.generation,
     );
     update_status(api, &name, status).await?;
@@ -2256,6 +2225,14 @@ async fn handle_deletion(
     Ok(Action::await_change())
 }
 
+/// Derive the canonical condition set for a ValkeyUpgrade based on its phase alone.
+///
+/// This is the pure, public counterpart to the internal `compute_upgrade_conditions`
+/// function. Call this when you only have a phase (no shard counters).
+pub fn derive_upgrade_conditions(phase: UpgradePhase, generation: Option<i64>) -> Vec<Condition> {
+    compute_upgrade_conditions(phase, 0, 0, 0, None, generation)
+}
+
 /// Update the phase of an upgrade
 /// Compute standard Kubernetes conditions based on upgrade phase and status.
 ///
@@ -2445,6 +2422,24 @@ fn compute_upgrade_conditions(
     conditions
 }
 
+/// Apply freshly-computed conditions to a status, preserving `last_transition_time`
+/// for unchanged condition statuses.
+fn merge_into_status(
+    status: &mut ValkeyUpgradeStatus,
+    phase: UpgradePhase,
+    generation: Option<i64>,
+) {
+    let new_conditions = compute_upgrade_conditions(
+        phase,
+        status.total_shards,
+        status.upgraded_shards,
+        status.failed_shards,
+        status.error_message.as_deref(),
+        generation,
+    );
+    status.conditions = merge_conditions(&status.conditions, new_conditions);
+}
+
 async fn update_phase(
     api: &Api<ValkeyUpgrade>,
     name: &str,
@@ -2459,15 +2454,7 @@ async fn update_phase(
         status.error_message = Some(msg);
     }
 
-    // Update conditions based on phase
-    status.conditions = compute_upgrade_conditions(
-        phase,
-        status.total_shards,
-        status.upgraded_shards,
-        status.failed_shards,
-        status.error_message.as_deref(),
-        obj.metadata.generation,
-    );
+    merge_into_status(&mut status, phase, obj.metadata.generation);
 
     update_status(api, name, status).await
 }
@@ -3220,5 +3207,129 @@ mod upgrade_reconciler_function_tests {
             replication_sync_timeout_seconds: 300,
             pod_ready_timeout_seconds: 600,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod derive_upgrade_conditions_tests {
+    use super::{derive_upgrade_conditions, merge_conditions};
+    use crate::crd::{Condition, UpgradePhase};
+
+    fn find<'a>(conditions: &'a [Condition], ty: &str) -> &'a Condition {
+        conditions
+            .iter()
+            .find(|c| c.r#type == ty)
+            .expect("condition should exist")
+    }
+
+    fn is_true(conditions: &[Condition], ty: &str) -> bool {
+        find(conditions, ty).status == "True"
+    }
+
+    #[test]
+    fn test_derive_upgrade_pending() {
+        let c = derive_upgrade_conditions(UpgradePhase::Pending, Some(1));
+        assert!(!is_true(&c, "Ready"));
+        assert!(!is_true(&c, "Progressing"));
+    }
+
+    #[test]
+    fn test_derive_upgrade_prechecks() {
+        let c = derive_upgrade_conditions(UpgradePhase::PreChecks, Some(1));
+        assert!(!is_true(&c, "Ready"));
+        assert!(is_true(&c, "Progressing"));
+    }
+
+    #[test]
+    fn test_derive_upgrade_in_progress() {
+        let c = derive_upgrade_conditions(UpgradePhase::InProgress, Some(1));
+        assert!(!is_true(&c, "Ready"));
+        assert!(is_true(&c, "Progressing"));
+    }
+
+    #[test]
+    fn test_derive_upgrade_completed() {
+        let c = derive_upgrade_conditions(UpgradePhase::Completed, Some(1));
+        assert!(is_true(&c, "Ready"));
+        assert!(!is_true(&c, "Progressing"));
+        assert!(!is_true(&c, "Degraded"));
+    }
+
+    #[test]
+    fn test_derive_upgrade_failed() {
+        let c = derive_upgrade_conditions(UpgradePhase::Failed, Some(1));
+        assert!(!is_true(&c, "Ready"));
+        assert!(is_true(&c, "Degraded"));
+    }
+
+    #[test]
+    fn test_derive_upgrade_rolling_back() {
+        let c = derive_upgrade_conditions(UpgradePhase::RollingBack, Some(1));
+        assert!(!is_true(&c, "Ready"));
+        assert!(is_true(&c, "Progressing"));
+    }
+
+    #[test]
+    fn test_derive_upgrade_rolled_back() {
+        let c = derive_upgrade_conditions(UpgradePhase::RolledBack, Some(1));
+        assert!(!is_true(&c, "Ready"));
+        assert!(!is_true(&c, "Progressing"));
+    }
+
+    #[test]
+    fn test_merge_upgrade_conditions_preserves_timestamp_when_unchanged() {
+        let old = vec![Condition::new(
+            "Ready",
+            false,
+            "Pending",
+            "Not started",
+            Some(1),
+        )];
+        let old_ts = old.first().unwrap().last_transition_time.clone();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let new = vec![Condition::new(
+            "Ready",
+            false,
+            "Pending",
+            "Not started",
+            Some(1),
+        )];
+        let merged = merge_conditions(&old, new);
+        assert_eq!(
+            merged.first().unwrap().last_transition_time,
+            old_ts,
+            "timestamp should be preserved when status is unchanged"
+        );
+    }
+
+    #[test]
+    fn test_merge_upgrade_conditions_updates_timestamp_on_flip() {
+        let old = vec![Condition::new(
+            "Ready",
+            false,
+            "Upgrading",
+            "In progress",
+            Some(1),
+        )];
+        let old_ts = old.first().unwrap().last_transition_time.clone();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let new = vec![Condition::new(
+            "Ready",
+            true,
+            "UpgradeCompleted",
+            "Done",
+            Some(1),
+        )];
+        let merged = merge_conditions(&old, new);
+        assert_ne!(
+            merged.first().unwrap().last_transition_time,
+            old_ts,
+            "timestamp should update when status flips"
+        );
     }
 }

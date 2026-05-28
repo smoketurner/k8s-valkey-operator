@@ -41,9 +41,10 @@ use serde::{Deserialize, Serialize};
     namespaced,
     // Print columns for kubectl get
     printcolumn = r#"{"name":"Phase", "type":"string", "jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Ready", "type":"string", "jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
     printcolumn = r#"{"name":"Masters", "type":"integer", "jsonPath":".spec.masters"}"#,
     printcolumn = r#"{"name":"Replicas", "type":"integer", "jsonPath":".spec.replicasPerMaster"}"#,
-    printcolumn = r#"{"name":"Ready", "type":"string", "jsonPath":".status.readyNodes"}"#,
+    printcolumn = r#"{"name":"Nodes", "type":"string", "jsonPath":".status.readyNodes"}"#,
     printcolumn = r#"{"name":"Slots", "type":"string", "jsonPath":".status.assignedSlots"}"#,
     printcolumn = r#"{"name":"Age", "type":"date", "jsonPath":".metadata.creationTimestamp"}"#
 )]
