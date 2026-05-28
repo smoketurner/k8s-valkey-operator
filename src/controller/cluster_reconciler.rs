@@ -1308,7 +1308,7 @@ async fn add_new_replicas_to_cluster(
             continue;
         }
 
-        let master_index = ((node.ordinal - masters) % masters) as usize;
+        let master_index = ((node.ordinal.get() - masters) % masters) as usize;
         let master_node_id = match master_node_ids.get(master_index) {
             Some(Some(id)) => id,
             Some(None) => {

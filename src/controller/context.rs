@@ -195,8 +195,9 @@ impl Context {
         &self,
         cluster: &ValkeyCluster,
         namespace: &str,
-        ordinal: i32,
+        ordinal: impl Into<crate::crd::PodOrdinal>,
     ) -> Result<ValkeyClient, Error> {
+        let ordinal = ordinal.into();
         let password = self
             .get_auth_password(
                 namespace,

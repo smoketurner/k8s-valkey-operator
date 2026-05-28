@@ -148,6 +148,30 @@ impl From<i32> for PodOrdinal {
     }
 }
 
+impl PartialEq<i32> for PodOrdinal {
+    fn eq(&self, other: &i32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialOrd<i32> for PodOrdinal {
+    fn partial_cmp(&self, other: &i32) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(other)
+    }
+}
+
+impl PartialEq<PodOrdinal> for i32 {
+    fn eq(&self, other: &PodOrdinal) -> bool {
+        *self == other.0
+    }
+}
+
+impl PartialOrd<PodOrdinal> for i32 {
+    fn partial_cmp(&self, other: &PodOrdinal) -> Option<std::cmp::Ordering> {
+        self.partial_cmp(&other.0)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

@@ -125,12 +125,14 @@ impl ScalingContext {
     }
 
     /// Get ordinals of masters being removed (scale down).
-    pub fn masters_to_remove(&self) -> Vec<i32> {
+    pub fn masters_to_remove(&self) -> Vec<crate::crd::PodOrdinal> {
         if !self.is_scale_down() {
             return Vec::new();
         }
 
-        (self.target_masters..self.current_masters).collect()
+        (self.target_masters..self.current_masters)
+            .map(crate::crd::PodOrdinal::new)
+            .collect()
     }
 }
 

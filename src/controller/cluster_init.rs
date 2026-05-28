@@ -25,7 +25,12 @@ use crate::slots::{TOTAL_SLOTS, calculate_distribution};
 /// Build the DNS name for a pod in the StatefulSet.
 ///
 /// Format: `{cluster-name}-{ordinal}.{cluster-name}-headless.{namespace}.svc.cluster.local`
-pub fn pod_dns_name(cluster_name: &str, namespace: &str, ordinal: i32) -> String {
+pub fn pod_dns_name(
+    cluster_name: &str,
+    namespace: &str,
+    ordinal: impl Into<crate::crd::PodOrdinal>,
+) -> String {
+    let ordinal = ordinal.into();
     let headless = format!("{}-headless", cluster_name);
     format!(
         "{}-{}.{}.{}.svc.cluster.local",
@@ -75,7 +80,8 @@ pub fn replica_pod_dns_names_for_master(
 }
 
 /// Get pod name (StatefulSet pod name, not DNS)
-pub fn pod_name(cluster_name: &str, ordinal: i32) -> String {
+pub fn pod_name(cluster_name: &str, ordinal: impl Into<crate::crd::PodOrdinal>) -> String {
+    let ordinal = ordinal.into();
     format!("{}-{}", cluster_name, ordinal)
 }
 
@@ -141,7 +147,7 @@ pub async fn recover_stale_ips(
             Ok(addr) => addr,
             Err(e) => {
                 warn!(
-                    ordinal = node.ordinal,
+                    ordinal = %node.ordinal,
                     error = %e,
                     "Failed to get connection for pod, skipping"
                 );
@@ -157,7 +163,7 @@ pub async fn recover_stale_ips(
                 Ok(c) => c,
                 Err(e) => {
                     warn!(
-                        ordinal = node.ordinal,
+                        ordinal = %node.ordinal,
                         error = %e,
                         "Failed to connect to pod for recovery, skipping"
                     );
@@ -179,7 +185,7 @@ pub async fn recover_stale_ips(
             {
                 Ok(()) => {
                     debug!(
-                        from_ordinal = node.ordinal,
+                        from_ordinal = %node.ordinal,
                         to_pod = %target_pod_name,
                         to_ip = %target_endpoint.ip(),
                         "CLUSTER MEET successful"
@@ -191,14 +197,14 @@ pub async fn recover_stale_ips(
                     let error_str = e.to_string().to_lowercase();
                     if error_str.contains("already") || error_str.contains("known") {
                         debug!(
-                            from_ordinal = node.ordinal,
+                            from_ordinal = %node.ordinal,
                             to_pod = %target_pod_name,
                             "Node already known, continuing"
                         );
                         successful_meets += 1;
                     } else {
                         debug!(
-                            from_ordinal = node.ordinal,
+                            from_ordinal = %node.ordinal,
                             to_pod = %target_pod_name,
                             error = %e,
                             "CLUSTER MEET failed"
@@ -253,7 +259,11 @@ impl ConnectionStrategy {
     }
 
     /// Get a connection address for a pod by ordinal
-    pub async fn get_connection(&self, ordinal: i32) -> Result<(String, u16), ValkeyError> {
+    pub async fn get_connection(
+        &self,
+        ordinal: impl Into<crate::crd::PodOrdinal>,
+    ) -> Result<(String, u16), ValkeyError> {
+        let ordinal = ordinal.into();
         let mut pf = self.port_forwards.lock().await;
         pf.ensure_forward(ordinal)
             .await
@@ -267,7 +277,7 @@ pub struct ClusterPortForwards {
     namespace: String,
     cluster_name: String,
     /// Map from pod ordinal to port forward
-    forwards: HashMap<i32, PortForward>,
+    forwards: HashMap<crate::crd::PodOrdinal, PortForward>,
 }
 
 impl ClusterPortForwards {
@@ -284,15 +294,16 @@ impl ClusterPortForwards {
     /// Ensure a port forward exists for the given pod ordinal
     pub async fn ensure_forward(
         &mut self,
-        ordinal: i32,
+        ordinal: impl Into<crate::crd::PodOrdinal>,
     ) -> Result<(String, u16), PortForwardError> {
+        let ordinal = ordinal.into();
         if let Some(pf) = self.forwards.get(&ordinal) {
             return Ok(("127.0.0.1".to_string(), pf.local_port()));
         }
 
         let pod_name = pod_name(&self.cluster_name, ordinal);
 
-        info!(pod = %pod_name, ordinal = ordinal, "Creating port forward for pod");
+        info!(pod = %pod_name, ordinal = %ordinal, "Creating port forward for pod");
 
         let pf = PortForward::start(
             self.client.clone(),
@@ -309,7 +320,8 @@ impl ClusterPortForwards {
     }
 
     /// Get the connection address for a pod ordinal
-    pub fn get_address(&self, ordinal: i32) -> Option<(String, u16)> {
+    pub fn get_address(&self, ordinal: impl Into<crate::crd::PodOrdinal>) -> Option<(String, u16)> {
+        let ordinal = ordinal.into();
         self.forwards
             .get(&ordinal)
             .map(|pf| ("127.0.0.1".to_string(), pf.local_port()))
@@ -318,7 +330,7 @@ impl ClusterPortForwards {
     /// Create port forwards for all pods in the cluster
     pub async fn ensure_all_forwards(&mut self, total_pods: i32) -> Result<(), PortForwardError> {
         for i in 0..total_pods {
-            self.ensure_forward(i).await?;
+            self.ensure_forward(crate::crd::PodOrdinal::new(i)).await?;
         }
         Ok(())
     }
@@ -704,9 +716,9 @@ pub async fn setup_replicas(
 fn parse_master_node_ids(
     nodes_output: &str,
     expected_masters: usize,
-    ip_to_ordinal: Option<&std::collections::HashMap<String, i32>>,
+    ip_to_ordinal: Option<&std::collections::HashMap<String, crate::crd::PodOrdinal>>,
 ) -> Result<Vec<crate::crd::NodeId>, ValkeyError> {
-    let mut master_ids: Vec<(crate::crd::NodeId, i32)> = Vec::new();
+    let mut master_ids: Vec<(crate::crd::NodeId, crate::crd::PodOrdinal)> = Vec::new();
 
     for line in nodes_output.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -731,7 +743,7 @@ fn parse_master_node_ids(
             if has_slots {
                 // Extract ordinal: first try IP→ordinal map, then fall back to address parsing
                 let ordinal = get_ordinal_from_address(address, ip_to_ordinal)
-                    .unwrap_or(master_ids.len() as i32);
+                    .unwrap_or(crate::crd::PodOrdinal::new(master_ids.len() as i32));
                 master_ids.push((crate::crd::NodeId::from((*node_id).to_string()), ordinal));
             }
         }
@@ -744,7 +756,7 @@ fn parse_master_node_ids(
     if ids.len() < expected_masters {
         // If we don't have enough masters with slots, also include masters without slots
         // This handles the case where we're getting node IDs before slot assignment
-        let mut all_masters: Vec<(crate::crd::NodeId, i32)> = Vec::new();
+        let mut all_masters: Vec<(crate::crd::NodeId, crate::crd::PodOrdinal)> = Vec::new();
 
         for line in nodes_output.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -760,7 +772,7 @@ fn parse_master_node_ids(
 
             if flags.contains("master") && !flags.contains("fail") {
                 let ordinal = get_ordinal_from_address(address, ip_to_ordinal)
-                    .unwrap_or(all_masters.len() as i32);
+                    .unwrap_or(crate::crd::PodOrdinal::new(all_masters.len() as i32));
                 all_masters.push((crate::crd::NodeId::from((*node_id).to_string()), ordinal));
             }
         }
@@ -782,8 +794,8 @@ fn parse_master_node_ids(
 /// Falls back to `extract_ordinal_from_address` if map is not available or IP not found.
 fn get_ordinal_from_address(
     address: &str,
-    ip_to_ordinal: Option<&std::collections::HashMap<String, i32>>,
-) -> Option<i32> {
+    ip_to_ordinal: Option<&std::collections::HashMap<String, crate::crd::PodOrdinal>>,
+) -> Option<crate::crd::PodOrdinal> {
     // Try to extract IP and look up in map first
     if let Some(map) = ip_to_ordinal {
         // Address format: hostname:port@cluster-bus-port or ip:port@cluster-bus-port
@@ -800,7 +812,7 @@ fn get_ordinal_from_address(
     }
 
     // Fall back to extracting from address (works for DNS names)
-    extract_ordinal_from_address(address).map(|o| o as i32)
+    extract_ordinal_from_address(address).map(|o| crate::crd::PodOrdinal::new(i32::from(o)))
 }
 
 // NOTE: initialize_cluster was removed as dead code.
@@ -903,7 +915,7 @@ pub async fn forget_nodes_with_retry(
                 Ok(addr) => addr,
                 Err(e) => {
                     debug!(
-                        ordinal = ordinal,
+                        ordinal = %ordinal,
                         error = %e,
                         "Failed to get connection for pod, skipping"
                     );
@@ -916,7 +928,7 @@ pub async fn forget_nodes_with_retry(
                 Ok(c) => c,
                 Err(e) => {
                     debug!(
-                        ordinal = ordinal,
+                        ordinal = %ordinal,
                         error = %e,
                         "Failed to connect to pod, skipping"
                     );
@@ -930,7 +942,7 @@ pub async fn forget_nodes_with_retry(
                 Ok(()) => {
                     debug!(
                         node_id = %node_id,
-                        from_ordinal = ordinal,
+                        from_ordinal = %ordinal,
                         "Forgot node from pod"
                     );
                     success_count += 1;
@@ -941,14 +953,14 @@ pub async fn forget_nodes_with_retry(
                     if error_str.contains("unknown node") || error_str.contains("myself") {
                         debug!(
                             node_id = %node_id,
-                            from_ordinal = ordinal,
+                            from_ordinal = %ordinal,
                             "Node already forgotten or is self"
                         );
                         success_count += 1;
                     } else {
                         debug!(
                             node_id = %node_id,
-                            from_ordinal = ordinal,
+                            from_ordinal = %ordinal,
                             error = %e,
                             "CLUSTER FORGET failed on this pod"
                         );
@@ -1116,9 +1128,9 @@ ghi789 10.0.0.3:6379@16379 master - 0 1234567890 3 connected 10923-16383"#;
 
         // With ip_to_ordinal map, ordinals are correct
         let mut ip_map = std::collections::HashMap::new();
-        ip_map.insert("10.0.0.1".to_string(), 0);
-        ip_map.insert("10.0.0.2".to_string(), 1);
-        ip_map.insert("10.0.0.3".to_string(), 2);
+        ip_map.insert("10.0.0.1".to_string(), crate::crd::PodOrdinal::new(0));
+        ip_map.insert("10.0.0.2".to_string(), crate::crd::PodOrdinal::new(1));
+        ip_map.insert("10.0.0.3".to_string(), crate::crd::PodOrdinal::new(2));
 
         let ids = parse_master_node_ids(nodes_output, 3, Some(&ip_map)).unwrap();
         assert_eq!(ids.len(), 3);
@@ -1129,34 +1141,35 @@ ghi789 10.0.0.3:6379@16379 master - 0 1234567890 3 connected 10923-16383"#;
 
     #[test]
     fn test_get_ordinal_from_address() {
+        use crate::crd::PodOrdinal;
         // Test with DNS name (no map needed)
         assert_eq!(
             get_ordinal_from_address("my-cluster-0.my-cluster-headless:6379", None),
-            Some(0)
+            Some(PodOrdinal::new(0))
         );
         assert_eq!(
             get_ordinal_from_address("my-cluster-5:6379@16379", None),
-            Some(5)
+            Some(PodOrdinal::new(5))
         );
 
         // Test with IP and map
         let mut ip_map = std::collections::HashMap::new();
-        ip_map.insert("10.0.0.5".to_string(), 4);
-        ip_map.insert("192.168.1.1".to_string(), 0);
+        ip_map.insert("10.0.0.5".to_string(), PodOrdinal::new(4));
+        ip_map.insert("192.168.1.1".to_string(), PodOrdinal::new(0));
 
         assert_eq!(
             get_ordinal_from_address("10.0.0.5:6379@16379", Some(&ip_map)),
-            Some(4)
+            Some(PodOrdinal::new(4))
         );
         assert_eq!(
             get_ordinal_from_address("192.168.1.1:6379", Some(&ip_map)),
-            Some(0)
+            Some(PodOrdinal::new(0))
         );
 
         // Falls back to extract_ordinal_from_address if IP not in map
         assert_eq!(
             get_ordinal_from_address("my-cluster-3:6379", Some(&ip_map)),
-            Some(3)
+            Some(PodOrdinal::new(3))
         );
     }
 
