@@ -447,11 +447,20 @@ impl<'a> StatusUpdate<'a> {
             (err, Some(format!("Phase: {}", self.phase)))
         };
 
+        // Label selector for the scale subresource — must match the pods owned by
+        // this cluster so HPA can read replica counts. Mirrors pod_selector_labels
+        // in src/resources/common.rs.
+        let selector = Some(format!(
+            "app.kubernetes.io/name={},app.kubernetes.io/instance={}",
+            self.name, self.name
+        ));
+
         let status = ValkeyClusterStatus {
             phase: self.phase,
             ready_nodes: format!("{}/{}", self.ready_replicas, desired_replicas),
             ready_masters,
             ready_replicas: self.ready_replicas,
+            selector,
             assigned_slots,
             observed_generation: generation,
             conditions,
