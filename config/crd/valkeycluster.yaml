@@ -62,6 +62,20 @@ spec:
               required:
                 - tls
                 - auth
+              x-kubernetes-validations:
+                # Cluster-size guardrail: total pod count = masters * (1 + replicasPerMaster).
+                # 500 pods is generous for any sane Valkey deployment and protects
+                # against runaway-config accidents (e.g., masters=100, replicas=10).
+                - rule: "self.masters * (1 + self.replicasPerMaster) <= 500"
+                  message: "Total pod count (masters * (1 + replicasPerMaster)) cannot exceed 500"
+                # Immutability: TLS issuer cannot change after creation. Changing it
+                # would require certificate rotation and disrupt the cluster.
+                - rule: "self.tls.issuerRef.name == oldSelf.tls.issuerRef.name"
+                  message: "spec.tls.issuerRef.name is immutable; delete and recreate the cluster to change it"
+                # Immutability: auth secret reference cannot change. Changing it would
+                # require credential rotation across all nodes.
+                - rule: "self.auth.secretRef.name == oldSelf.auth.secretRef.name"
+                  message: "spec.auth.secretRef.name is immutable; delete and recreate the cluster to change it"
               properties:
                 masters:
                   type: integer
