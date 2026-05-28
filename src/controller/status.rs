@@ -2,7 +2,9 @@
 //!
 //! Provides helpers for building and updating resource status conditions.
 
-use crate::crd::Condition;
+use crate::crd::{
+    Condition, degraded_condition, error_condition, progressing_condition, ready_condition,
+};
 
 /// Builder for managing conditions list
 pub struct ConditionBuilder {
@@ -19,11 +21,10 @@ impl ConditionBuilder {
 
     /// Add or update a condition
     pub fn set(&mut self, condition: Condition) -> &mut Self {
-        // Find and replace existing condition of same type
         if let Some(existing) = self
             .conditions
             .iter_mut()
-            .find(|c| c.r#type == condition.r#type)
+            .find(|c| c.type_ == condition.type_)
         {
             *existing = condition;
         } else {
@@ -40,7 +41,7 @@ impl ConditionBuilder {
         message: &str,
         generation: Option<i64>,
     ) -> &mut Self {
-        self.set(Condition::ready(ready, reason, message, generation))
+        self.set(ready_condition(ready, reason, message, generation))
     }
 
     /// Set Progressing condition
@@ -51,7 +52,7 @@ impl ConditionBuilder {
         message: &str,
         generation: Option<i64>,
     ) -> &mut Self {
-        self.set(Condition::progressing(
+        self.set(progressing_condition(
             progressing,
             reason,
             message,
@@ -67,12 +68,12 @@ impl ConditionBuilder {
         message: &str,
         generation: Option<i64>,
     ) -> &mut Self {
-        self.set(Condition::degraded(degraded, reason, message, generation))
+        self.set(degraded_condition(degraded, reason, message, generation))
     }
 
     /// Set Error condition with actionable message
     pub fn error(&mut self, reason: &str, message: &str, generation: Option<i64>) -> &mut Self {
-        self.set(Condition::error(reason, message, generation))
+        self.set(error_condition(reason, message, generation))
     }
 
     /// Build the conditions list
@@ -91,7 +92,7 @@ impl Default for ConditionBuilder {
 pub fn is_condition_true(conditions: &[Condition], condition_type: &str) -> bool {
     conditions
         .iter()
-        .find(|c| c.r#type == condition_type)
+        .find(|c| c.type_ == condition_type)
         .is_some_and(|c| c.status == "True")
 }
 
@@ -102,6 +103,6 @@ pub fn get_condition_reason<'a>(
 ) -> Option<&'a str> {
     conditions
         .iter()
-        .find(|c| c.r#type == condition_type)
+        .find(|c| c.type_ == condition_type)
         .map(|c| c.reason.as_str())
 }

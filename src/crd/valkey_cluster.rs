@@ -10,6 +10,8 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::Condition;
+
 /// ValkeyCluster is a custom resource for deploying Valkey clusters.
 ///
 /// Example:
@@ -947,74 +949,6 @@ impl std::fmt::Display for ClusterPhase {
     }
 }
 
-/// Condition describes the state of a cluster at a certain point.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct Condition {
-    /// Type of condition.
-    pub r#type: String,
-    /// Status of the condition ("True", "False", "Unknown").
-    pub status: String,
-    /// Machine-readable reason for the condition's last transition.
-    pub reason: String,
-    /// Human-readable message indicating details about last transition.
-    pub message: String,
-    /// Last time the condition transitioned from one status to another.
-    pub last_transition_time: String,
-    /// The generation of the resource this condition was observed for.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observed_generation: Option<i64>,
-}
-
-impl Condition {
-    /// Create a new condition.
-    pub fn new(
-        condition_type: &str,
-        status: bool,
-        reason: &str,
-        message: &str,
-        generation: Option<i64>,
-    ) -> Self {
-        Self {
-            r#type: condition_type.to_string(),
-            status: if status {
-                "True".to_string()
-            } else {
-                "False".to_string()
-            },
-            reason: reason.to_string(),
-            message: message.to_string(),
-            last_transition_time: jiff::Timestamp::now().to_string(),
-            observed_generation: generation,
-        }
-    }
-
-    /// Create a "Ready" condition.
-    pub fn ready(ready: bool, reason: &str, message: &str, generation: Option<i64>) -> Self {
-        Self::new("Ready", ready, reason, message, generation)
-    }
-
-    /// Create a "Progressing" condition.
-    pub fn progressing(
-        progressing: bool,
-        reason: &str,
-        message: &str,
-        generation: Option<i64>,
-    ) -> Self {
-        Self::new("Progressing", progressing, reason, message, generation)
-    }
-
-    /// Create a "Degraded" condition.
-    pub fn degraded(degraded: bool, reason: &str, message: &str, generation: Option<i64>) -> Self {
-        Self::new("Degraded", degraded, reason, message, generation)
-    }
-
-    /// Create an "Error" condition with actionable message.
-    pub fn error(reason: &str, message: &str, generation: Option<i64>) -> Self {
-        Self::new("Error", true, reason, message, generation)
-    }
-}
-
 /// Types of conditions for ValkeyCluster.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
 pub enum ConditionType {
@@ -1264,8 +1198,9 @@ mod tests {
 
     #[test]
     fn test_condition_ready() {
-        let condition = Condition::ready(true, "AllReady", "All components ready", Some(1));
-        assert_eq!(condition.r#type, "Ready");
+        let condition =
+            crate::crd::ready_condition(true, "AllReady", "All components ready", Some(1));
+        assert_eq!(condition.type_, "Ready");
         assert_eq!(condition.status, "True");
         assert_eq!(condition.reason, "AllReady");
         assert_eq!(condition.message, "All components ready");
@@ -1274,21 +1209,23 @@ mod tests {
 
     #[test]
     fn test_condition_not_ready() {
-        let condition = Condition::ready(false, "NotReady", "Components starting", None);
+        let condition = crate::crd::ready_condition(false, "NotReady", "Components starting", None);
         assert_eq!(condition.status, "False");
     }
 
     #[test]
     fn test_condition_progressing() {
-        let condition = Condition::progressing(true, "Reconciling", "Updating resources", Some(2));
-        assert_eq!(condition.r#type, "Progressing");
+        let condition =
+            crate::crd::progressing_condition(true, "Reconciling", "Updating resources", Some(2));
+        assert_eq!(condition.type_, "Progressing");
         assert_eq!(condition.status, "True");
     }
 
     #[test]
     fn test_condition_degraded() {
-        let condition = Condition::degraded(true, "PodFailed", "Pod in crash loop", Some(3));
-        assert_eq!(condition.r#type, "Degraded");
+        let condition =
+            crate::crd::degraded_condition(true, "PodFailed", "Pod in crash loop", Some(3));
+        assert_eq!(condition.type_, "Degraded");
         assert_eq!(condition.status, "True");
     }
 }

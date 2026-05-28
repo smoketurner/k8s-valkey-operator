@@ -29,7 +29,8 @@ use crate::{
     },
     crd::{
         Condition, ShardUpgradeState, ShardUpgradeStatus, UpgradePhase, ValkeyCluster,
-        ValkeyUpgrade, ValkeyUpgradeSpec, ValkeyUpgradeStatus,
+        ValkeyUpgrade, ValkeyUpgradeSpec, ValkeyUpgradeStatus, degraded_condition,
+        progressing_condition, ready_condition,
     },
 };
 
@@ -2254,19 +2255,19 @@ fn compute_upgrade_conditions(
     match phase {
         UpgradePhase::Completed => {
             // Upgrade completed successfully
-            conditions.push(Condition::ready(
+            conditions.push(ready_condition(
                 true,
                 "UpgradeCompleted",
                 &format!("All {} shards upgraded successfully", total_shards),
                 generation,
             ));
-            conditions.push(Condition::progressing(
+            conditions.push(progressing_condition(
                 false,
                 "UpgradeCompleted",
                 "Upgrade finished",
                 generation,
             ));
-            conditions.push(Condition::degraded(
+            conditions.push(degraded_condition(
                 false,
                 "UpgradeCompleted",
                 "No degraded shards",
@@ -2275,19 +2276,19 @@ fn compute_upgrade_conditions(
         }
         UpgradePhase::Failed => {
             // Upgrade failed completely
-            conditions.push(Condition::ready(
+            conditions.push(ready_condition(
                 false,
                 "UpgradeFailed",
                 error_message.unwrap_or("Upgrade failed"),
                 generation,
             ));
-            conditions.push(Condition::progressing(
+            conditions.push(progressing_condition(
                 false,
                 "UpgradeFailed",
                 "Upgrade stopped due to failure",
                 generation,
             ));
-            conditions.push(Condition::degraded(
+            conditions.push(degraded_condition(
                 true,
                 "UpgradeFailed",
                 error_message.unwrap_or("Upgrade failed"),
@@ -2297,7 +2298,7 @@ fn compute_upgrade_conditions(
         UpgradePhase::RollingBack | UpgradePhase::RolledBack => {
             // Rollback in progress or completed
             let is_rolling_back = phase == UpgradePhase::RollingBack;
-            conditions.push(Condition::ready(
+            conditions.push(ready_condition(
                 false,
                 if is_rolling_back {
                     "RollingBack"
@@ -2311,7 +2312,7 @@ fn compute_upgrade_conditions(
                 },
                 generation,
             ));
-            conditions.push(Condition::progressing(
+            conditions.push(progressing_condition(
                 is_rolling_back,
                 if is_rolling_back {
                     "RollingBack"
@@ -2325,7 +2326,7 @@ fn compute_upgrade_conditions(
                 },
                 generation,
             ));
-            conditions.push(Condition::degraded(
+            conditions.push(degraded_condition(
                 true,
                 "RollingBack",
                 "Upgrade rolled back",
@@ -2344,7 +2345,7 @@ fn compute_upgrade_conditions(
             // Note: sync_elapsed_seconds and sync_started_at are not available here
             // They're tracked in status but we'd need to pass them to this function
             // For now, just show basic progress
-            conditions.push(Condition::ready(
+            conditions.push(ready_condition(
                 false,
                 "Upgrading",
                 &format!(
@@ -2353,7 +2354,7 @@ fn compute_upgrade_conditions(
                 ),
                 generation,
             ));
-            conditions.push(Condition::progressing(
+            conditions.push(progressing_condition(
                 true,
                 "Upgrading",
                 &format!("Upgrading shard {}/{}", upgraded_shards + 1, total_shards),
@@ -2364,7 +2365,7 @@ fn compute_upgrade_conditions(
             } else {
                 "All shards upgrading successfully".to_string()
             };
-            conditions.push(Condition::degraded(
+            conditions.push(degraded_condition(
                 has_failures,
                 if has_failures {
                     "ShardFailures"
@@ -2377,19 +2378,19 @@ fn compute_upgrade_conditions(
         }
         UpgradePhase::PreChecks => {
             // Pre-checks phase
-            conditions.push(Condition::ready(
+            conditions.push(ready_condition(
                 false,
                 "PreChecks",
                 "Running pre-upgrade health checks",
                 generation,
             ));
-            conditions.push(Condition::progressing(
+            conditions.push(progressing_condition(
                 true,
                 "PreChecks",
                 "Validating cluster health before upgrade",
                 generation,
             ));
-            conditions.push(Condition::degraded(
+            conditions.push(degraded_condition(
                 false,
                 "PreChecks",
                 "No degradation detected",
@@ -2398,19 +2399,19 @@ fn compute_upgrade_conditions(
         }
         UpgradePhase::Pending => {
             // Pending validation
-            conditions.push(Condition::ready(
+            conditions.push(ready_condition(
                 false,
                 "Pending",
                 "Upgrade validation pending",
                 generation,
             ));
-            conditions.push(Condition::progressing(
+            conditions.push(progressing_condition(
                 false,
                 "Pending",
                 "Waiting for validation",
                 generation,
             ));
-            conditions.push(Condition::degraded(
+            conditions.push(degraded_condition(
                 false,
                 "Pending",
                 "No degradation",
@@ -2902,9 +2903,9 @@ mod upgrade_reconciler_function_tests {
 
         assert_eq!(conditions.len(), 3);
 
-        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+        let Some(ready) = conditions.iter().find(|c| c.type_ == "Ready") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Ready"),
+                conditions.iter().any(|c| c.type_ == "Ready"),
                 "Missing Ready condition"
             );
             return;
@@ -2912,18 +2913,18 @@ mod upgrade_reconciler_function_tests {
         assert_eq!(ready.status, "True");
         assert_eq!(ready.reason, "UpgradeCompleted");
 
-        let Some(progressing) = conditions.iter().find(|c| c.r#type == "Progressing") else {
+        let Some(progressing) = conditions.iter().find(|c| c.type_ == "Progressing") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Progressing"),
+                conditions.iter().any(|c| c.type_ == "Progressing"),
                 "Missing Progressing condition"
             );
             return;
         };
         assert_eq!(progressing.status, "False");
 
-        let Some(degraded) = conditions.iter().find(|c| c.r#type == "Degraded") else {
+        let Some(degraded) = conditions.iter().find(|c| c.type_ == "Degraded") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Degraded"),
+                conditions.iter().any(|c| c.type_ == "Degraded"),
                 "Missing Degraded condition"
             );
             return;
@@ -2940,9 +2941,9 @@ mod upgrade_reconciler_function_tests {
 
         assert_eq!(conditions.len(), 3);
 
-        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+        let Some(ready) = conditions.iter().find(|c| c.type_ == "Ready") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Ready"),
+                conditions.iter().any(|c| c.type_ == "Ready"),
                 "Missing Ready condition"
             );
             return;
@@ -2951,9 +2952,9 @@ mod upgrade_reconciler_function_tests {
         assert_eq!(ready.reason, "UpgradeFailed");
         assert_eq!(ready.message, error_msg);
 
-        let Some(degraded) = conditions.iter().find(|c| c.r#type == "Degraded") else {
+        let Some(degraded) = conditions.iter().find(|c| c.type_ == "Degraded") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Degraded"),
+                conditions.iter().any(|c| c.type_ == "Degraded"),
                 "Missing Degraded condition"
             );
             return;
@@ -2969,9 +2970,9 @@ mod upgrade_reconciler_function_tests {
 
         assert_eq!(conditions.len(), 3);
 
-        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+        let Some(ready) = conditions.iter().find(|c| c.type_ == "Ready") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Ready"),
+                conditions.iter().any(|c| c.type_ == "Ready"),
                 "Missing Ready condition"
             );
             return;
@@ -2979,9 +2980,9 @@ mod upgrade_reconciler_function_tests {
         assert_eq!(ready.status, "False");
         assert!(ready.message.contains("2/6"));
 
-        let Some(progressing) = conditions.iter().find(|c| c.r#type == "Progressing") else {
+        let Some(progressing) = conditions.iter().find(|c| c.type_ == "Progressing") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Progressing"),
+                conditions.iter().any(|c| c.type_ == "Progressing"),
                 "Missing Progressing condition"
             );
             return;
@@ -2989,9 +2990,9 @@ mod upgrade_reconciler_function_tests {
         assert_eq!(progressing.status, "True");
         assert!(progressing.message.contains("Upgrading shard"));
 
-        let Some(degraded) = conditions.iter().find(|c| c.r#type == "Degraded") else {
+        let Some(degraded) = conditions.iter().find(|c| c.type_ == "Degraded") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Degraded"),
+                conditions.iter().any(|c| c.type_ == "Degraded"),
                 "Missing Degraded condition"
             );
             return;
@@ -3005,9 +3006,9 @@ mod upgrade_reconciler_function_tests {
         let conditions =
             compute_upgrade_conditions(UpgradePhase::InProgress, 6, 2, 1, None, Some(1));
 
-        let Some(degraded) = conditions.iter().find(|c| c.r#type == "Degraded") else {
+        let Some(degraded) = conditions.iter().find(|c| c.type_ == "Degraded") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Degraded"),
+                conditions.iter().any(|c| c.type_ == "Degraded"),
                 "Missing Degraded condition"
             );
             return;
@@ -3025,9 +3026,9 @@ mod upgrade_reconciler_function_tests {
 
         assert_eq!(conditions.len(), 3);
 
-        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+        let Some(ready) = conditions.iter().find(|c| c.type_ == "Ready") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Ready"),
+                conditions.iter().any(|c| c.type_ == "Ready"),
                 "Missing Ready condition"
             );
             return;
@@ -3035,18 +3036,18 @@ mod upgrade_reconciler_function_tests {
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "RollingBack");
 
-        let Some(progressing) = conditions.iter().find(|c| c.r#type == "Progressing") else {
+        let Some(progressing) = conditions.iter().find(|c| c.type_ == "Progressing") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Progressing"),
+                conditions.iter().any(|c| c.type_ == "Progressing"),
                 "Missing Progressing condition"
             );
             return;
         };
         assert_eq!(progressing.status, "True");
 
-        let Some(degraded) = conditions.iter().find(|c| c.r#type == "Degraded") else {
+        let Some(degraded) = conditions.iter().find(|c| c.type_ == "Degraded") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Degraded"),
+                conditions.iter().any(|c| c.type_ == "Degraded"),
                 "Missing Degraded condition"
             );
             return;
@@ -3060,9 +3061,9 @@ mod upgrade_reconciler_function_tests {
         let conditions =
             compute_upgrade_conditions(UpgradePhase::RolledBack, 3, 1, 0, None, Some(1));
 
-        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+        let Some(ready) = conditions.iter().find(|c| c.type_ == "Ready") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Ready"),
+                conditions.iter().any(|c| c.type_ == "Ready"),
                 "Missing Ready condition"
             );
             return;
@@ -3070,9 +3071,9 @@ mod upgrade_reconciler_function_tests {
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "RolledBack");
 
-        let Some(progressing) = conditions.iter().find(|c| c.r#type == "Progressing") else {
+        let Some(progressing) = conditions.iter().find(|c| c.type_ == "Progressing") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Progressing"),
+                conditions.iter().any(|c| c.type_ == "Progressing"),
                 "Missing Progressing condition"
             );
             return;
@@ -3088,9 +3089,9 @@ mod upgrade_reconciler_function_tests {
 
         assert_eq!(conditions.len(), 3);
 
-        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+        let Some(ready) = conditions.iter().find(|c| c.type_ == "Ready") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Ready"),
+                conditions.iter().any(|c| c.type_ == "Ready"),
                 "Missing Ready condition"
             );
             return;
@@ -3098,9 +3099,9 @@ mod upgrade_reconciler_function_tests {
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "PreChecks");
 
-        let Some(progressing) = conditions.iter().find(|c| c.r#type == "Progressing") else {
+        let Some(progressing) = conditions.iter().find(|c| c.type_ == "Progressing") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Progressing"),
+                conditions.iter().any(|c| c.type_ == "Progressing"),
                 "Missing Progressing condition"
             );
             return;
@@ -3118,9 +3119,9 @@ mod upgrade_reconciler_function_tests {
 
         assert_eq!(conditions.len(), 3);
 
-        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+        let Some(ready) = conditions.iter().find(|c| c.type_ == "Ready") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Ready"),
+                conditions.iter().any(|c| c.type_ == "Ready"),
                 "Missing Ready condition"
             );
             return;
@@ -3128,9 +3129,9 @@ mod upgrade_reconciler_function_tests {
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "Pending");
 
-        let Some(progressing) = conditions.iter().find(|c| c.r#type == "Progressing") else {
+        let Some(progressing) = conditions.iter().find(|c| c.type_ == "Progressing") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Progressing"),
+                conditions.iter().any(|c| c.type_ == "Progressing"),
                 "Missing Progressing condition"
             );
             return;
@@ -3144,9 +3145,9 @@ mod upgrade_reconciler_function_tests {
         let conditions =
             compute_upgrade_conditions(UpgradePhase::InProgress, 0, 0, 0, None, Some(1));
 
-        let Some(ready) = conditions.iter().find(|c| c.r#type == "Ready") else {
+        let Some(ready) = conditions.iter().find(|c| c.type_ == "Ready") else {
             assert!(
-                conditions.iter().any(|c| c.r#type == "Ready"),
+                conditions.iter().any(|c| c.type_ == "Ready"),
                 "Missing Ready condition"
             );
             return;
@@ -3214,12 +3215,12 @@ mod upgrade_reconciler_function_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod derive_upgrade_conditions_tests {
     use super::{derive_upgrade_conditions, merge_conditions};
-    use crate::crd::{Condition, UpgradePhase};
+    use crate::crd::{Condition, UpgradePhase, new_condition};
 
     fn find<'a>(conditions: &'a [Condition], ty: &str) -> &'a Condition {
         conditions
             .iter()
-            .find(|c| c.r#type == ty)
+            .find(|c| c.type_ == ty)
             .expect("condition should exist")
     }
 
@@ -3279,7 +3280,7 @@ mod derive_upgrade_conditions_tests {
 
     #[test]
     fn test_merge_upgrade_conditions_preserves_timestamp_when_unchanged() {
-        let old = vec![Condition::new(
+        let old = vec![new_condition(
             "Ready",
             false,
             "Pending",
@@ -3290,7 +3291,7 @@ mod derive_upgrade_conditions_tests {
 
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        let new = vec![Condition::new(
+        let new = vec![new_condition(
             "Ready",
             false,
             "Pending",
@@ -3307,7 +3308,7 @@ mod derive_upgrade_conditions_tests {
 
     #[test]
     fn test_merge_upgrade_conditions_updates_timestamp_on_flip() {
-        let old = vec![Condition::new(
+        let old = vec![new_condition(
             "Ready",
             false,
             "Upgrading",
@@ -3318,7 +3319,7 @@ mod derive_upgrade_conditions_tests {
 
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        let new = vec![Condition::new(
+        let new = vec![new_condition(
             "Ready",
             true,
             "UpgradeCompleted",

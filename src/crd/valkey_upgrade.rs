@@ -7,7 +7,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::valkey_cluster::Condition;
+use super::Condition;
 
 // ============================================================================
 // ValkeyUpgrade CRD

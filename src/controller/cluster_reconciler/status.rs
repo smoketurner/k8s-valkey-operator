@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::{
     controller::error::Error,
-    crd::{ClusterPhase, Condition, ValkeyCluster, ValkeyClusterStatus, total_pods},
+    crd::{ClusterPhase, Condition, ValkeyCluster, ValkeyClusterStatus, new_condition, total_pods},
     resources::certificate,
     slots::TOTAL_SLOTS,
 };
@@ -114,7 +114,7 @@ fn ready_reason(phase: ClusterPhase) -> (&'static str, &'static str) {
 /// use valkey_operator::crd::ClusterPhase;
 ///
 /// let conditions = derive_cluster_conditions(ClusterPhase::Running, 6, 6, Some(1));
-/// assert!(conditions.iter().any(|c| c.r#type == "Ready" && c.status == "True"));
+/// assert!(conditions.iter().any(|c| c.type_ == "Ready" && c.status == "True"));
 /// ```
 pub fn derive_cluster_conditions(
     phase: ClusterPhase,
@@ -137,8 +137,8 @@ pub fn derive_cluster_conditions(
     };
 
     vec![
-        Condition::new("Ready", ready, rr, rm, generation),
-        Condition::new(
+        new_condition("Ready", ready, rr, rm, generation),
+        new_condition(
             "Progressing",
             progressing,
             if progressing {
@@ -153,7 +153,7 @@ pub fn derive_cluster_conditions(
             },
             generation,
         ),
-        Condition::new(
+        new_condition(
             "Degraded",
             degraded,
             if degraded {
@@ -168,7 +168,7 @@ pub fn derive_cluster_conditions(
             },
             generation,
         ),
-        Condition::new(
+        new_condition(
             "ClusterFormed",
             cluster_formed,
             if cluster_formed {
@@ -183,7 +183,7 @@ pub fn derive_cluster_conditions(
             },
             generation,
         ),
-        Condition::new(
+        new_condition(
             "SlotsAssigned",
             slots_assigned,
             if slots_assigned {
@@ -206,7 +206,7 @@ pub fn derive_cluster_conditions(
 pub fn merge_conditions(existing: &[Condition], new: Vec<Condition>) -> Vec<Condition> {
     let mut merged = Vec::with_capacity(new.len());
     for mut condition in new {
-        let old = existing.iter().find(|c| c.r#type == condition.r#type);
+        let old = existing.iter().find(|c| c.type_ == condition.type_);
         if let Some(prev) = old
             && prev.status == condition.status
         {
@@ -412,7 +412,7 @@ mod tests {
     fn find_condition<'a>(conditions: &'a [Condition], ty: &str) -> &'a Condition {
         conditions
             .iter()
-            .find(|c| c.r#type == ty)
+            .find(|c| c.type_ == ty)
             .expect("condition should exist")
     }
 
@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn test_merge_conditions_preserves_timestamp_when_status_unchanged() {
-        let old = vec![Condition::new(
+        let old = vec![new_condition(
             "Ready",
             true,
             "ClusterHealthy",
@@ -621,7 +621,7 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        let new = vec![Condition::new(
+        let new = vec![new_condition(
             "Ready",
             true,
             "ClusterHealthy",
@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn test_merge_conditions_updates_timestamp_when_status_flips() {
-        let old = vec![Condition::new(
+        let old = vec![new_condition(
             "Ready",
             false,
             "Creating",
@@ -649,7 +649,7 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        let new = vec![Condition::new(
+        let new = vec![new_condition(
             "Ready",
             true,
             "ClusterHealthy",
@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_merge_conditions_adds_new_condition() {
-        let old = vec![Condition::new(
+        let old = vec![new_condition(
             "Ready",
             true,
             "ClusterHealthy",
@@ -674,8 +674,8 @@ mod tests {
             Some(1),
         )];
         let new = vec![
-            Condition::new("Ready", true, "ClusterHealthy", "OK", Some(1)),
-            Condition::new("Progressing", false, "ReconcileComplete", "Done", Some(1)),
+            new_condition("Ready", true, "ClusterHealthy", "OK", Some(1)),
+            new_condition("Progressing", false, "ReconcileComplete", "Done", Some(1)),
         ];
         let merged = merge_conditions(&old, new);
         assert_eq!(merged.len(), 2);
