@@ -984,6 +984,7 @@ pub(crate) async fn check_cluster_health(
             healthy_replicas: 0,
             slots_assigned: 0,
             topology: None,
+            max_replica_lag: None,
         });
     }
 
@@ -997,6 +998,7 @@ pub(crate) async fn check_cluster_health(
                 healthy_replicas: 0,
                 slots_assigned: 0,
                 topology: None,
+                max_replica_lag: None,
             });
         }
     };
@@ -1012,6 +1014,7 @@ pub(crate) async fn check_cluster_health(
                 healthy_replicas: 0,
                 slots_assigned: 0,
                 topology: None,
+                max_replica_lag: None,
             });
         }
     };
@@ -1027,6 +1030,7 @@ pub(crate) async fn check_cluster_health(
                 healthy_replicas: 0,
                 slots_assigned: cluster_info.slots_assigned,
                 topology: None,
+                max_replica_lag: None,
             });
         }
     };
@@ -1059,6 +1063,9 @@ pub(crate) async fn check_cluster_health(
 
     let masters = cluster_nodes.masters();
 
+    let replica_lags = observe_replica_lags(obj, ctx, namespace, &cluster_nodes).await;
+    let max_replica_lag = replica_lags.values().copied().max();
+
     let topology = ClusterTopology {
         masters: masters
             .iter()
@@ -1073,7 +1080,7 @@ pub(crate) async fn check_cluster_health(
                         .map(|r| ReplicaNode {
                             node_id: r.node_id.clone(),
                             pod_name: extract_pod_name(&r.address),
-                            replication_lag: 0,
+                            replication_lag: replica_lags.get(&r.node_id).copied().unwrap_or(0),
                         })
                         .collect(),
                 }
@@ -1087,7 +1094,76 @@ pub(crate) async fn check_cluster_health(
         healthy_replicas: cluster_state.healthy_replicas_count(),
         slots_assigned: cluster_state.cluster_info.slots_assigned,
         topology: Some(topology),
+        max_replica_lag,
     })
+}
+
+/// Observe replication lag per replica.
+///
+/// Returns a map of replica `node_id` → observed lag in bytes. Per-replica
+/// connection or query failures are logged at debug level and the replica is
+/// omitted from the map — callers treat absence as "not observed" rather than
+/// "infinite lag" so a transient connection blip cannot flip
+/// `ReplicasInSync` to False.
+async fn observe_replica_lags(
+    obj: &ValkeyCluster,
+    ctx: &Context,
+    namespace: &str,
+    cluster_nodes: &crate::client::types::ParsedClusterNodes,
+) -> std::collections::HashMap<String, i64> {
+    let mut lags = std::collections::HashMap::new();
+    for master in cluster_nodes.masters() {
+        let master_port: u16 = master.port.try_into().unwrap_or(6379);
+        let master_client = match ctx
+            .connect_to_host(obj, namespace, &master.ip, master_port)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(
+                    node_id = %master.node_id,
+                    error = %e,
+                    "Skipping replica-lag observation: master connection failed"
+                );
+                continue;
+            }
+        };
+
+        for replica in cluster_nodes.replicas_of(&master.node_id) {
+            let replica_port: u16 = replica.port.try_into().unwrap_or(6379);
+            let replica_client = match ctx
+                .connect_to_host(obj, namespace, &replica.ip, replica_port)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!(
+                        node_id = %replica.node_id,
+                        error = %e,
+                        "Skipping replica-lag observation: replica connection failed"
+                    );
+                    continue;
+                }
+            };
+
+            match replica_client.get_replication_lag(&master_client).await {
+                Ok(lag) => {
+                    lags.insert(replica.node_id.clone(), lag);
+                }
+                Err(e) => {
+                    debug!(
+                        node_id = %replica.node_id,
+                        error = %e,
+                        "Skipping replica-lag observation: INFO REPLICATION failed"
+                    );
+                }
+            }
+            let _ = replica_client.close().await;
+        }
+
+        let _ = master_client.close().await;
+    }
+    lags
 }
 
 async fn get_current_master_count(
@@ -1603,6 +1679,7 @@ mod tests {
             healthy_replicas: 0,
             slots_assigned: 0,
             topology: None,
+            max_replica_lag: None,
         };
         assert!(!status.is_healthy);
         assert_eq!(status.healthy_masters, 0);
@@ -1617,6 +1694,7 @@ mod tests {
             healthy_replicas: 3,
             slots_assigned: 16384,
             topology: None,
+            max_replica_lag: None,
         };
         assert!(status.is_healthy);
         assert_eq!(status.healthy_masters, 3);
