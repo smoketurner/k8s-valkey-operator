@@ -41,6 +41,16 @@ use super::{Condition, NodeId};
     shortname = "vc",
     status = "ValkeyClusterStatus",
     namespaced,
+    // Categories: appear in `kubectl get all` and `kubectl get valkey`.
+    category = "all",
+    category = "valkey",
+    // Scale subresource: `kubectl scale vc/<name> --replicas=N` adjusts
+    // spec.masters. HPA integration works via the labelSelector path.
+    scale = r#"{
+        "specReplicasPath": ".spec.masters",
+        "statusReplicasPath": ".status.readyMasters",
+        "labelSelectorPath": ".status.selector"
+    }"#,
     // Print columns for kubectl get
     printcolumn = r#"{"name":"Phase", "type":"string", "jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Ready", "type":"string", "jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
@@ -773,6 +783,12 @@ pub struct ValkeyClusterStatus {
     /// Number of ready replica nodes.
     #[serde(default)]
     pub ready_replicas: i32,
+
+    /// Pod label selector for HPA integration via the scale subresource.
+    /// Rendered as a comma-separated label-selector string (e.g.,
+    /// `app.kubernetes.io/name=my-cluster,app.kubernetes.io/instance=my-cluster`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
 
     /// Assigned hash slots in "assigned/total" format (e.g., "16384/16384").
     #[serde(default)]

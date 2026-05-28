@@ -11,6 +11,9 @@ spec:
     singular: valkeycluster
     shortNames:
       - vc
+    categories:
+      - all
+      - valkey
   scope: Namespaced
   versions:
     - name: v1alpha1
@@ -18,6 +21,10 @@ spec:
       storage: true
       subresources:
         status: {}
+        scale:
+          specReplicasPath: .spec.masters
+          statusReplicasPath: .status.readyMasters
+          labelSelectorPath: .status.selector
       additionalPrinterColumns:
         - name: Phase
           type: string
@@ -371,6 +378,11 @@ spec:
                   type: integer
                 readyReplicas:
                   type: integer
+                selector:
+                  type: string
+                  description: |
+                    Pod label selector for the scale subresource (HPA integration).
+                    Rendered as a comma-separated label-selector string.
                 assignedSlots:
                   type: string
                   description: Assigned slots in "assigned/16384" format
