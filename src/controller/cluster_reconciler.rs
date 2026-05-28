@@ -8,8 +8,8 @@ mod scaling;
 mod status;
 
 pub(crate) use deletion::{execute_forget_removed_nodes, handle_deletion};
-pub use status::ClusterHealthStatus;
 pub(crate) use status::StatusUpdate;
+pub use status::{ClusterHealthStatus, derive_cluster_conditions, merge_conditions};
 
 use std::str::FromStr;
 use std::sync::Arc;
