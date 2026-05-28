@@ -76,3 +76,29 @@ pub fn degraded_condition(
 pub fn error_condition(reason: &str, message: &str, generation: Option<i64>) -> Condition {
     new_condition("Error", true, reason, message, generation)
 }
+
+/// Construct a tri-state condition where the status may be unknown.
+///
+/// `None` produces a `status: "Unknown"` condition — the Kubernetes convention
+/// when the operator has no observation for this signal yet.
+pub fn tri_state_condition(
+    condition_type: &str,
+    status: Option<bool>,
+    reason: &str,
+    message: &str,
+    generation: Option<i64>,
+) -> Condition {
+    let status_str = match status {
+        Some(true) => "True".to_string(),
+        Some(false) => "False".to_string(),
+        None => "Unknown".to_string(),
+    };
+    Condition {
+        type_: condition_type.to_string(),
+        status: status_str,
+        reason: reason.to_string(),
+        message: message.to_string(),
+        last_transition_time: Time(jiff::Timestamp::now()),
+        observed_generation: generation,
+    }
+}
