@@ -198,7 +198,7 @@ pub struct ClusterNodeInfo {
     pub pod_name: String,
 
     /// Pod ordinal in the StatefulSet (e.g., 0, 1, 2).
-    pub ordinal: i32,
+    pub ordinal: crate::crd::PodOrdinal,
 
     /// Pod endpoint (IP and port). None if pod not yet running.
     pub endpoint: Option<Endpoint>,
@@ -280,7 +280,7 @@ pub struct ClusterTopology {
     namespace: String,
 
     // Pre-built indexes for fast lookups
-    ordinal_index: HashMap<i32, usize>,
+    ordinal_index: HashMap<crate::crd::PodOrdinal, usize>,
     ip_index: HashMap<String, usize>,
     node_id_index: HashMap<crate::crd::NodeId, usize>,
 }
@@ -332,16 +332,17 @@ impl ClusterTopology {
             };
 
             // Extract ordinal from pod name (e.g., "my-cluster-3" -> 3)
-            let ordinal = pod_name
+            let ordinal_raw = pod_name
                 .rsplit('-')
                 .next()
                 .and_then(|s| s.parse::<i32>().ok())
                 .unwrap_or(-1);
 
-            if ordinal < 0 {
+            if ordinal_raw < 0 {
                 // Skip pods that don't match StatefulSet naming convention
                 continue;
             }
+            let ordinal = crate::crd::PodOrdinal::new(ordinal_raw);
 
             let dns_name = super::cluster_init::pod_dns_name(cluster_name, namespace, ordinal);
 
@@ -451,11 +452,13 @@ impl ClusterTopology {
 
         for (pod_name, ip, port) in pod_ips {
             // Extract ordinal from pod name
-            let ordinal = pod_name
-                .rsplit('-')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let ordinal = crate::crd::PodOrdinal::new(
+                pod_name
+                    .rsplit('-')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0),
+            );
 
             let dns_name = super::cluster_init::pod_dns_name(cluster_name, namespace, ordinal);
             let endpoint = Endpoint::new(ip.clone(), *port);
@@ -531,7 +534,11 @@ impl ClusterTopology {
     // =========================================================================
 
     /// Look up a node by its ordinal.
-    pub fn by_ordinal(&self, ordinal: i32) -> Option<&ClusterNodeInfo> {
+    pub fn by_ordinal(
+        &self,
+        ordinal: impl Into<crate::crd::PodOrdinal>,
+    ) -> Option<&ClusterNodeInfo> {
+        let ordinal = ordinal.into();
         self.ordinal_index
             .get(&ordinal)
             .and_then(|&idx| self.nodes.get(idx))
@@ -801,7 +808,7 @@ impl ClusterTopology {
     }
 
     /// Build an IP to ordinal mapping (for compatibility with existing code).
-    pub fn ip_to_ordinal_map(&self) -> HashMap<String, i32> {
+    pub fn ip_to_ordinal_map(&self) -> HashMap<String, crate::crd::PodOrdinal> {
         self.nodes
             .iter()
             .filter_map(|n| n.ip().map(|ip| (ip.to_string(), n.ordinal)))
@@ -809,7 +816,7 @@ impl ClusterTopology {
     }
 
     /// Build an ordinal to node_id mapping (for compatibility with existing code).
-    pub fn ordinal_to_node_id_map(&self) -> HashMap<i32, crate::crd::NodeId> {
+    pub fn ordinal_to_node_id_map(&self) -> HashMap<crate::crd::PodOrdinal, crate::crd::NodeId> {
         self.nodes
             .iter()
             .filter_map(|n| n.node_id.as_ref().map(|nid| (n.ordinal, nid.clone())))
@@ -879,7 +886,7 @@ mod tests {
     fn make_node(ordinal: i32, role: NodeRole, node_id: Option<&str>) -> ClusterNodeInfo {
         ClusterNodeInfo {
             pod_name: format!("test-cluster-{}", ordinal),
-            ordinal,
+            ordinal: crate::crd::PodOrdinal::new(ordinal),
             endpoint: Some(Endpoint::new(
                 format!("10.0.0.{}", ordinal + 1),
                 DEFAULT_VALKEY_PORT,
@@ -1082,8 +1089,8 @@ mod tests {
         let topology = make_topology(nodes);
 
         let map = topology.ip_to_ordinal_map();
-        assert_eq!(map.get("10.0.0.1"), Some(&0));
-        assert_eq!(map.get("10.0.0.2"), Some(&1));
+        assert_eq!(map.get("10.0.0.1"), Some(&crate::crd::PodOrdinal::new(0)));
+        assert_eq!(map.get("10.0.0.2"), Some(&crate::crd::PodOrdinal::new(1)));
     }
 
     #[test]
@@ -1095,8 +1102,14 @@ mod tests {
         let topology = make_topology(nodes);
 
         let map = topology.ordinal_to_node_id_map();
-        assert_eq!(map.get(&0), Some(&crate::crd::NodeId::from("abc123")));
-        assert_eq!(map.get(&1), Some(&crate::crd::NodeId::from("def456")));
+        assert_eq!(
+            map.get(&crate::crd::PodOrdinal::new(0)),
+            Some(&crate::crd::NodeId::from("abc123"))
+        );
+        assert_eq!(
+            map.get(&crate::crd::PodOrdinal::new(1)),
+            Some(&crate::crd::NodeId::from("def456"))
+        );
     }
 
     #[test]

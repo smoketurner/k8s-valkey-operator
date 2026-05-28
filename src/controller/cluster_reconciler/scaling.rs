@@ -203,7 +203,7 @@ pub(crate) async fn execute_scale_down(
         info!(
             node_id = %node.node_id,
             ip = %node.ip,
-            ordinal = ordinal,
+            ordinal = %ordinal,
             slot_ranges = slot_ranges.len(),
             "Connecting to source node for slot migration"
         );
@@ -227,12 +227,15 @@ pub(crate) async fn execute_scale_down(
                 ));
             };
 
-            let target_ordinal = ip_to_ordinal.get(&dest_node.ip).copied().unwrap_or(0);
+            let target_ordinal = ip_to_ordinal
+                .get(&dest_node.ip)
+                .copied()
+                .unwrap_or_default();
 
             info!(
                 from_node = %node.node_id,
                 to_node = %dest_node.node_id,
-                target_ordinal = target_ordinal,
+                target_ordinal = %target_ordinal,
                 start_slot = range.start,
                 end_slot = range.end,
                 "Migrating slot range using CLUSTER MIGRATESLOTS"
@@ -352,7 +355,8 @@ pub(crate) async fn execute_rebalance_slots(
     let target_distribution = calculate_distribution(target_masters as u16);
 
     let mut current_ownership: HashMap<u16, crate::crd::NodeId> = HashMap::new();
-    let mut node_info: HashMap<crate::crd::NodeId, (String, i32)> = HashMap::new();
+    let mut node_info: HashMap<crate::crd::NodeId, (String, crate::crd::PodOrdinal)> =
+        HashMap::new();
 
     for master in &masters {
         if let Some(&ordinal) = ip_to_ordinal.get(&master.ip) {
@@ -366,7 +370,12 @@ pub(crate) async fn execute_rebalance_slots(
     }
 
     let mut masters_sorted: Vec<_> = masters.clone();
-    masters_sorted.sort_by_key(|m| ip_to_ordinal.get(&m.ip).copied().unwrap_or(i32::MAX));
+    masters_sorted.sort_by_key(|m| {
+        ip_to_ordinal
+            .get(&m.ip)
+            .copied()
+            .unwrap_or(crate::crd::PodOrdinal::new(i32::MAX))
+    });
 
     let mut migrations_by_source: HashMap<crate::crd::NodeId, Vec<(u16, crate::crd::NodeId)>> =
         HashMap::new();
@@ -406,7 +415,7 @@ pub(crate) async fn execute_rebalance_slots(
 
         info!(
             source_node = %source_node_id,
-            ordinal = ordinal,
+            ordinal = %ordinal,
             destinations = by_dest.len(),
             "Connecting to source node for slot migration"
         );
@@ -445,7 +454,7 @@ pub(crate) async fn execute_rebalance_slots(
                 let target_ordinal = node_info
                     .get(&dest_node_id)
                     .map(|(_, ord)| *ord)
-                    .unwrap_or(0);
+                    .unwrap_or_default();
 
                 match source_client
                     .cluster_migrateslots(start, end, &dest_node_id)
@@ -521,13 +530,13 @@ pub(crate) async fn promote_replicas_to_masters(
     namespace: &str,
     current_masters: i32,
     target_masters: i32,
-) -> Result<Vec<i32>, Error> {
+) -> Result<Vec<crate::crd::PodOrdinal>, Error> {
     if target_masters <= current_masters {
         return Ok(Vec::new());
     }
 
     let name = obj.name_any();
-    let mut promoted = Vec::new();
+    let mut promoted: Vec<crate::crd::PodOrdinal> = Vec::new();
 
     let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
 
@@ -543,7 +552,7 @@ pub(crate) async fn promote_replicas_to_masters(
     for node in to_promote {
         info!(
             cluster = %name,
-            ordinal = node.ordinal,
+            ordinal = %node.ordinal,
             node_id = %node.node_id.as_ref().map_or("unknown", |n| n.as_str()),
             "Promoting replica to master via CLUSTER RESET SOFT"
         );
@@ -552,11 +561,11 @@ pub(crate) async fn promote_replicas_to_masters(
 
         match replica_client.cluster_reset(false).await {
             Ok(()) => {
-                info!(cluster = %name, ordinal = node.ordinal, "Replica promoted to master");
+                info!(cluster = %name, ordinal = %node.ordinal, "Replica promoted to master");
                 promoted.push(node.ordinal);
             }
             Err(e) => {
-                warn!(cluster = %name, ordinal = node.ordinal, error = %e, "Failed to promote replica");
+                warn!(cluster = %name, ordinal = %node.ordinal, error = %e, "Failed to promote replica");
             }
         }
 
@@ -574,12 +583,12 @@ pub(crate) async fn promote_replicas_to_masters(
             {
                 info!(
                     cluster = %name,
-                    ordinal = ordinal,
+                    ordinal = %ordinal,
                     ip = %endpoint.ip(),
                     "Re-adding promoted node via CLUSTER MEET"
                 );
                 if let Err(e) = client.cluster_meet(endpoint.ip(), endpoint.port()).await {
-                    warn!(cluster = %name, ordinal = ordinal, error = %e, "Failed to CLUSTER MEET promoted node");
+                    warn!(cluster = %name, ordinal = %ordinal, error = %e, "Failed to CLUSTER MEET promoted node");
                 }
             }
         }
@@ -656,7 +665,7 @@ async fn wait_for_slot_migration(
     obj: &ValkeyCluster,
     namespace: &str,
     source_client: &crate::client::ValkeyClient,
-    target_ordinal: i32,
+    target_ordinal: crate::crd::PodOrdinal,
     start_slot: u16,
     end_slot: u16,
     target_node_id: &crate::crd::NodeId,
