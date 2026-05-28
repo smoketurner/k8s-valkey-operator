@@ -438,7 +438,7 @@ async fn test_condition_updates_during_failure() {
         .expect("Should get resource");
     let status = resource.status.expect("Should have status");
 
-    let ready_condition = status.conditions.iter().find(|c| c.r#type == "Ready");
+    let ready_condition = status.conditions.iter().find(|c| c.type_ == "Ready");
 
     if let Some(cond) = ready_condition {
         println!("Initial Ready condition: status={}", cond.status);
@@ -478,7 +478,7 @@ async fn test_condition_updates_during_failure() {
         .expect("Should get resource");
     let status = recovered.status.expect("Should have status");
 
-    let ready_condition = status.conditions.iter().find(|c| c.r#type == "Ready");
+    let ready_condition = status.conditions.iter().find(|c| c.type_ == "Ready");
 
     if let Some(cond) = ready_condition {
         println!("After recovery Ready condition: status={}", cond.status);

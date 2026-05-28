@@ -10,7 +10,9 @@
 mod common;
 
 mod crd_tests {
-    use valkey_operator::crd::{ClusterPhase, Condition};
+    use valkey_operator::crd::{
+        ClusterPhase, degraded_condition, progressing_condition, ready_condition,
+    };
 
     #[test]
     fn test_phase_display() {
@@ -48,8 +50,8 @@ mod crd_tests {
 
     #[test]
     fn test_condition_ready() {
-        let condition = Condition::ready(true, "AllReady", "All components ready", Some(1));
-        assert_eq!(condition.r#type, "Ready");
+        let condition = ready_condition(true, "AllReady", "All components ready", Some(1));
+        assert_eq!(condition.type_, "Ready");
         assert_eq!(condition.status, "True");
         assert_eq!(condition.reason, "AllReady");
         assert_eq!(condition.message, "All components ready");
@@ -58,21 +60,21 @@ mod crd_tests {
 
     #[test]
     fn test_condition_not_ready() {
-        let condition = Condition::ready(false, "NotReady", "Components starting", None);
+        let condition = ready_condition(false, "NotReady", "Components starting", None);
         assert_eq!(condition.status, "False");
     }
 
     #[test]
     fn test_condition_progressing() {
-        let condition = Condition::progressing(true, "Reconciling", "Updating resources", Some(2));
-        assert_eq!(condition.r#type, "Progressing");
+        let condition = progressing_condition(true, "Reconciling", "Updating resources", Some(2));
+        assert_eq!(condition.type_, "Progressing");
         assert_eq!(condition.status, "True");
     }
 
     #[test]
     fn test_condition_degraded() {
-        let condition = Condition::degraded(true, "PodFailed", "Pod in crash loop", Some(3));
-        assert_eq!(condition.r#type, "Degraded");
+        let condition = degraded_condition(true, "PodFailed", "Pod in crash loop", Some(3));
+        assert_eq!(condition.type_, "Degraded");
         assert_eq!(condition.status, "True");
     }
 }
