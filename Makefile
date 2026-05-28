@@ -19,7 +19,7 @@ CARGO ?= cargo
 OPERATOR_SDK ?= operator-sdk
 
 .PHONY: all build test install uninstall deploy undeploy run clean help \
-        bundle-sync bundle-validate bundle-build bundle-push
+        bundle-sync bundle-set-version bundle-validate bundle-build bundle-push
 
 all: build
 
@@ -108,6 +108,16 @@ bundle-sync: ## Refresh bundle/manifests/ CRDs from config/crd/ (run after CRD e
 	@cp config/crd/valkeycluster.yaml bundle/manifests/valkeyclusters.valkey-operator.smoketurner.com.yaml
 	@cp config/crd/valkeyupgrade.yaml bundle/manifests/valkeyupgrades.valkey-operator.smoketurner.com.yaml
 	@echo "Bundle CRDs synced from config/crd/"
+
+bundle-set-version: ## Set the CSV version (VERSION=X.Y.Z, no v prefix). Used by the release workflow.
+	@test -n "$(VERSION)" || { echo "ERROR: VERSION is required (e.g., make bundle-set-version VERSION=0.1.0)"; exit 1; }
+	@CSV=bundle/manifests/valkey-operator.clusterserviceversion.yaml; \
+	  sed -i.bak \
+	    -e "s|^  name: valkey-operator\.v[0-9][0-9.]*|  name: valkey-operator.v$(VERSION)|" \
+	    -e "s|^  version: [0-9][0-9.]*|  version: $(VERSION)|" \
+	    -e "s|k8s-valkey-operator:v[0-9][0-9.]*|k8s-valkey-operator:v$(VERSION)|g" \
+	    "$$CSV" && rm -f "$$CSV.bak"
+	@echo "CSV version set to $(VERSION)"
 
 bundle-validate: ## Validate the OLM bundle (requires operator-sdk $(OPERATOR_SDK_VERSION))
 	@command -v $(OPERATOR_SDK) >/dev/null 2>&1 || { \
