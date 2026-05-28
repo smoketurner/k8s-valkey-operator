@@ -1,12 +1,14 @@
 //! Validation policies for ValkeyCluster admission webhooks.
 //!
-//! Policies are organized into tiers:
-//! - Tier 1 (Critical): Always enforced (replica validation)
-//! - Tier 2 (Update): Only enforced on UPDATE operations (immutability, upgrade protection)
+//! Numeric bounds (masters, replicasPerMaster) and field immutability
+//! (TLS issuer name, auth secret name) live in the CRD schema as OpenAPI
+//! constraints and `x-kubernetes-validations` CEL rules. The webhook
+//! covers only what the schema can't express:
+//! - `image_change`: semver-aware downgrade protection
+//! - `upgrade_protection`: blocks spec changes while an upgrade is in flight
+//!   (driven by the `upgrade-in-progress` annotation on the cluster)
 
 pub mod image_change;
-pub mod immutability;
-pub mod replicas;
 pub mod upgrade_protection;
 
 use crate::crd::ValkeyCluster;
@@ -61,29 +63,17 @@ impl<'a> ValidationContext<'a> {
     }
 }
 
-/// Run all validation policies
+/// Run all validation policies. Only relevant on UPDATE — CREATE-time
+/// shape validation is handled entirely by the CRD schema.
 pub fn validate_all(ctx: &ValidationContext<'_>) -> ValidationResult {
-    // Tier 1: Critical validations (always enforced)
-    let result = replicas::validate(ctx);
-    if !result.allowed {
-        return result;
-    }
-
-    // Tier 2: Update validations (only for UPDATE operations)
     if ctx.is_update() {
-        // Check upgrade protection first - this is the most important check
-        // to prevent changes during an active upgrade
+        // Upgrade protection runs first: while an upgrade is in flight, no
+        // other spec change should be evaluated at all.
         let result = upgrade_protection::validate(ctx);
         if !result.allowed {
             return result;
         }
 
-        let result = immutability::validate(ctx);
-        if !result.allowed {
-            return result;
-        }
-
-        // Block direct image downgrades unless allow_downgrade is set
         let result = image_change::validate(ctx);
         if !result.allowed {
             return result;

@@ -262,20 +262,6 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_masters_on_create() {
-        let resource = create_resource(2); // Below minimum of 3
-        let ctx = ValidationContext {
-            resource: &resource,
-            old_resource: None,
-            dry_run: false,
-            namespace: Some("default"),
-        };
-
-        let result = validate_all(&ctx);
-        assert!(!result.allowed);
-    }
-
-    #[test]
     fn test_valid_update_request() {
         let old = create_resource(3);
         let new = create_resource(6);
@@ -288,22 +274,5 @@ mod tests {
 
         let result = validate_all(&ctx);
         assert!(result.allowed);
-    }
-
-    #[test]
-    fn test_scale_below_minimum_on_update() {
-        let old = create_resource(3);
-        let new = create_resource(2);
-        let ctx = ValidationContext {
-            resource: &new,
-            old_resource: Some(&old),
-            dry_run: false,
-            namespace: Some("default"),
-        };
-
-        let result = validate_all(&ctx);
-        assert!(!result.allowed);
-        // Tier 1 (masters) policy rejects this before Tier 2 (immutability) runs
-        assert!(result.message.unwrap().contains("at least"));
     }
 }
