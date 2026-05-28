@@ -970,36 +970,27 @@ impl std::fmt::Display for ClusterPhase {
 pub enum ConditionType {
     /// Cluster is fully operational and healthy.
     Ready,
-    /// All 16384 hash slots have been assigned to nodes.
-    SlotsAssigned,
-    /// No slot migration is in progress.
-    SlotsStable,
-    /// TLS certificates are valid and not expiring soon.
-    TLSReady,
-    /// All nodes are reachable and cluster is consistent.
-    ClusterHealthy,
-    /// RDB/AOF persistence is functioning correctly.
-    PersistenceHealthy,
-    /// All replicas are synchronized with their masters.
-    ReplicasInSync,
     /// Reconciliation is in progress.
     Progressing,
     /// Cluster is in a degraded state.
     Degraded,
+    /// No slot migration is in progress.
+    SlotsStable,
+    /// All replicas are synchronized with their masters.
+    ReplicasInSync,
+    /// TLS certificates are valid and not expiring soon.
+    TLSReady,
 }
 
 impl std::fmt::Display for ConditionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConditionType::Ready => write!(f, "Ready"),
-            ConditionType::SlotsAssigned => write!(f, "SlotsAssigned"),
-            ConditionType::SlotsStable => write!(f, "SlotsStable"),
-            ConditionType::TLSReady => write!(f, "TLSReady"),
-            ConditionType::ClusterHealthy => write!(f, "ClusterHealthy"),
-            ConditionType::PersistenceHealthy => write!(f, "PersistenceHealthy"),
-            ConditionType::ReplicasInSync => write!(f, "ReplicasInSync"),
             ConditionType::Progressing => write!(f, "Progressing"),
             ConditionType::Degraded => write!(f, "Degraded"),
+            ConditionType::SlotsStable => write!(f, "SlotsStable"),
+            ConditionType::ReplicasInSync => write!(f, "ReplicasInSync"),
+            ConditionType::TLSReady => write!(f, "TLSReady"),
         }
     }
 }
@@ -1208,8 +1199,11 @@ mod tests {
     #[test]
     fn test_condition_type_display() {
         assert_eq!(ConditionType::Ready.to_string(), "Ready");
-        assert_eq!(ConditionType::SlotsAssigned.to_string(), "SlotsAssigned");
-        assert_eq!(ConditionType::ClusterHealthy.to_string(), "ClusterHealthy");
+        assert_eq!(ConditionType::Progressing.to_string(), "Progressing");
+        assert_eq!(ConditionType::Degraded.to_string(), "Degraded");
+        assert_eq!(ConditionType::SlotsStable.to_string(), "SlotsStable");
+        assert_eq!(ConditionType::ReplicasInSync.to_string(), "ReplicasInSync");
+        assert_eq!(ConditionType::TLSReady.to_string(), "TLSReady");
     }
 
     #[test]

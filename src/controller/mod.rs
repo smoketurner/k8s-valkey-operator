@@ -23,6 +23,7 @@ pub mod cluster_topology;
 pub mod cluster_validation;
 pub mod operation_coordination;
 pub mod operation_lock;
+pub mod tls_status;
 
 // ValkeyUpgrade controller
 pub mod upgrade_reconciler;

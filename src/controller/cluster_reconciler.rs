@@ -33,6 +33,7 @@ use crate::{
         context::Context,
         diagnostic_hints::DiagnosticHint,
         error::Error,
+        tls_status,
     },
     crd::{ClusterPhase, ValkeyCluster, total_pods},
     resources::{certificate, common, pdb, services, statefulset},
@@ -186,6 +187,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                 ready_replicas: 0,
                 error_message: Some(&error_msg),
                 health_status: None,
+                tls: None,
                 generation: current_gen,
             }
             .apply()
@@ -216,6 +218,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     ready_replicas: 0,
                     error_message: Some(&error_msg),
                     health_status: None,
+                    tls: None,
                     generation: current_gen,
                 }
                 .apply()
@@ -275,6 +278,8 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
         None
     };
 
+    let tls_observation = tls_status::observe(&obj, &ctx).await;
+
     StatusUpdate {
         api: &api,
         name: &name,
@@ -282,6 +287,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
         ready_replicas: ready_replicas_final,
         error_message: None,
         health_status: health_status.as_ref(),
+        tls: Some(&tls_observation),
         generation: current_gen,
     }
     .apply()
@@ -341,6 +347,7 @@ async fn dispatch_phase(
                     ready_replicas: 0,
                     error_message: Some(&e.to_string()),
                     health_status: None,
+                    tls: None,
                     generation: current_gen,
                 }
                 .apply()
