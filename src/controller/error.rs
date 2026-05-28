@@ -40,10 +40,6 @@ pub enum Error {
     #[error("Timeout: {0}")]
     Timeout(String),
 
-    /// Operation lock conflict - another operation holds the lock
-    #[error("Operation blocked: {current_holder} operation is in progress")]
-    OperationLocked { current_holder: String },
-
     /// Quorum check failed - not enough nodes reachable
     #[error("Insufficient quorum: {reachable} nodes reachable, need {required}")]
     InsufficientQuorum { reachable: i32, required: i32 },
@@ -80,8 +76,6 @@ impl Error {
             Error::Valkey(ve) => ve.is_retryable(),
             Error::Validation(_) | Error::Permanent(_) | Error::MissingField(_) => false,
             Error::Serialization(_) => false,
-            // Lock contention is transient - can retry after lock is released
-            Error::OperationLocked { .. } => true,
             // Quorum errors are permanent - require manual intervention
             Error::InsufficientQuorum { .. } | Error::ForgetQuorumFailed { .. } => false,
             // Failover verification timeout requires investigation
@@ -329,17 +323,6 @@ mod tests {
     }
 
     #[test]
-    fn test_error_display_operation_locked() {
-        let error = Error::OperationLocked {
-            current_holder: "scaling".to_string(),
-        };
-        assert_eq!(
-            error.to_string(),
-            "Operation blocked: scaling operation is in progress"
-        );
-    }
-
-    #[test]
     fn test_error_display_insufficient_quorum() {
         let error = Error::InsufficientQuorum {
             reachable: 1,
@@ -390,14 +373,6 @@ mod tests {
             (Error::Validation("test".to_string()), false, false),
             (Error::Permanent("test".to_string()), false, false),
             (Error::MissingField("test".to_string()), false, false),
-            // Operation lock is retryable (can retry after lock released)
-            (
-                Error::OperationLocked {
-                    current_holder: "test".to_string(),
-                },
-                true,
-                false,
-            ),
             // Quorum errors are non-retryable (require intervention)
             (
                 Error::InsufficientQuorum {
