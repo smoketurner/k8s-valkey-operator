@@ -11,7 +11,7 @@ VERSION ?= 0.1.0
 BUNDLE_IMG ?= ghcr.io/smoketurner/k8s-valkey-operator-bundle:v$(VERSION)
 
 # operator-sdk version. CI pins this to the same value via the workflow env.
-OPERATOR_SDK_VERSION ?= v1.43.0
+OPERATOR_SDK_VERSION ?= v1.42.2
 
 # Tool binaries
 KUBECTL ?= kubectl

@@ -23,7 +23,7 @@ on:
       - '.github/workflows/bundle-validate.yml'
 
 env:
-  OPERATOR_SDK_VERSION: v1.43.0
+  OPERATOR_SDK_VERSION: v1.42.2
 
 jobs:
   validate:
