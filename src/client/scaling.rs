@@ -57,7 +57,7 @@ pub struct ScalingResult {
     /// Nodes added (for scale up).
     pub nodes_added: Vec<String>,
     /// Nodes removed (for scale down).
-    pub nodes_removed: Vec<String>,
+    pub nodes_removed: Vec<crate::crd::NodeId>,
     /// Error message if operation failed.
     pub error: Option<String>,
 }
@@ -240,8 +240,8 @@ impl ValkeyClient {
         let target_distribution = calculate_distribution(master_count as u16);
 
         // Build current slot ownership map and node info lookup
-        let mut current_ownership: HashMap<u16, String> = HashMap::new();
-        let mut node_info: HashMap<String, (String, u16)> = HashMap::new(); // node_id -> (ip, port)
+        let mut current_ownership: HashMap<u16, crate::crd::NodeId> = HashMap::new();
+        let mut node_info: HashMap<crate::crd::NodeId, (String, u16)> = HashMap::new(); // node_id -> (ip, port)
         for master in &masters {
             node_info.insert(
                 master.node_id.clone(),
@@ -256,8 +256,9 @@ impl ValkeyClient {
 
         // Collect all slot migrations grouped by (source, destination)
         // Key: (source_node_id, dest_node_id), Value: list of slots to migrate
-        let mut migrations: HashMap<(String, String), Vec<u16>> = HashMap::new();
-        let mut unassigned_slots: HashMap<String, Vec<u16>> = HashMap::new();
+        let mut migrations: HashMap<(crate::crd::NodeId, crate::crd::NodeId), Vec<u16>> =
+            HashMap::new();
+        let mut unassigned_slots: HashMap<crate::crd::NodeId, Vec<u16>> = HashMap::new();
 
         for (master, range) in masters.iter().zip(target_distribution.iter()) {
             for slot in range.iter() {
@@ -383,8 +384,8 @@ impl ValkeyClient {
         &self,
         start_slot: u16,
         end_slot: u16,
-        _source_node_id: &str,
-        target_node_id: &str,
+        _source_node_id: &crate::crd::NodeId,
+        target_node_id: &crate::crd::NodeId,
         source_ip: &str,
         source_port: u16,
     ) -> Result<(), ValkeyError> {

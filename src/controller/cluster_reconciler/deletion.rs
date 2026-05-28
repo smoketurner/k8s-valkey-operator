@@ -41,7 +41,8 @@ pub(crate) async fn execute_forget_removed_nodes(
         ClusterTopology::build(&ctx.client, namespace, &cluster_name, Some(&cluster_nodes)).await?;
 
     let orphaned = topology.orphaned_nodes(&cluster_nodes);
-    let orphan_node_ids: Vec<String> = orphaned.iter().map(|n| n.node_id.clone()).collect();
+    let orphan_node_ids: Vec<crate::crd::NodeId> =
+        orphaned.iter().map(|n| n.node_id.clone()).collect();
 
     if orphan_node_ids.is_empty() {
         return Ok(true);
@@ -72,7 +73,7 @@ pub(crate) async fn forget_nodes_with_quorum(
     obj: &ValkeyCluster,
     ctx: &Context,
     namespace: &str,
-    node_ids_to_forget: &[String],
+    node_ids_to_forget: &[crate::crd::NodeId],
 ) -> Result<(), Error> {
     let name = obj.name_any();
     let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;

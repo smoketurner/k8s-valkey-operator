@@ -588,7 +588,8 @@ pub async fn setup_replicas(
     // Parse the cluster nodes output to get master node IDs
     // During initial setup, Valkey uses DNS names (cluster-announce-hostname),
     // so extract_ordinal_from_address works correctly. Pass None for ip_to_ordinal.
-    let master_node_ids: Vec<String> = parse_master_node_ids(&nodes_raw, masters as usize, None)?;
+    let master_node_ids: Vec<crate::crd::NodeId> =
+        parse_master_node_ids(&nodes_raw, masters as usize, None)?;
 
     if master_node_ids.len() != masters as usize {
         return Err(ValkeyError::ClusterNotReady(format!(
@@ -704,8 +705,8 @@ fn parse_master_node_ids(
     nodes_output: &str,
     expected_masters: usize,
     ip_to_ordinal: Option<&std::collections::HashMap<String, i32>>,
-) -> Result<Vec<String>, ValkeyError> {
-    let mut master_ids: Vec<(String, i32)> = Vec::new();
+) -> Result<Vec<crate::crd::NodeId>, ValkeyError> {
+    let mut master_ids: Vec<(crate::crd::NodeId, i32)> = Vec::new();
 
     for line in nodes_output.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -731,19 +732,19 @@ fn parse_master_node_ids(
                 // Extract ordinal: first try IP→ordinal map, then fall back to address parsing
                 let ordinal = get_ordinal_from_address(address, ip_to_ordinal)
                     .unwrap_or(master_ids.len() as i32);
-                master_ids.push(((*node_id).to_string(), ordinal));
+                master_ids.push((crate::crd::NodeId::from((*node_id).to_string()), ordinal));
             }
         }
     }
 
     // Sort by ordinal to ensure consistent ordering
     master_ids.sort_by_key(|(_, ordinal)| *ordinal);
-    let ids: Vec<String> = master_ids.into_iter().map(|(id, _)| id).collect();
+    let ids: Vec<crate::crd::NodeId> = master_ids.into_iter().map(|(id, _)| id).collect();
 
     if ids.len() < expected_masters {
         // If we don't have enough masters with slots, also include masters without slots
         // This handles the case where we're getting node IDs before slot assignment
-        let mut all_masters: Vec<(String, i32)> = Vec::new();
+        let mut all_masters: Vec<(crate::crd::NodeId, i32)> = Vec::new();
 
         for line in nodes_output.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -760,7 +761,7 @@ fn parse_master_node_ids(
             if flags.contains("master") && !flags.contains("fail") {
                 let ordinal = get_ordinal_from_address(address, ip_to_ordinal)
                     .unwrap_or(all_masters.len() as i32);
-                all_masters.push(((*node_id).to_string(), ordinal));
+                all_masters.push((crate::crd::NodeId::from((*node_id).to_string()), ordinal));
             }
         }
 
@@ -880,11 +881,11 @@ pub async fn detect_orphaned_nodes(
 #[instrument(skip(cluster, password, tls_certs, strategy))]
 pub async fn forget_nodes_with_retry(
     cluster: &ValkeyCluster,
-    nodes_to_forget: &[String], // Node IDs
+    nodes_to_forget: &[crate::crd::NodeId],
     password: Option<&str>,
     tls_certs: Option<&TlsCertData>,
     strategy: &ConnectionStrategy,
-) -> Result<Vec<String>, ValkeyError> {
+) -> Result<Vec<crate::crd::NodeId>, ValkeyError> {
     let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
     let mut forgotten = Vec::new();
     let cluster_name = cluster.name_any();

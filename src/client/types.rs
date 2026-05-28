@@ -266,7 +266,7 @@ pub use crate::slots::distribution::SlotRange;
 #[derive(Debug, Clone)]
 pub struct ClusterNode {
     /// Unique node ID (40 hex characters).
-    pub node_id: String,
+    pub node_id: crate::crd::NodeId,
     /// IP address and client port.
     pub address: String,
     /// IP address only.
@@ -278,7 +278,7 @@ pub struct ClusterNode {
     /// Node flags.
     pub flags: NodeFlags,
     /// Master node ID if this is a replica, "-" otherwise.
-    pub master_id: Option<String>,
+    pub master_id: Option<crate::crd::NodeId>,
     /// Ping sent timestamp.
     pub ping_sent: i64,
     /// Pong received timestamp.
@@ -337,10 +337,12 @@ impl ClusterNode {
             )));
         }
 
-        let node_id = parts
-            .first()
-            .ok_or_else(|| ParseError::MissingField("node_id".to_string()))?
-            .to_string();
+        let node_id = crate::crd::NodeId::from(
+            parts
+                .first()
+                .ok_or_else(|| ParseError::MissingField("node_id".to_string()))?
+                .to_string(),
+        );
 
         // Parse address: ip:port@cport or ip:port
         let addr_field = parts
@@ -384,7 +386,7 @@ impl ClusterNode {
         let master_id = if *master_field == "-" {
             None
         } else {
-            Some(master_field.to_string())
+            Some(crate::crd::NodeId::from(master_field.to_string()))
         };
 
         let ping_sent = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -455,16 +457,16 @@ impl ParsedClusterNodes {
     }
 
     /// Get replicas of a specific master.
-    pub fn replicas_of(&self, master_id: &str) -> Vec<&ClusterNode> {
+    pub fn replicas_of(&self, master_id: &crate::crd::NodeId) -> Vec<&ClusterNode> {
         self.nodes
             .iter()
-            .filter(|n| n.master_id.as_deref() == Some(master_id))
+            .filter(|n| n.master_id.as_ref() == Some(master_id))
             .collect()
     }
 
     /// Get a node by its ID.
-    pub fn get_node(&self, node_id: &str) -> Option<&ClusterNode> {
-        self.nodes.iter().find(|n| n.node_id == node_id)
+    pub fn get_node(&self, node_id: &crate::crd::NodeId) -> Option<&ClusterNode> {
+        self.nodes.iter().find(|n| &n.node_id == node_id)
     }
 
     /// Get total number of slots assigned.
@@ -638,7 +640,9 @@ cluster_my_epoch:2
         assert!(!node.is_myself());
         assert_eq!(
             node.master_id,
-            Some("67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1".to_string())
+            Some(crate::crd::NodeId::from(
+                "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1"
+            ))
         );
         assert!(node.slots.is_empty());
     }
@@ -658,7 +662,9 @@ e7d1eecce10fd6bb5eb35b9f99a514335d9ba9ca 127.0.0.1:6380@16380 slave 67ed2db8d677
         assert!(parsed.all_slots_assigned());
         assert_eq!(parsed.total_slots_assigned(), 16384);
 
-        let replicas = parsed.replicas_of("67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1");
+        let replicas = parsed.replicas_of(&crate::crd::NodeId::from(
+            "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1",
+        ));
         assert_eq!(replicas.len(), 1);
     }
 }

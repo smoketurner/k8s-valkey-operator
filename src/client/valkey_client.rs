@@ -228,7 +228,7 @@ pub enum ClusterSetSlotState {
     /// The slot is being migrated (does not support node-id in fred).
     Migrating,
     /// The slot is owned by the specified node.
-    Node(String),
+    Node(crate::crd::NodeId),
     /// The slot state is cleared (not importing/migrating).
     Stable,
 }
@@ -516,8 +516,13 @@ impl ValkeyClient {
 
     /// Execute CLUSTER REPLICATE to make this node a replica of the specified master.
     #[instrument(skip(self))]
-    pub async fn cluster_replicate(&self, master_node_id: &str) -> Result<(), ValkeyError> {
-        self.client.cluster_replicate(master_node_id).await?;
+    pub async fn cluster_replicate(
+        &self,
+        master_node_id: &crate::crd::NodeId,
+    ) -> Result<(), ValkeyError> {
+        self.client
+            .cluster_replicate(master_node_id.as_str())
+            .await?;
         Ok(())
     }
 
@@ -568,8 +573,8 @@ impl ValkeyClient {
 
     /// Execute CLUSTER FORGET to remove a node from the cluster.
     #[instrument(skip(self))]
-    pub async fn cluster_forget(&self, node_id: &str) -> Result<(), ValkeyError> {
-        self.client.cluster_forget(node_id).await?;
+    pub async fn cluster_forget(&self, node_id: &crate::crd::NodeId) -> Result<(), ValkeyError> {
+        self.client.cluster_forget(node_id.as_str()).await?;
         Ok(())
     }
 
@@ -612,7 +617,7 @@ impl ValkeyClient {
         let fred_state = match state {
             ClusterSetSlotState::Importing => FredState::Importing,
             ClusterSetSlotState::Migrating => FredState::Migrating,
-            ClusterSetSlotState::Node(node_id) => FredState::Node(node_id),
+            ClusterSetSlotState::Node(node_id) => FredState::Node(node_id.into_inner()),
             ClusterSetSlotState::Stable => FredState::Stable,
         };
 
@@ -711,7 +716,7 @@ impl ValkeyClient {
     #[instrument(skip(self), fields(node = %node_id))]
     pub async fn verify_failover_completed(
         &self,
-        node_id: &str,
+        node_id: &crate::crd::NodeId,
         timeout: Duration,
     ) -> Result<bool, ValkeyError> {
         let start = std::time::Instant::now();
@@ -816,7 +821,7 @@ impl ValkeyClient {
         &self,
         start_slot: u16,
         end_slot: u16,
-        target_node_id: &str,
+        target_node_id: &crate::crd::NodeId,
     ) -> Result<(), ValkeyError> {
         // CLUSTER MIGRATESLOTS SLOTSRANGE <start> <end> NODE <target-node-id>
         let start_slot_str = start_slot.to_string();

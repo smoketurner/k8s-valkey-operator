@@ -974,7 +974,7 @@ pub(crate) async fn check_cluster_health(
     ctx: &Context,
     namespace: &str,
 ) -> Result<ClusterHealthStatus, Error> {
-    use crate::crd::{ClusterTopology, MasterNode, NodeId, ReplicaNode};
+    use crate::crd::{ClusterTopology, MasterNode, ReplicaNode};
 
     let pod_addresses = cluster_init::master_pod_dns_names(obj);
     if pod_addresses.is_empty() {
@@ -1072,13 +1072,13 @@ pub(crate) async fn check_cluster_health(
             .map(|m| {
                 let node_replicas = cluster_nodes.replicas_of(&m.node_id);
                 MasterNode {
-                    node_id: NodeId::from(m.node_id.clone()),
+                    node_id: m.node_id.clone(),
                     pod_name: extract_pod_name(&m.address),
                     slot_ranges: m.slots.iter().map(|s| s.to_string()).collect(),
                     replicas: node_replicas
                         .iter()
                         .map(|r| ReplicaNode {
-                            node_id: NodeId::from(r.node_id.clone()),
+                            node_id: r.node_id.clone(),
                             pod_name: extract_pod_name(&r.address),
                             replication_lag: replica_lags.get(&r.node_id).copied().unwrap_or(0),
                         })
@@ -1110,7 +1110,7 @@ async fn observe_replica_lags(
     ctx: &Context,
     namespace: &str,
     cluster_nodes: &crate::client::types::ParsedClusterNodes,
-) -> std::collections::HashMap<String, i64> {
+) -> std::collections::HashMap<crate::crd::NodeId, i64> {
     let mut lags = std::collections::HashMap::new();
     for master in cluster_nodes.masters() {
         let master_port: u16 = master.port.try_into().unwrap_or(6379);
@@ -1284,7 +1284,7 @@ async fn add_new_replicas_to_cluster(
     let topology =
         ClusterTopology::build(&ctx.client, namespace, &name, Some(&cluster_nodes)).await?;
 
-    let mut master_node_ids: Vec<Option<String>> = Vec::with_capacity(masters as usize);
+    let mut master_node_ids: Vec<Option<crate::crd::NodeId>> = Vec::with_capacity(masters as usize);
     for ordinal in 0..masters {
         if let Some(node) = topology.by_ordinal(ordinal) {
             if node.is_master_with_slots() || node.role == NodeRole::Master {
