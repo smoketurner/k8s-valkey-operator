@@ -1,0 +1,506 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: valkeyclusters.valkey-operator.smoketurner.com
+spec:
+  group: valkey-operator.smoketurner.com
+  names:
+    kind: ValkeyCluster
+    listKind: ValkeyClusterList
+    plural: valkeyclusters
+    singular: valkeycluster
+    shortNames:
+      - vc
+    categories:
+      - all
+      - valkey
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+        scale:
+          specReplicasPath: .spec.masters
+          statusReplicasPath: .status.readyMasters
+          labelSelectorPath: .status.selector
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Masters
+          type: integer
+          jsonPath: .spec.masters
+        - name: Replicas
+          type: integer
+          jsonPath: .spec.replicasPerMaster
+        - name: Ready
+          type: string
+          jsonPath: .status.readyNodes
+        - name: Slots
+          type: string
+          jsonPath: .status.assignedSlots
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            metadata:
+              type: object
+              properties:
+                name:
+                  type: string
+                  maxLength: 53
+                  description: Name must be 53 chars or less to allow room for -headless suffix
+            spec:
+              type: object
+              required:
+                - tls
+                - auth
+              x-kubernetes-validations:
+                # Cluster-size guardrail: total pod count = masters * (1 + replicasPerMaster).
+                # 500 pods is generous for any sane Valkey deployment and protects
+                # against runaway-config accidents (e.g., masters=100, replicas=10).
+                - rule: "self.masters * (1 + self.replicasPerMaster) <= 500"
+                  message: "Total pod count (masters * (1 + replicasPerMaster)) cannot exceed 500"
+                # Immutability: TLS issuer cannot change after creation. Changing it
+                # would require certificate rotation and disrupt the cluster.
+                - rule: "self.tls.issuerRef.name == oldSelf.tls.issuerRef.name"
+                  message: "spec.tls.issuerRef.name is immutable; delete and recreate the cluster to change it"
+                # Immutability: auth secret reference cannot change. Changing it would
+                # require credential rotation across all nodes.
+                - rule: "self.auth.secretRef.name == oldSelf.auth.secretRef.name"
+                  message: "spec.auth.secretRef.name is immutable; delete and recreate the cluster to change it"
+              properties:
+                masters:
+                  type: integer
+                  default: 3
+                  minimum: 3
+                  maximum: 100
+                  description: Number of master nodes (minimum 3 for cluster quorum)
+                replicasPerMaster:
+                  type: integer
+                  default: 1
+                  minimum: 0
+                  maximum: 5
+                  description: Number of replicas per master node
+                image:
+                  type: object
+                  properties:
+                    repository:
+                      type: string
+                      default: "valkey/valkey"
+                    tag:
+                      type: string
+                      default: "9.1.0-alpine"
+                    pullPolicy:
+                      type: string
+                      default: "IfNotPresent"
+                      enum: ["Always", "IfNotPresent", "Never"]
+                    pullSecrets:
+                      type: array
+                      items:
+                        type: string
+                    allowDowngrade:
+                      type: boolean
+                      default: false
+                      description: Allow downgrading to an older version. Required when changing to a lower version number.
+                tls:
+                  type: object
+                  required:
+                    - issuerRef
+                  properties:
+                    issuerRef:
+                      type: object
+                      required:
+                        - name
+                      properties:
+                        name:
+                          type: string
+                          description: Name of the cert-manager Issuer or ClusterIssuer
+                        kind:
+                          type: string
+                          default: "ClusterIssuer"
+                          enum: ["Issuer", "ClusterIssuer"]
+                        group:
+                          type: string
+                          default: "cert-manager.io"
+                    duration:
+                      type: string
+                      default: "2160h"
+                      description: Certificate duration (default 90 days)
+                    renewBefore:
+                      type: string
+                      default: "360h"
+                      description: Time before expiry to renew (default 15 days)
+                auth:
+                  type: object
+                  required:
+                    - secretRef
+                  properties:
+                    secretRef:
+                      type: object
+                      required:
+                        - name
+                      properties:
+                        name:
+                          type: string
+                          description: Name of the Secret containing the password
+                        key:
+                          type: string
+                          default: "password"
+                          description: Key within the Secret
+                    acl:
+                      type: object
+                      description: ACL (Access Control List) configuration for Valkey 7+
+                      properties:
+                        enabled:
+                          type: boolean
+                          default: false
+                          description: Enable ACL-based authentication
+                        configSecretRef:
+                          type: object
+                          description: Reference to Secret containing ACL configuration
+                          properties:
+                            name:
+                              type: string
+                              description: Name of the Secret containing ACL rules
+                            key:
+                              type: string
+                              default: "acl.conf"
+                              description: Key within the Secret
+                        adminUser:
+                          type: string
+                          default: "default"
+                          description: Username for admin/operator access
+                persistence:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: true
+                    storageClassName:
+                      type: string
+                    size:
+                      type: string
+                      default: "10Gi"
+                      pattern: "^([0-9]+)(Ki|Mi|Gi|Ti|Pi|Ei)?$"
+                      description: Storage size (e.g., 10Gi, 100Mi)
+                    aof:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                          default: true
+                        fsync:
+                          type: string
+                          default: "everysec"
+                          enum: ["always", "everysec", "no"]
+                    rdb:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                          default: true
+                        saveRules:
+                          type: array
+                          items:
+                            type: string
+                          default: ["900 1", "300 10", "60 10000"]
+                resources:
+                  type: object
+                  properties:
+                    requests:
+                      type: object
+                      properties:
+                        cpu:
+                          type: string
+                          default: "100m"
+                          pattern: "^([0-9]+m?|[0-9]*\\.[0-9]+)$"
+                          description: CPU request (e.g., 100m, 0.5, 1)
+                        memory:
+                          type: string
+                          default: "256Mi"
+                          pattern: "^([0-9]+)(Ki|Mi|Gi|Ti)?$"
+                          description: Memory request (e.g., 256Mi, 1Gi)
+                    limits:
+                      type: object
+                      properties:
+                        cpu:
+                          type: string
+                          default: "1"
+                          pattern: "^([0-9]+m?|[0-9]*\\.[0-9]+)$"
+                          description: CPU limit (e.g., 100m, 0.5, 1)
+                        memory:
+                          type: string
+                          default: "1Gi"
+                          pattern: "^([0-9]+)(Ki|Mi|Gi|Ti)?$"
+                          description: Memory limit (e.g., 256Mi, 1Gi)
+                scheduling:
+                  type: object
+                  properties:
+                    spreadMasters:
+                      type: boolean
+                      default: true
+                      description: Spread masters across nodes via anti-affinity
+                    topologyKey:
+                      type: string
+                      default: "kubernetes.io/hostname"
+                    nodeSelector:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    tolerations:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          key:
+                            type: string
+                          operator:
+                            type: string
+                          value:
+                            type: string
+                          effect:
+                            type: string
+                          tolerationSeconds:
+                            type: integer
+                labels:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: Custom labels for managed resources
+                annotations:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: Custom annotations for managed resources
+                readService:
+                  type: object
+                  description: Read-only service for distributing read traffic across replicas
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                      description: Enable the read service
+                    serviceType:
+                      type: string
+                      default: "ClusterIP"
+                      enum: ["ClusterIP", "NodePort", "LoadBalancer"]
+                      description: Service type for the read service
+                    annotations:
+                      type: object
+                      additionalProperties:
+                        type: string
+                      description: Additional annotations for the read service
+                metricsExporter:
+                  type: object
+                  description: Prometheus metrics exporter sidecar configuration
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                      description: Enable the metrics exporter sidecar
+                    image:
+                      type: string
+                      default: "oliver006/redis_exporter:latest"
+                      description: Exporter container image
+                    port:
+                      type: integer
+                      default: 9121
+                      description: Port to expose metrics on
+                    resources:
+                      type: object
+                      properties:
+                        cpuRequest:
+                          type: string
+                          default: "50m"
+                        memoryRequest:
+                          type: string
+                          default: "64Mi"
+                        cpuLimit:
+                          type: string
+                          default: "100m"
+                        memoryLimit:
+                          type: string
+                          default: "128Mi"
+                    extraEnv:
+                      type: object
+                      additionalProperties:
+                        type: string
+                      description: Additional environment variables for the exporter
+                replication:
+                  type: object
+                  description: Replication configuration for master-replica synchronization
+                  properties:
+                    disklessSync:
+                      type: boolean
+                      default: false
+                      description: Enable diskless sync (stream RDB directly to replicas)
+                    disklessSyncDelay:
+                      type: integer
+                      default: 5
+                      description: Delay in seconds before starting diskless sync
+                    minReplicasToWrite:
+                      type: integer
+                      description: Minimum replicas that must acknowledge writes. Defaults to 1 when replicasPerMaster > 0 (secure by default). Set to 0 to disable.
+                    minReplicasMaxLag:
+                      type: integer
+                      default: 10
+                      description: Maximum lag in seconds for replica health check
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    # Initial Creation
+                    - Pending
+                    - Creating
+                    - WaitingForPods
+                    - InitializingCluster
+                    - AssigningSlots
+                    - ConfiguringReplicas
+                    # Steady State
+                    - Running
+                    # Scale-Up Path
+                    - ScalingUpStatefulSet
+                    - WaitingForNewPods
+                    - AddingNodesToCluster
+                    - RebalancingSlots
+                    - ConfiguringNewReplicas
+                    # Scale-Down Path
+                    - EvacuatingSlots
+                    - RemovingNodesFromCluster
+                    - ScalingDownStatefulSet
+                    # Completion
+                    - VerifyingClusterHealth
+                    # Problem States
+                    - Degraded
+                    - Failed
+                    # Terminal
+                    - Deleting
+                readyNodes:
+                  type: string
+                  description: Ready nodes in "ready/total" format
+                readyMasters:
+                  type: integer
+                readyReplicas:
+                  type: integer
+                selector:
+                  type: string
+                  description: |
+                    Pod label selector for the scale subresource (HPA integration).
+                    Rendered as a comma-separated label-selector string.
+                assignedSlots:
+                  type: string
+                  description: Assigned slots in "assigned/16384" format
+                observedGeneration:
+                  type: integer
+                  format: int64
+                valkeyVersion:
+                  type: string
+                connectionEndpoint:
+                  type: string
+                  description: Connection URL for clients
+                connectionSecret:
+                  type: string
+                tlsSecret:
+                  type: string
+                  description: Secret containing TLS certificates
+                operationProgress:
+                  type: object
+                  description: Progress tracking for multi-step operations
+                  properties:
+                    currentStep:
+                      type: string
+                    totalSteps:
+                      type: integer
+                    completedSteps:
+                      type: integer
+                message:
+                  type: string
+                  description: Human-readable status message
+                reconcileCount:
+                  type: integer
+                  description: Count of reconciliations in current phase
+                lastPhaseTransition:
+                  type: string
+                  description: Timestamp of last phase transition
+                recoveryAttempts:
+                  type: integer
+                  description: Number of recovery attempts
+                lastRecoveryAttempt:
+                  type: string
+                  description: Timestamp of last recovery attempt
+                currentOperation:
+                  type: string
+                  description: Current operation in progress
+                operationStartedAt:
+                  type: string
+                  description: Timestamp when current operation started
+                topology:
+                  type: object
+                  properties:
+                    masters:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          nodeId:
+                            type: string
+                          podName:
+                            type: string
+                          slotRanges:
+                            type: array
+                            items:
+                              type: string
+                          replicas:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                nodeId:
+                                  type: string
+                                podName:
+                                  type: string
+                                replicationLag:
+                                  type: integer
+                                  format: int64
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - reason
+                      - message
+                      - lastTransitionTime
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                lastError:
+                  type: string
+                  description: Last error with actionable remediation steps
+                summary:
+                  type: string
+                  description: Human-readable cluster health summary

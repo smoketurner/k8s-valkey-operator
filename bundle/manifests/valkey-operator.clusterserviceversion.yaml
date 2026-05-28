@@ -1,0 +1,408 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: ClusterServiceVersion
+metadata:
+  name: valkey-operator.v0.1.0
+  namespace: placeholder
+  annotations:
+    capabilities: Full Lifecycle
+    categories: "Database"
+    repository: https://github.com/smoketurner/k8s-valkey-operator
+    containerImage: ghcr.io/smoketurner/k8s-valkey-operator:v0.1.0
+    support: Community
+    description: >-
+      Manage Valkey clusters on Kubernetes with state-machine-driven
+      reconciliation, TLS-by-default via cert-manager, and online scaling and
+      version upgrades.
+    alm-examples: |-
+      [
+        {
+          "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
+          "kind": "ValkeyCluster",
+          "metadata": {
+            "name": "my-cluster",
+            "namespace": "default"
+          },
+          "spec": {
+            "masters": 3,
+            "replicasPerMaster": 1,
+            "tls": {
+              "issuerRef": {
+                "name": "selfsigned-issuer",
+                "kind": "ClusterIssuer"
+              }
+            },
+            "auth": {
+              "secretRef": {
+                "name": "valkey-auth",
+                "key": "password"
+              }
+            },
+            "persistence": {
+              "enabled": true,
+              "size": "1Gi"
+            }
+          }
+        },
+        {
+          "apiVersion": "valkey-operator.smoketurner.com/v1alpha1",
+          "kind": "ValkeyUpgrade",
+          "metadata": {
+            "name": "my-cluster-upgrade",
+            "namespace": "default"
+          },
+          "spec": {
+            "clusterRef": {
+              "name": "my-cluster"
+            },
+            "targetImage": {
+              "repository": "valkey/valkey",
+              "tag": "9.1.1-alpine"
+            }
+          }
+        }
+      ]
+spec:
+  displayName: Valkey Operator
+  description: |
+    The Valkey Operator manages production-grade Valkey clusters on Kubernetes
+    using the operator pattern. It owns two custom resources:
+
+    * **`ValkeyCluster`** — declarative cluster topology (masters, replicas per
+      master, TLS issuer, auth secret, persistence, scheduling). The operator
+      handles initial cluster formation (CLUSTER MEET → ADDSLOTS → REPLICATE),
+      online scale-up and scale-down with safe slot migration, and recovery
+      from degraded states.
+    * **`ValkeyUpgrade`** — declarative rolling version upgrades with
+      replica-first reconfiguration, sync-offset verification, and master
+      failover.
+
+    ## Highlights
+
+    * **Secure by default.** TLS and authentication are required fields, not
+      optional. Cluster bus, replication, and client traffic are all
+      encrypted.
+    * **State-machine driven.** Every operation flows through an explicit FSM
+      (18 phases for cluster lifecycle, 7 for upgrades) with operation locks,
+      idempotent steps, and per-phase requeue policies.
+    * **Native Kubernetes ergonomics.** Scale subresource (`kubectl scale
+      vc/my-cluster --replicas=N`), HPA-compatible, included in
+      `kubectl get all` via the `valkey` category, status conditions follow
+      the standard Kubernetes pattern.
+    * **Observable.** Six status conditions (Ready, Progressing, Degraded,
+      SlotsStable, ReplicasInSync, TLSReady), Prometheus metrics endpoint,
+      and Kubernetes events with diagnostic hints.
+
+    ## Prerequisites
+
+    * **cert-manager** must be installed in the cluster. The operator
+      generates `Certificate` resources for each cluster and reads them back
+      to populate the `TLSReady` condition.
+    * **Kubernetes 1.35+** for the CRD features (CEL validation, scale
+      subresource paths) the operator relies on.
+
+    ## Getting started
+
+    1. Install cert-manager and create a `ClusterIssuer`.
+    2. Create a `Secret` holding the cluster password.
+    3. Apply a `ValkeyCluster` referencing the issuer and secret.
+
+    See the [project README](https://github.com/smoketurner/k8s-valkey-operator)
+    for full configuration reference and operational runbooks.
+  version: 0.1.0
+  maturity: alpha
+  keywords:
+    - valkey
+    - redis
+    - cache
+    - database
+    - cluster
+    - high-availability
+  maintainers:
+    - name: Valkey Operator Team
+      email: maintainers@smoketurner.com
+  provider:
+    name: smoketurner
+    url: https://github.com/smoketurner
+  links:
+    - name: GitHub Repository
+      url: https://github.com/smoketurner/k8s-valkey-operator
+    - name: Releases
+      url: https://github.com/smoketurner/k8s-valkey-operator/releases
+    - name: Helm Chart
+      url: https://github.com/smoketurner/k8s-valkey-operator/tree/main/charts/valkey-operator
+  icon:
+    - mediatype: image/svg+xml
+      base64data: PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz48c3ZnIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgdmlld0JveD0iMCAwIDEwMCAxMDAiPjxyZWN0IHdpZHRoPSIxMDAiIGhlaWdodD0iMTAwIiByeD0iMTYiIGZpbGw9IiMwRjRDNzUiLz48dGV4dCB4PSI1MCIgeT0iNjgiIGZvbnQtc2l6ZT0iNTYiIGZvbnQtZmFtaWx5PSJzYW5zLXNlcmlmIiBmaWxsPSIjRkZGRkZGIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXdlaWdodD0iYm9sZCI+VjwvdGV4dD48L3N2Zz4=
+  minKubeVersion: 1.35.0
+  installModes:
+    - type: OwnNamespace
+      supported: true
+    - type: SingleNamespace
+      supported: true
+    - type: MultiNamespace
+      supported: false
+    - type: AllNamespaces
+      supported: true
+  customresourcedefinitions:
+    owned:
+      - name: valkeyclusters.valkey-operator.smoketurner.com
+        version: v1alpha1
+        kind: ValkeyCluster
+        displayName: Valkey Cluster
+        description: >-
+          A Valkey cluster managed by the operator. Defines topology
+          (masters, replicas per master), TLS configuration via cert-manager,
+          authentication, persistence, and scheduling.
+        resources:
+          - kind: StatefulSet
+            version: apps/v1
+          - kind: Service
+            version: v1
+          - kind: PersistentVolumeClaim
+            version: v1
+          - kind: Pod
+            version: v1
+          - kind: PodDisruptionBudget
+            version: policy/v1
+          - kind: Certificate
+            version: cert-manager.io/v1
+      - name: valkeyupgrades.valkey-operator.smoketurner.com
+        version: v1alpha1
+        kind: ValkeyUpgrade
+        displayName: Valkey Upgrade
+        description: >-
+          A declarative rolling upgrade of a managed Valkey cluster to a new
+          image version. Replicas are upgraded first, replication offset is
+          verified, then masters are failed over and upgraded.
+        resources:
+          - kind: ValkeyCluster
+            version: valkey-operator.smoketurner.com/v1alpha1
+          - kind: Pod
+            version: v1
+  install:
+    strategy: deployment
+    spec:
+      clusterPermissions:
+        - serviceAccountName: valkey-operator
+          rules:
+            - apiGroups:
+                - valkey-operator.smoketurner.com
+              resources:
+                - valkeyclusters
+              verbs:
+                - get
+                - list
+                - watch
+                - create
+                - update
+                - patch
+                - delete
+            - apiGroups:
+                - valkey-operator.smoketurner.com
+              resources:
+                - valkeyclusters/status
+              verbs:
+                - get
+                - update
+                - patch
+            - apiGroups:
+                - valkey-operator.smoketurner.com
+              resources:
+                - valkeyclusters/finalizers
+              verbs:
+                - update
+            - apiGroups:
+                - valkey-operator.smoketurner.com
+              resources:
+                - valkeyupgrades
+              verbs:
+                - get
+                - list
+                - watch
+                - create
+                - update
+                - patch
+                - delete
+            - apiGroups:
+                - valkey-operator.smoketurner.com
+              resources:
+                - valkeyupgrades/status
+              verbs:
+                - get
+                - update
+                - patch
+            - apiGroups:
+                - valkey-operator.smoketurner.com
+              resources:
+                - valkeyupgrades/finalizers
+              verbs:
+                - update
+            - apiGroups:
+                - ""
+              resources:
+                - pods
+              verbs:
+                - get
+                - list
+                - watch
+                - delete
+            - apiGroups:
+                - ""
+              resources:
+                - services
+                - secrets
+              verbs:
+                - get
+                - list
+                - watch
+                - create
+                - update
+                - patch
+                - delete
+            - apiGroups:
+                - ""
+              resources:
+                - persistentvolumeclaims
+              verbs:
+                - get
+                - list
+                - watch
+                - create
+                - delete
+            - apiGroups:
+                - apps
+              resources:
+                - statefulsets
+              verbs:
+                - get
+                - list
+                - watch
+                - create
+                - update
+                - patch
+                - delete
+            - apiGroups:
+                - policy
+              resources:
+                - poddisruptionbudgets
+              verbs:
+                - get
+                - list
+                - watch
+                - create
+                - update
+                - patch
+                - delete
+            - apiGroups:
+                - cert-manager.io
+              resources:
+                - certificates
+              verbs:
+                - get
+                - list
+                - watch
+                - create
+                - update
+                - patch
+                - delete
+            - apiGroups:
+                - coordination.k8s.io
+              resources:
+                - leases
+              verbs:
+                - get
+                - list
+                - watch
+                - create
+                - update
+                - patch
+                - delete
+            - apiGroups:
+                - events.k8s.io
+              resources:
+                - events
+              verbs:
+                - create
+                - patch
+      deployments:
+        - name: valkey-operator
+          spec:
+            replicas: 1
+            progressDeadlineSeconds: 300
+            minReadySeconds: 5
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: valkey-operator
+            strategy:
+              type: Recreate
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/name: valkey-operator
+                  app.kubernetes.io/component: controller
+              spec:
+                serviceAccountName: valkey-operator
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 1000
+                  fsGroup: 1000
+                containers:
+                  - name: operator
+                    image: ghcr.io/smoketurner/k8s-valkey-operator:v0.1.0
+                    imagePullPolicy: IfNotPresent
+                    ports:
+                      - name: health
+                        containerPort: 8080
+                        protocol: TCP
+                      - name: webhook
+                        containerPort: 8443
+                        protocol: TCP
+                    env:
+                      - name: RUST_LOG
+                        value: info
+                      - name: POD_NAME
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: metadata.name
+                      - name: POD_NAMESPACE
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: metadata.namespace
+                    resources:
+                      limits:
+                        cpu: 500m
+                        memory: 256Mi
+                      requests:
+                        cpu: 100m
+                        memory: 128Mi
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      capabilities:
+                        drop:
+                          - ALL
+                    livenessProbe:
+                      httpGet:
+                        path: /healthz
+                        port: 8080
+                      initialDelaySeconds: 15
+                      periodSeconds: 20
+                    readinessProbe:
+                      httpGet:
+                        path: /readyz
+                        port: 8080
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+                    volumeMounts:
+                      - name: webhook-certs
+                        mountPath: /etc/webhook/certs
+                        readOnly: true
+                volumes:
+                  - name: webhook-certs
+                    secret:
+                      secretName: valkey-operator-webhook-tls
+                      optional: true
+                terminationGracePeriodSeconds: 10
+  relatedImages:
+    - name: operator
+      image: ghcr.io/smoketurner/k8s-valkey-operator:v0.1.0
