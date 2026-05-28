@@ -211,13 +211,13 @@ pub struct ClusterNodeInfo {
 
     // === Valkey cluster info (may be None if not yet in cluster) ===
     /// Unique node ID (40 hex characters). None if not yet in cluster.
-    pub node_id: Option<String>,
+    pub node_id: Option<crate::crd::NodeId>,
 
     /// Node role in the cluster.
     pub role: NodeRole,
 
     /// If replica, the master's node_id.
-    pub master_id: Option<String>,
+    pub master_id: Option<crate::crd::NodeId>,
 
     /// Slot ranges owned by this node (masters only).
     pub slots: Vec<SlotRange>,
@@ -282,7 +282,7 @@ pub struct ClusterTopology {
     // Pre-built indexes for fast lookups
     ordinal_index: HashMap<i32, usize>,
     ip_index: HashMap<String, usize>,
-    node_id_index: HashMap<String, usize>,
+    node_id_index: HashMap<crate::crd::NodeId, usize>,
 }
 
 impl ClusterTopology {
@@ -809,7 +809,7 @@ impl ClusterTopology {
     }
 
     /// Build an ordinal to node_id mapping (for compatibility with existing code).
-    pub fn ordinal_to_node_id_map(&self) -> HashMap<i32, String> {
+    pub fn ordinal_to_node_id_map(&self) -> HashMap<i32, crate::crd::NodeId> {
         self.nodes
             .iter()
             .filter_map(|n| n.node_id.as_ref().map(|nid| (n.ordinal, nid.clone())))
@@ -889,7 +889,7 @@ mod tests {
                 ordinal
             ),
             current_image: Some("valkey:7.2".to_string()),
-            node_id: node_id.map(|s| s.to_string()),
+            node_id: node_id.map(crate::crd::NodeId::from),
             role,
             master_id: None,
             slots: if role == NodeRole::Master {
@@ -1095,8 +1095,8 @@ mod tests {
         let topology = make_topology(nodes);
 
         let map = topology.ordinal_to_node_id_map();
-        assert_eq!(map.get(&0), Some(&"abc123".to_string()));
-        assert_eq!(map.get(&1), Some(&"def456".to_string()));
+        assert_eq!(map.get(&0), Some(&crate::crd::NodeId::from("abc123")));
+        assert_eq!(map.get(&1), Some(&crate::crd::NodeId::from("def456")));
     }
 
     #[test]

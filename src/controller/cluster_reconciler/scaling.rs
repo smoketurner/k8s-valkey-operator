@@ -351,8 +351,8 @@ pub(crate) async fn execute_rebalance_slots(
 
     let target_distribution = calculate_distribution(target_masters as u16);
 
-    let mut current_ownership: HashMap<u16, String> = HashMap::new();
-    let mut node_info: HashMap<String, (String, i32)> = HashMap::new();
+    let mut current_ownership: HashMap<u16, crate::crd::NodeId> = HashMap::new();
+    let mut node_info: HashMap<crate::crd::NodeId, (String, i32)> = HashMap::new();
 
     for master in &masters {
         if let Some(&ordinal) = ip_to_ordinal.get(&master.ip) {
@@ -368,8 +368,9 @@ pub(crate) async fn execute_rebalance_slots(
     let mut masters_sorted: Vec<_> = masters.clone();
     masters_sorted.sort_by_key(|m| ip_to_ordinal.get(&m.ip).copied().unwrap_or(i32::MAX));
 
-    let mut migrations_by_source: HashMap<String, Vec<(u16, String)>> = HashMap::new();
-    let mut unassigned_slots: HashMap<String, Vec<u16>> = HashMap::new();
+    let mut migrations_by_source: HashMap<crate::crd::NodeId, Vec<(u16, crate::crd::NodeId)>> =
+        HashMap::new();
+    let mut unassigned_slots: HashMap<crate::crd::NodeId, Vec<u16>> = HashMap::new();
 
     for (master, range) in masters_sorted.iter().zip(target_distribution.iter()) {
         for slot in range.iter() {
@@ -390,7 +391,7 @@ pub(crate) async fn execute_rebalance_slots(
     }
 
     for (source_node_id, slot_migrations) in migrations_by_source {
-        let mut by_dest: HashMap<String, Vec<u16>> = HashMap::new();
+        let mut by_dest: HashMap<crate::crd::NodeId, Vec<u16>> = HashMap::new();
         for (slot, dest) in slot_migrations {
             by_dest.entry(dest).or_default().push(slot);
         }
@@ -543,7 +544,7 @@ pub(crate) async fn promote_replicas_to_masters(
         info!(
             cluster = %name,
             ordinal = node.ordinal,
-            node_id = %node.node_id.as_deref().unwrap_or("unknown"),
+            node_id = %node.node_id.as_ref().map_or("unknown", |n| n.as_str()),
             "Promoting replica to master via CLUSTER RESET SOFT"
         );
 
@@ -658,7 +659,7 @@ async fn wait_for_slot_migration(
     target_ordinal: i32,
     start_slot: u16,
     end_slot: u16,
-    target_node_id: &str,
+    target_node_id: &crate::crd::NodeId,
 ) -> Result<(), ValkeyError> {
     use std::time::{Duration, Instant};
 
@@ -732,7 +733,7 @@ async fn wait_for_slot_migration(
                         debug!(
                             start_slot,
                             end_slot,
-                            target_node = target_node_id,
+                            target_node = %target_node_id,
                             "Slot range migration verified on target node"
                         );
                         let _ = target_client.close().await;
@@ -740,13 +741,13 @@ async fn wait_for_slot_migration(
                     }
                     debug!(
                         attempt,
-                        target_node = target_node_id,
+                        target_node = %target_node_id,
                         "Target node does not yet own expected slot range"
                     );
                 } else {
                     debug!(
                         attempt,
-                        target_node = target_node_id,
+                        target_node = %target_node_id,
                         "Target node not found in cluster nodes"
                     );
                 }

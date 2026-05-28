@@ -2200,7 +2200,7 @@ async fn initialize_shard_statuses(
     for (i, master) in masters.iter().enumerate() {
         shard_statuses.push(ShardUpgradeStatus {
             shard_index: i as i32,
-            master_node_id: NodeId::from(master.node_id.clone()),
+            master_node_id: master.node_id.clone(),
             master_pod: format!("{}-{}", cluster_name, i),
             status: ShardUpgradeState::Pending,
             promoted_replica: None,
