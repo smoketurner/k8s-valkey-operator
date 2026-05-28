@@ -7,7 +7,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::Condition;
+use super::{Condition, NodeId};
 
 // ============================================================================
 // ValkeyUpgrade CRD
@@ -180,7 +180,7 @@ pub struct ShardUpgradeStatus {
     pub shard_index: i32,
 
     /// Master node ID.
-    pub master_node_id: String,
+    pub master_node_id: NodeId,
 
     /// Master pod name.
     pub master_pod: String,

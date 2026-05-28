@@ -28,7 +28,7 @@ use crate::{
         operation_coordination::{self, OperationType},
     },
     crd::{
-        Condition, ShardUpgradeState, ShardUpgradeStatus, UpgradePhase, ValkeyCluster,
+        Condition, NodeId, ShardUpgradeState, ShardUpgradeStatus, UpgradePhase, ValkeyCluster,
         ValkeyUpgrade, ValkeyUpgradeSpec, ValkeyUpgradeStatus, degraded_condition,
         progressing_condition, ready_condition,
     },
@@ -451,7 +451,7 @@ async fn handle_inprogress_phase(
         .cloned()
         .unwrap_or_else(|| ShardUpgradeStatus {
             shard_index: current_shard,
-            master_node_id: String::new(),
+            master_node_id: NodeId::default(),
             master_pod: String::new(),
             status: ShardUpgradeState::Pending,
             promoted_replica: None,
@@ -1266,7 +1266,7 @@ async fn execute_failover(
                     .shard_statuses
                     .resize_with(shard_idx + 1, || ShardUpgradeStatus {
                         shard_index,
-                        master_node_id: String::new(),
+                        master_node_id: NodeId::default(),
                         master_pod: String::new(),
                         status: ShardUpgradeState::Pending,
                         promoted_replica: None,
@@ -2200,7 +2200,7 @@ async fn initialize_shard_statuses(
     for (i, master) in masters.iter().enumerate() {
         shard_statuses.push(ShardUpgradeStatus {
             shard_index: i as i32,
-            master_node_id: master.node_id.clone(),
+            master_node_id: NodeId::from(master.node_id.clone()),
             master_pod: format!("{}-{}", cluster_name, i),
             status: ShardUpgradeState::Pending,
             promoted_replica: None,
@@ -2492,7 +2492,7 @@ async fn update_shard_status(
             .shard_statuses
             .resize_with(shard_idx + 1, || ShardUpgradeStatus {
                 shard_index,
-                master_node_id: String::new(),
+                master_node_id: NodeId::default(),
                 master_pod: String::new(),
                 status: ShardUpgradeState::Pending,
                 promoted_replica: None,
@@ -2532,7 +2532,7 @@ async fn update_shard_status_with_error(
             .shard_statuses
             .resize_with(shard_idx + 1, || ShardUpgradeStatus {
                 shard_index,
-                master_node_id: String::new(),
+                master_node_id: NodeId::default(),
                 master_pod: String::new(),
                 status: ShardUpgradeState::Pending,
                 promoted_replica: None,

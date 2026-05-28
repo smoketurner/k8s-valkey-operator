@@ -10,7 +10,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::Condition;
+use super::{Condition, NodeId};
 
 /// ValkeyCluster is a custom resource for deploying Valkey clusters.
 ///
@@ -1001,7 +1001,7 @@ pub struct ClusterTopology {
 #[serde(rename_all = "camelCase")]
 pub struct MasterNode {
     /// Node ID (Valkey cluster node identifier).
-    pub node_id: String,
+    pub node_id: NodeId,
     /// Pod name.
     pub pod_name: String,
     /// Hash slot ranges owned by this master (e.g., ["0-5460"]).
@@ -1015,7 +1015,7 @@ pub struct MasterNode {
 #[serde(rename_all = "camelCase")]
 pub struct ReplicaNode {
     /// Node ID (Valkey cluster node identifier).
-    pub node_id: String,
+    pub node_id: NodeId,
     /// Pod name.
     pub pod_name: String,
     /// Replication lag in bytes (0 means fully synchronized).

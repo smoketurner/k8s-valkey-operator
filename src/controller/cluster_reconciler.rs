@@ -974,7 +974,7 @@ pub(crate) async fn check_cluster_health(
     ctx: &Context,
     namespace: &str,
 ) -> Result<ClusterHealthStatus, Error> {
-    use crate::crd::{ClusterTopology, MasterNode, ReplicaNode};
+    use crate::crd::{ClusterTopology, MasterNode, NodeId, ReplicaNode};
 
     let pod_addresses = cluster_init::master_pod_dns_names(obj);
     if pod_addresses.is_empty() {
@@ -1072,13 +1072,13 @@ pub(crate) async fn check_cluster_health(
             .map(|m| {
                 let node_replicas = cluster_nodes.replicas_of(&m.node_id);
                 MasterNode {
-                    node_id: m.node_id.clone(),
+                    node_id: NodeId::from(m.node_id.clone()),
                     pod_name: extract_pod_name(&m.address),
                     slot_ranges: m.slots.iter().map(|s| s.to_string()).collect(),
                     replicas: node_replicas
                         .iter()
                         .map(|r| ReplicaNode {
-                            node_id: r.node_id.clone(),
+                            node_id: NodeId::from(r.node_id.clone()),
                             pod_name: extract_pod_name(&r.address),
                             replication_lag: replica_lags.get(&r.node_id).copied().unwrap_or(0),
                         })
