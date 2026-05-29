@@ -99,7 +99,6 @@ make clean-all          # Uninstall and clean
 | `upgrade_state_machine.rs` | Upgrade phase transitions |
 | `upgrade_reconciler.rs` | Upgrade reconciliation logic |
 | `operation_coordination.rs` | Cross-resource operation coordination |
-| `operation_lock.rs` | Operation locks preventing concurrent scale/upgrade |
 | `error.rs` | Error types and transient/permanent classification |
 | `status.rs` | Condition management and generation tracking |
 | `context.rs` | Shared context (client, recorder) |
