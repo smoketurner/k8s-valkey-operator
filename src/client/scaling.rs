@@ -404,6 +404,10 @@ impl ValkeyClient {
         // on the node that currently owns the slots. Reuse this client's TLS
         // certificates so TLS-enabled clusters open a TLS connection instead of
         // a plain TCP socket (issue #47).
+        //
+        // tls_server_name is the headless service short form
+        // ({cluster}-headless.{ns}.svc), which is in every pod's cert SANs —
+        // valid for any pod in the cluster, not just the one `self` connected to.
         let source_client = ValkeyClient::connect_single(
             source_ip,
             source_port,
