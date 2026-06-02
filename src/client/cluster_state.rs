@@ -36,20 +36,12 @@ impl ClusterState {
 
         let cluster_state_ok = self.cluster_info.state == ClusterHealthState::Ok;
         let all_slots_assigned = self.cluster_info.slots_assigned == i32::from(TOTAL_SLOTS);
-        let cluster_size_matches = self.cluster_nodes.masters().len() as i32 == expected_masters;
         let no_slots_fail = self.cluster_info.slots_fail == 0;
         let no_slots_pfail = self.cluster_info.slots_pfail == 0;
-
-        let healthy_masters = self
-            .cluster_nodes
-            .masters()
-            .iter()
-            .filter(|m| !m.flags.fail && !m.flags.pfail)
-            .count() as i32;
+        let healthy_masters = self.healthy_masters_count();
 
         cluster_state_ok
             && all_slots_assigned
-            && cluster_size_matches
             && no_slots_fail
             && no_slots_pfail
             && healthy_masters == expected_masters
@@ -85,7 +77,7 @@ impl ClusterState {
     }
 
     /// Check if there are slots in a failed or partially-failed state.
-    pub fn has_migrating_slots(&self) -> bool {
+    pub fn has_failed_slots(&self) -> bool {
         self.cluster_info.slots_fail > 0 || self.cluster_info.slots_pfail > 0
     }
 
@@ -107,14 +99,6 @@ impl ClusterState {
             ));
         }
 
-        let actual_masters = self.cluster_nodes.masters().len() as i32;
-        if actual_masters != expected_masters {
-            issues.push(format!(
-                "master count mismatch (expected: {}, actual: {})",
-                expected_masters, actual_masters
-            ));
-        }
-
         let healthy_masters = self.healthy_masters_count();
         if healthy_masters != expected_masters {
             issues.push(format!(
@@ -123,8 +107,8 @@ impl ClusterState {
             ));
         }
 
-        if self.has_migrating_slots() {
-            issues.push("slots in migration or failed state".to_string());
+        if self.has_failed_slots() {
+            issues.push("slots in failed or partially-failed state".to_string());
         }
 
         if issues.is_empty() {

@@ -44,23 +44,35 @@ pub(crate) async fn execute_scaling_operation(
     let target_masters = obj.spec.masters;
     let _ = client.close().await;
 
-    let promoted_count = if target_masters > masters_with_slots {
+    if target_masters > masters_with_slots {
         let promoted =
             promote_replicas_to_masters(obj, ctx, namespace, masters_with_slots, target_masters)
                 .await?;
         if !promoted.is_empty() {
             info!(promoted = ?promoted, "Promoted replicas to masters before scaling");
         }
-        promoted.len() as i32
-    } else {
-        0
-    };
+    }
 
     let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
 
     let cluster_nodes = client.cluster_nodes().await?;
 
-    let current_masters = masters_with_slots + promoted_count;
+    // Count masters at expected ordinals (< target_masters) to exclude
+    // unconfigured pods at replica ordinals and stale gossip entries.
+    let cluster_name = obj.name_any();
+    let topology =
+        ClusterTopology::build(&ctx.client, namespace, &cluster_name, Some(&cluster_nodes)).await?;
+    let ip_to_ordinal = topology.ip_to_ordinal_map();
+
+    let current_masters = cluster_nodes
+        .masters()
+        .iter()
+        .filter(|m| {
+            ip_to_ordinal
+                .get(&m.ip)
+                .is_some_and(|&ord| ord < target_masters)
+        })
+        .count() as i32;
 
     let scaling_ctx = ScalingContext {
         current_masters,
