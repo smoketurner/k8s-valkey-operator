@@ -9,8 +9,8 @@ use kube::runtime::events::{Event, EventType, Recorder, Reporter};
 use kube::{Api, Client, Resource, ResourceExt};
 
 use crate::client::valkey_client::{TlsCertData, ValkeyClient};
-use crate::controller::cluster_init;
 use crate::controller::error::Error;
+use crate::controller::transport::{TransportMode, TransportPool};
 use crate::crd::{ValkeyCluster, ValkeyUpgrade};
 use crate::health::HealthState;
 
@@ -26,11 +26,18 @@ pub struct Context {
     reporter: Reporter,
     /// Optional health state for metrics and readiness
     pub health_state: Option<Arc<HealthState>>,
+    /// Persistent transport pool for Valkey pod connections
+    transport_pool: Arc<TransportPool>,
 }
 
 impl Context {
     /// Create a new context
-    pub fn new(client: Client, health_state: Option<Arc<HealthState>>) -> Self {
+    pub fn new(
+        client: Client,
+        health_state: Option<Arc<HealthState>>,
+        mode: TransportMode,
+    ) -> Self {
+        let transport_pool = Arc::new(TransportPool::new(mode, client.clone()));
         Self {
             client,
             reporter: Reporter {
@@ -38,7 +45,13 @@ impl Context {
                 instance: std::env::var("POD_NAME").ok(),
             },
             health_state,
+            transport_pool,
         }
+    }
+
+    /// Get a reference to the transport pool.
+    pub fn transport_pool(&self) -> &TransportPool {
+        &self.transport_pool
     }
 
     /// Create an event recorder for publishing Kubernetes events
@@ -190,7 +203,7 @@ impl Context {
         }
     }
 
-    /// Connect to a cluster node using the shared connection strategy.
+    /// Connect to a cluster node via the persistent transport pool.
     pub async fn connect_to_cluster(
         &self,
         cluster: &ValkeyCluster,
@@ -198,6 +211,8 @@ impl Context {
         ordinal: impl Into<crate::crd::PodOrdinal>,
     ) -> Result<ValkeyClient, Error> {
         let ordinal = ordinal.into();
+        let cluster_name = cluster.name_any();
+
         let password = self
             .get_auth_password(
                 namespace,
@@ -206,23 +221,31 @@ impl Context {
             )
             .await?;
 
-        let tls_certs = self.get_tls_certs(namespace, &cluster.name_any()).await?;
+        let tls_certs = self.get_tls_certs(namespace, &cluster_name).await?;
 
-        let strategy = cluster_init::create_connection_strategy(
-            self.client.clone(),
-            namespace,
-            &cluster.name_any(),
-        );
-        let (connect_host, connect_port) = strategy.get_connection(ordinal).await?;
+        let resolved = self
+            .transport_pool
+            .resolve(namespace, &cluster_name, ordinal)
+            .await?;
 
-        ValkeyClient::connect_single(
-            &connect_host,
-            connect_port,
+        let result = ValkeyClient::connect_single(
+            &resolved.host,
+            resolved.port,
             password.as_deref(),
             tls_certs.as_ref(),
+            Some(&resolved.tls_server_name),
         )
-        .await
-        .map_err(Error::from)
+        .await;
+
+        match result {
+            Ok(client) => Ok(client),
+            Err(e) => {
+                self.transport_pool
+                    .evict(namespace, &cluster_name, ordinal)
+                    .await;
+                Err(Error::from(e))
+            }
+        }
     }
 
     /// Connect to a specific host/port using the cluster's auth and TLS config.
@@ -241,39 +264,32 @@ impl Context {
             )
             .await?;
 
-        let tls_certs = self.get_tls_certs(namespace, &cluster.name_any()).await?;
+        let cluster_name = cluster.name_any();
+        let tls_certs = self.get_tls_certs(namespace, &cluster_name).await?;
 
-        ValkeyClient::connect_single(host, port, password.as_deref(), tls_certs.as_ref())
-            .await
-            .map_err(Error::from)
+        let tls_server_name = Self::tls_server_name_for_host(host, &cluster_name, namespace);
+
+        ValkeyClient::connect_single(
+            host,
+            port,
+            password.as_deref(),
+            tls_certs.as_ref(),
+            Some(&tls_server_name),
+        )
+        .await
+        .map_err(Error::from)
     }
 
-    /// Build shared connection context for cluster operations.
-    pub async fn connection_context(
-        &self,
-        cluster: &ValkeyCluster,
-        namespace: &str,
-    ) -> Result<
-        (
-            Option<String>,
-            Option<TlsCertData>,
-            cluster_init::ConnectionStrategy,
-        ),
-        Error,
-    > {
-        let password = self
-            .get_auth_password(
-                namespace,
-                &cluster.spec.auth.secret_ref.name,
-                &cluster.spec.auth.secret_ref.key,
-            )
-            .await?;
-        let tls_certs = self.get_tls_certs(namespace, &cluster.name_any()).await?;
-        let strategy = cluster_init::create_connection_strategy(
-            self.client.clone(),
-            namespace,
-            &cluster.name_any(),
-        );
-        Ok((password, tls_certs, strategy))
+    /// Derive the TLS server name for a given host.
+    ///
+    /// If the host is already a DNS name (contains `.svc`), use it directly.
+    /// Otherwise (IP address), use the headless service short form which is
+    /// always present in the cert SANs.
+    fn tls_server_name_for_host(host: &str, cluster_name: &str, namespace: &str) -> String {
+        if host.contains(".svc") {
+            host.to_string()
+        } else {
+            format!("{}-headless.{}.svc", cluster_name, namespace)
+        }
     }
 }

@@ -20,20 +20,9 @@ pub(crate) async fn execute_forget_removed_nodes(
     namespace: &str,
 ) -> Result<bool, Error> {
     let name = obj.name_any();
-    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
 
-    let (host, port) = strategy.get_connection(0).await?;
-
-    let client = crate::client::ValkeyClient::connect_single(
-        &host,
-        port,
-        password.as_deref(),
-        tls_certs.as_ref(),
-    )
-    .await?;
-
+    let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
     let cluster_nodes = client.cluster_nodes().await?;
-
     let _ = client.close().await;
 
     let cluster_name = obj.name_any();
@@ -76,20 +65,9 @@ pub(crate) async fn forget_nodes_with_quorum(
     node_ids_to_forget: &[crate::crd::NodeId],
 ) -> Result<(), Error> {
     let name = obj.name_any();
-    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
 
-    let (host, port) = strategy.get_connection(0).await?;
-
-    let client = crate::client::ValkeyClient::connect_single(
-        &host,
-        port,
-        password.as_deref(),
-        tls_certs.as_ref(),
-    )
-    .await?;
-
+    let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
     let cluster_nodes = client.cluster_nodes().await?;
-
     let _ = client.close().await;
 
     let total_nodes = cluster_nodes.nodes.len();
@@ -105,35 +83,26 @@ pub(crate) async fn forget_nodes_with_quorum(
             }
 
             let ordinal = i32::try_from(idx).unwrap_or(0);
-            if let Ok((h, p)) = strategy.get_connection(ordinal).await {
-                match crate::client::ValkeyClient::connect_single(
-                    &h,
-                    p,
-                    password.as_deref(),
-                    tls_certs.as_ref(),
-                )
-                .await
-                {
-                    Ok(node_client) => {
-                        match node_client.cluster_forget(node_id).await {
-                            Ok(()) => {
-                                successes += 1;
-                                debug!(
-                                    name = %name,
-                                    node_id = %node_id,
-                                    source = %node.node_id,
-                                    "CLUSTER FORGET succeeded"
-                                );
-                            }
-                            Err(e) => {
-                                failures.push(format!("{}:{}", node.node_id, e));
-                            }
+            match ctx.connect_to_cluster(obj, namespace, ordinal).await {
+                Ok(node_client) => {
+                    match node_client.cluster_forget(node_id).await {
+                        Ok(()) => {
+                            successes += 1;
+                            debug!(
+                                name = %name,
+                                node_id = %node_id,
+                                source = %node.node_id,
+                                "CLUSTER FORGET succeeded"
+                            );
                         }
-                        let _ = node_client.close().await;
+                        Err(e) => {
+                            failures.push(format!("{}:{}", node.node_id, e));
+                        }
                     }
-                    Err(e) => {
-                        failures.push(format!("{}:connect failed: {}", node.node_id, e));
-                    }
+                    let _ = node_client.close().await;
+                }
+                Err(e) => {
+                    failures.push(format!("{}:connect failed: {}", node.node_id, e));
                 }
             }
         }
@@ -173,26 +142,13 @@ pub(crate) async fn verify_scale_down_quorum(
 ) -> Result<(), Error> {
     let name = obj.name_any();
 
-    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
-
-    let (host, port) = strategy.get_connection(0).await?;
-
-    let client = crate::client::ValkeyClient::connect_single(
-        &host,
-        port,
-        password.as_deref(),
-        tls_certs.as_ref(),
-    )
-    .await?;
-
+    let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
     let cluster_nodes = client.cluster_nodes().await?;
-
     let _ = client.close().await;
 
     let total_masters = cluster_nodes.masters().len() as i32;
     let required_quorum = (total_masters / 2) + 1;
 
-    // If we connected and got CLUSTER NODES, all reported masters are reachable.
     let reachable_masters = total_masters;
 
     debug!(
@@ -224,6 +180,8 @@ pub(crate) async fn handle_deletion(
 
     let name = obj.name_any();
     info!(name = %name, "Handling deletion");
+
+    ctx.transport_pool().evict_cluster(namespace, &name).await;
 
     let api: kube::Api<ValkeyCluster> = kube::Api::namespaced(ctx.client.clone(), namespace);
     remove_finalizer(&api, &name, super::FINALIZER).await?;

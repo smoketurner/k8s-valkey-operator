@@ -89,11 +89,13 @@ impl ScopedOperator {
     /// Controllers panic if they exit unexpectedly, causing tests to fail
     /// immediately rather than timing out.
     async fn run_controllers(client: Client, namespace: &str) {
+        use valkey_operator::controller::transport::TransportMode;
+        let mode = TransportMode::LocalForward;
         tokio::select! {
-            _ = valkey_operator::run_controller_scoped(client.clone(), None, Some(namespace)) => {
+            _ = valkey_operator::run_controller_scoped(client.clone(), None, Some(namespace), mode) => {
                 panic!("ValkeyCluster controller exited unexpectedly");
             }
-            _ = valkey_operator::run_upgrade_controller_scoped(client, Some(namespace)) => {
+            _ = valkey_operator::run_upgrade_controller_scoped(client, Some(namespace), mode) => {
                 panic!("ValkeyUpgrade controller exited unexpectedly");
             }
         }

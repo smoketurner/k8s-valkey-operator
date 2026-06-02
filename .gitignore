@@ -22,3 +22,4 @@ kubeconfig
 config/test/*
 
 .local/
+/.claude/worktrees

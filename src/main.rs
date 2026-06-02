@@ -16,6 +16,7 @@ use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
 use tokio::signal;
 use tracing::{error, info, warn};
 
+use valkey_operator::controller::transport::TransportMode;
 use valkey_operator::health::{HealthState, run_health_server};
 use valkey_operator::{WEBHOOK_CERT_PATH, WEBHOOK_KEY_PATH, run_webhook_server};
 use valkey_operator::{run_controller, run_upgrade_controller};
@@ -43,9 +44,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting valkey-operator");
 
-    // Create Kubernetes client
-    let client = Client::try_default().await?;
-    info!("Connected to Kubernetes cluster");
+    // Detect transport mode from kube config, with optional env override
+    let mode_override = TransportMode::from_env()?;
+    let (config, detected_mode) = match kube::Config::incluster() {
+        Ok(c) => (c, TransportMode::InCluster),
+        Err(_) => (kube::Config::infer().await?, TransportMode::LocalForward),
+    };
+    let mode = mode_override.unwrap_or(detected_mode);
+    let client = Client::try_from(config)?;
+    info!(?mode, "Connected to Kubernetes cluster");
 
     // Get pod identity for leader election
     let pod_name = std::env::var("POD_NAME").unwrap_or_else(|_| {
@@ -153,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let health_state = health_state.clone();
         let controller_client = client.clone();
         tokio::spawn(async move {
-            run_controller(controller_client, Some(health_state)).await;
+            run_controller(controller_client, Some(health_state), mode).await;
         })
     };
 
@@ -161,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upgrade_controller_handle = {
         let controller_client = client.clone();
         tokio::spawn(async move {
-            run_upgrade_controller(controller_client).await;
+            run_upgrade_controller(controller_client, mode).await;
         })
     };
 

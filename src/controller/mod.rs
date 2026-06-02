@@ -13,6 +13,7 @@ pub mod context;
 pub mod diagnostic_hints;
 pub mod error;
 pub mod status;
+pub mod transport;
 
 // ValkeyCluster controller
 pub mod cluster_init;

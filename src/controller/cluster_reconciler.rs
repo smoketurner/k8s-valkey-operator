@@ -881,20 +881,8 @@ async fn execute_cluster_init(
     namespace: &str,
 ) -> Result<(), Error> {
     let name = obj.name_any();
-    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
-
     let topology = ClusterTopology::build(&ctx.client, namespace, &name, None).await?;
-
-    cluster_init::execute_cluster_meet(
-        obj,
-        &topology,
-        password.as_deref(),
-        tls_certs.as_ref(),
-        &strategy,
-    )
-    .await?;
-
-    Ok(())
+    cluster_init::execute_cluster_meet(obj, &topology, ctx, namespace).await
 }
 
 async fn execute_stale_ip_recovery(
@@ -903,20 +891,8 @@ async fn execute_stale_ip_recovery(
     namespace: &str,
 ) -> Result<(), Error> {
     let name = obj.name_any();
-    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
-
     let topology = ClusterTopology::build(&ctx.client, namespace, &name, None).await?;
-
-    cluster_init::recover_stale_ips(
-        obj,
-        &topology,
-        password.as_deref(),
-        tls_certs.as_ref(),
-        &strategy,
-    )
-    .await?;
-
-    Ok(())
+    cluster_init::recover_stale_ips(obj, &topology, ctx, namespace).await
 }
 
 async fn execute_slot_assignment_no_replicas(
@@ -924,12 +900,7 @@ async fn execute_slot_assignment_no_replicas(
     ctx: &Context,
     namespace: &str,
 ) -> Result<(), Error> {
-    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
-
-    cluster_init::assign_slots_to_masters(obj, password.as_deref(), tls_certs.as_ref(), &strategy)
-        .await?;
-
-    Ok(())
+    cluster_init::assign_slots_to_masters(obj, ctx, namespace).await
 }
 
 async fn execute_replica_setup(
@@ -940,12 +911,7 @@ async fn execute_replica_setup(
     if obj.spec.replicas_per_master == 0 {
         return Ok(());
     }
-
-    let (password, tls_certs, strategy) = ctx.connection_context(obj, namespace).await?;
-
-    cluster_init::setup_replicas(obj, password.as_deref(), tls_certs.as_ref(), &strategy).await?;
-
-    Ok(())
+    cluster_init::setup_replicas(obj, ctx, namespace).await
 }
 
 async fn execute_scale_up_rebalance(
