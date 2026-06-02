@@ -29,8 +29,15 @@ const LEASE_RENEW_INTERVAL_SECS: u64 = 5;
 /// Grace period for in-flight reconciliations to complete during shutdown
 const SHUTDOWN_GRACE_PERIOD_SECS: u64 = 5;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing subscriber
     tracing_subscriber::fmt()
         .with_env_filter(

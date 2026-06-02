@@ -37,17 +37,9 @@ impl ClusterState {
         let cluster_state_ok = self.cluster_info.state == ClusterHealthState::Ok;
         let all_slots_assigned = self.cluster_info.slots_assigned == i32::from(TOTAL_SLOTS);
         let cluster_size_matches = self.cluster_nodes.masters().len() as i32 == expected_masters;
-        let no_failed_nodes = self
-            .cluster_nodes
-            .nodes
-            .iter()
-            .filter(|n| n.flags.fail)
-            .count()
-            == 0;
         let no_slots_fail = self.cluster_info.slots_fail == 0;
         let no_slots_pfail = self.cluster_info.slots_pfail == 0;
 
-        // Check for healthy masters (not in fail/pfail state)
         let healthy_masters = self
             .cluster_nodes
             .masters()
@@ -58,7 +50,6 @@ impl ClusterState {
         cluster_state_ok
             && all_slots_assigned
             && cluster_size_matches
-            && no_failed_nodes
             && no_slots_fail
             && no_slots_pfail
             && healthy_masters == expected_masters
@@ -93,19 +84,9 @@ impl ClusterState {
             .count() as i32
     }
 
-    /// Check if there are any slots in migration state.
-    ///
-    /// Returns true if any slots are in migrating or importing state.
+    /// Check if there are slots in a failed or partially-failed state.
     pub fn has_migrating_slots(&self) -> bool {
-        // Check for nodes with migrating/importing slots
-        // This is a simplified check - in practice, we'd parse slot ranges with [slot-<-node] or [slot->-node]
-        // For now, we check for failed/pfail nodes which often indicate migration issues
-        self.cluster_nodes
-            .nodes
-            .iter()
-            .any(|n| n.flags.fail || n.flags.pfail)
-            || self.cluster_info.slots_fail > 0
-            || self.cluster_info.slots_pfail > 0
+        self.cluster_info.slots_fail > 0 || self.cluster_info.slots_pfail > 0
     }
 
     /// Get detailed health status message.
