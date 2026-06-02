@@ -102,10 +102,7 @@ pub(crate) async fn forget_nodes_with_quorum(
                     let _ = node_client.close().await;
                 }
                 Err(e) => {
-                    failures.push(format!(
-                        "{}:connect failed: {}",
-                        node.node_id, e
-                    ));
+                    failures.push(format!("{}:connect failed: {}", node.node_id, e));
                 }
             }
         }

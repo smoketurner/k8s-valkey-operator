@@ -119,10 +119,9 @@ pub async fn recover_stale_ips(
     );
 
     if pod_endpoints.is_empty() {
-        return Err(ValkeyError::ClusterNotReady(
-            "No pods available for recovery".to_string(),
-        )
-        .into());
+        return Err(
+            ValkeyError::ClusterNotReady("No pods available for recovery".to_string()).into(),
+        );
     }
 
     // Execute CLUSTER MEET from each pod to all other pods
@@ -239,9 +238,7 @@ pub async fn execute_cluster_meet(
     let pod_endpoints = topology.pod_endpoints();
 
     if pod_endpoints.is_empty() {
-        return Err(
-            ValkeyError::InvalidConfig("No pods in cluster".to_string()).into()
-        );
+        return Err(ValkeyError::InvalidConfig("No pods in cluster".to_string()).into());
     }
 
     info!(
@@ -396,9 +393,7 @@ pub async fn assign_slots_to_masters(
             "Connecting to master to assign slots"
         );
 
-        let client = ctx
-            .connect_to_cluster(cluster, namespace, i as i32)
-            .await?;
+        let client = ctx.connect_to_cluster(cluster, namespace, i as i32).await?;
 
         debug!(
             master_index = i,
@@ -448,10 +443,7 @@ pub async fn setup_replicas(
     let master_pods = master_pod_dns_names(cluster);
 
     if master_pods.is_empty() {
-        return Err(ValkeyError::InvalidConfig(
-            "No master pods found".to_string(),
-        )
-        .into());
+        return Err(ValkeyError::InvalidConfig("No master pods found".to_string()).into());
     }
 
     // Connect to first master to get cluster topology
@@ -758,10 +750,7 @@ pub async fn forget_nodes_with_retry(
 
         // Execute CLUSTER FORGET from EVERY pod (not just one)
         for ordinal in 0..total_pods {
-            let client = match ctx
-                .connect_to_cluster(cluster, namespace, ordinal)
-                .await
-            {
+            let client = match ctx.connect_to_cluster(cluster, namespace, ordinal).await {
                 Ok(c) => c,
                 Err(e) => {
                     debug!(

@@ -267,8 +267,7 @@ impl Context {
         let cluster_name = cluster.name_any();
         let tls_certs = self.get_tls_certs(namespace, &cluster_name).await?;
 
-        let tls_server_name =
-            Self::tls_server_name_for_host(host, &cluster_name, namespace);
+        let tls_server_name = Self::tls_server_name_for_host(host, &cluster_name, namespace);
 
         ValkeyClient::connect_single(
             host,
@@ -286,16 +285,11 @@ impl Context {
     /// If the host is already a DNS name (contains `.svc`), use it directly.
     /// Otherwise (IP address), use the headless service short form which is
     /// always present in the cert SANs.
-    fn tls_server_name_for_host(
-        host: &str,
-        cluster_name: &str,
-        namespace: &str,
-    ) -> String {
+    fn tls_server_name_for_host(host: &str, cluster_name: &str, namespace: &str) -> String {
         if host.contains(".svc") {
             host.to_string()
         } else {
             format!("{}-headless.{}.svc", cluster_name, namespace)
         }
     }
-
 }

@@ -44,16 +44,10 @@ impl TransportMode {
 #[derive(thiserror::Error, Debug)]
 pub enum TransportError {
     #[error("Pod {ordinal} not resolvable: {reason}")]
-    NotResolvable {
-        ordinal: PodOrdinal,
-        reason: String,
-    },
+    NotResolvable { ordinal: PodOrdinal, reason: String },
 
     #[error("Port forward to pod {ordinal} failed: {reason}")]
-    PortForwardFailed {
-        ordinal: PodOrdinal,
-        reason: String,
-    },
+    PortForwardFailed { ordinal: PodOrdinal, reason: String },
 
     #[error(
         "Invalid VALKEY_OPERATOR_TRANSPORT_MODE '{0}' \
@@ -179,12 +173,7 @@ impl TransportPool {
     }
 
     /// Evict a single pod's cached transport.
-    pub async fn evict(
-        &self,
-        namespace: &str,
-        cluster_name: &str,
-        ordinal: impl Into<PodOrdinal>,
-    ) {
+    pub async fn evict(&self, namespace: &str, cluster_name: &str, ordinal: impl Into<PodOrdinal>) {
         let key = CacheKey {
             namespace: namespace.into(),
             cluster_name: cluster_name.into(),
@@ -196,9 +185,10 @@ impl TransportPool {
 
     /// Evict all cached transports for a cluster.
     pub async fn evict_cluster(&self, namespace: &str, cluster_name: &str) {
-        self.cache.write().await.retain(|k, _| {
-            k.namespace != namespace || k.cluster_name != cluster_name
-        });
+        self.cache
+            .write()
+            .await
+            .retain(|k, _| k.namespace != namespace || k.cluster_name != cluster_name);
     }
 }
 
@@ -229,9 +219,7 @@ mod tests {
         let result = TransportMode::parse_mode("bogus");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            matches!(err, TransportError::InvalidMode(ref v) if v == "bogus")
-        );
+        assert!(matches!(err, TransportError::InvalidMode(ref v) if v == "bogus"));
     }
 
     #[test]
@@ -263,18 +251,12 @@ mod tests {
 
     #[tokio::test]
     async fn in_cluster_resolve_returns_dns_name() {
-        let client = kube::Client::try_default()
-            .await
-            .unwrap_or_else(|_| {
-                // Tests may run without a cluster; build a dummy client
-                // that is never used (InCluster resolve is pure).
-                kube::Client::try_from(
-                    kube::Config::new(
-                        "https://localhost:6443".parse().unwrap(),
-                    ),
-                )
+        let client = kube::Client::try_default().await.unwrap_or_else(|_| {
+            // Tests may run without a cluster; build a dummy client
+            // that is never used (InCluster resolve is pure).
+            kube::Client::try_from(kube::Config::new("https://localhost:6443".parse().unwrap()))
                 .unwrap()
-            });
+        });
 
         let pool = TransportPool::new(TransportMode::InCluster, client);
         let ep = pool.resolve("default", "my-cluster", 2).await.unwrap();
@@ -289,12 +271,9 @@ mod tests {
 
     #[tokio::test]
     async fn in_cluster_resolve_is_deterministic() {
-        let client = kube::Client::try_from(
-            kube::Config::new(
-                "https://localhost:6443".parse().unwrap(),
-            ),
-        )
-        .unwrap();
+        let client =
+            kube::Client::try_from(kube::Config::new("https://localhost:6443".parse().unwrap()))
+                .unwrap();
 
         let pool = TransportPool::new(TransportMode::InCluster, client);
         let ep1 = pool.resolve("prod", "valkey", 0).await.unwrap();
@@ -307,12 +286,9 @@ mod tests {
 
     #[tokio::test]
     async fn in_cluster_evict_is_noop() {
-        let client = kube::Client::try_from(
-            kube::Config::new(
-                "https://localhost:6443".parse().unwrap(),
-            ),
-        )
-        .unwrap();
+        let client =
+            kube::Client::try_from(kube::Config::new("https://localhost:6443".parse().unwrap()))
+                .unwrap();
 
         let pool = TransportPool::new(TransportMode::InCluster, client);
 
@@ -322,10 +298,7 @@ mod tests {
 
         // Resolve still works after eviction
         let ep = pool.resolve("ns", "cluster", 0).await.unwrap();
-        assert_eq!(
-            ep.host,
-            "cluster-0.cluster-headless.ns.svc.cluster.local"
-        );
+        assert_eq!(ep.host, "cluster-0.cluster-headless.ns.svc.cluster.local");
     }
 
     #[test]

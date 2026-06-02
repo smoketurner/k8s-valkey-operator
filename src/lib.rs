@@ -28,8 +28,8 @@ use serde::de::DeserializeOwned;
 use tracing::{debug, error, info};
 
 use controller::{
-    cluster_reconciler::reconcile as reconcile_cluster, context::Context,
-    transport::TransportMode, upgrade_reconciler::reconcile as reconcile_upgrade,
+    cluster_reconciler::reconcile as reconcile_cluster, context::Context, transport::TransportMode,
+    upgrade_reconciler::reconcile as reconcile_upgrade,
 };
 use crd::{ValkeyCluster, ValkeyUpgrade};
 
