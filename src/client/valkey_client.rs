@@ -326,6 +326,12 @@ pub struct ValkeyClient {
     /// connections to a source node during slot migration) can reuse the same
     /// TLS material instead of falling back to plain TCP.
     tls_certs: Option<TlsCertData>,
+    /// TLS server name (SNI) used for certificate verification.
+    ///
+    /// Stored so that derived connections can verify against the same
+    /// DNS name rather than the raw dial target (which may be an IP or
+    /// 127.0.0.1 via port-forward).
+    tls_server_name: Option<String>,
 }
 
 impl ValkeyClient {
@@ -388,6 +394,7 @@ impl ValkeyClient {
             client,
             config,
             tls_certs: None,
+            tls_server_name: None,
         })
     }
 
@@ -399,16 +406,20 @@ impl ValkeyClient {
     /// * `port` - Port number
     /// * `password` - Optional password for AUTH
     /// * `tls_certs` - Optional TLS certificate data for secure connections
+    /// * `tls_server_name` - Optional TLS server name for SNI/SAN verification
     #[instrument(skip_all, fields(host = %host, port = %port, tls = tls_certs.is_some()))]
     pub async fn connect_single(
         host: &str,
         port: u16,
         password: Option<&str>,
         tls_certs: Option<&TlsCertData>,
+        tls_server_name: Option<&str>,
     ) -> Result<Self, ValkeyError> {
-        let server_config = ServerConfig::Centralized {
-            server: Server::new(host, port),
-        };
+        let mut server = Server::new(host, port);
+        if let Some(name) = tls_server_name {
+            server.tls_server_name = Some(name.into());
+        }
+        let server_config = ServerConfig::Centralized { server };
 
         let mut redis_config = Config {
             server: server_config,
@@ -445,6 +456,7 @@ impl ValkeyClient {
             client,
             config,
             tls_certs: tls_certs.cloned(),
+            tls_server_name: tls_server_name.map(String::from),
         })
     }
 
@@ -466,6 +478,11 @@ impl ValkeyClient {
     /// path-based TLS configuration instead of in-memory certificate data.
     pub fn tls_certs(&self) -> Option<&TlsCertData> {
         self.tls_certs.as_ref()
+    }
+
+    /// Get the TLS server name (SNI) this client was constructed with, if any.
+    pub fn tls_server_name(&self) -> Option<&str> {
+        self.tls_server_name.as_deref()
     }
 
     /// Check if the client is connected.
@@ -889,16 +906,14 @@ impl ValkeyClient {
 /// Creates a rustls ClientConfig with the provided CA certificate and optional
 /// client certificate for mTLS, then wraps it in a fred TlsConnector.
 ///
-/// Note: When using port forwarding, we connect to 127.0.0.1 but the certificate
-/// is issued for the pod DNS names. We use a custom verifier that validates the
-/// certificate chain but allows hostname mismatch for this use case.
+/// The server's certificate is verified against the CA using strict rustls
+/// validation. The SNI name sent during the handshake comes from
+/// `Server.tls_server_name` (set by the caller of `connect_single`), which
+/// decouples the TCP dial target (e.g. 127.0.0.1 via port-forward) from the
+/// name the server proves ownership of.
 fn build_tls_connector(certs: &TlsCertData) -> Result<TlsConnector, ValkeyError> {
-    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::pki_types::{ServerName, UnixTime};
-    use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
-    use std::sync::Arc;
+    use rustls::{ClientConfig, RootCertStore};
 
-    // Parse CA certificate(s) from PEM
     let mut root_store = RootCertStore::empty();
     let ca_certs = rustls_pemfile::certs(&mut certs.ca_cert_pem.as_slice())
         .collect::<Result<Vec<_>, _>>()
@@ -910,81 +925,9 @@ fn build_tls_connector(certs: &TlsCertData) -> Result<TlsConnector, ValkeyError>
             .map_err(|e| ValkeyError::Connection(format!("Failed to add CA certificate: {}", e)))?;
     }
 
-    // Custom verifier that allows hostname mismatch for port forwarding scenarios.
-    // When port forwarding, we connect to localhost but the cert is issued for pod DNS names.
-    #[derive(Debug)]
-    struct PortForwardVerifier;
-
-    impl ServerCertVerifier for PortForwardVerifier {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            // When using port forwarding, we connect to 127.0.0.1 but the certificate
-            // is issued for the pod DNS names (e.g., *.test-cluster-headless.default.svc).
-            //
-            // For local development/testing via port forwarding, we trust the tunnel
-            // and accept any certificate signed by a CA we control (self-signed issuer).
-            //
-            // In production (in-cluster), the operator connects using proper DNS names
-            // and standard certificate verification would apply.
-            //
-            // Note: We still verify TLS signatures in verify_tls12/13_signature methods,
-            // ensuring the certificate is properly signed.
-            Ok(ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls12_signature(
-                message,
-                cert,
-                dss,
-                &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
-            )
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls13_signature(
-                message,
-                cert,
-                dss,
-                &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
-            )
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            rustls::crypto::aws_lc_rs::default_provider()
-                .signature_verification_algorithms
-                .supported_schemes()
-        }
-    }
-
-    let verifier = Arc::new(PortForwardVerifier);
-    // TODO: The root_store (CA certs) is parsed but not used because PortForwardVerifier
-    // trusts all certificates. This is acceptable for port-forwarded connections where the
-    // operator runs outside the cluster, but a proper verifier should be used for in-cluster
-    // connections where DNS resolves to actual pod IPs.
-    let _ = root_store;
-
-    // Build client config with custom verifier
     let config = if let (Some(cert_pem), Some(key_pem)) =
         (&certs.client_cert_pem, &certs.client_key_pem)
     {
-        // mTLS: client cert + key
         let client_certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
             .collect::<Result<Vec<CertificateDer<'static>>, _>>()
             .map_err(|e| {
@@ -996,15 +939,12 @@ fn build_tls_connector(certs: &TlsCertData) -> Result<TlsConnector, ValkeyError>
             .ok_or_else(|| ValkeyError::Connection("No private key found in PEM".to_string()))?;
 
         ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
+            .with_root_certificates(root_store)
             .with_client_auth_cert(client_certs, client_key)
             .map_err(|e| ValkeyError::Connection(format!("Failed to build TLS config: {}", e)))?
     } else {
-        // Server-only TLS (no client cert)
         ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
+            .with_root_certificates(root_store)
             .with_no_client_auth()
     };
 
@@ -1217,6 +1157,7 @@ mod tests {
             client: Builder::default_centralized().build().unwrap(),
             config: ValkeyClientConfig::default(),
             tls_certs: None,
+            tls_server_name: None,
         };
         assert!(client.tls_certs().is_none());
     }
@@ -1236,6 +1177,7 @@ mod tests {
             client: Builder::default_centralized().build().unwrap(),
             config: ValkeyClientConfig::default(),
             tls_certs: Some(certs.clone()),
+            tls_server_name: None,
         };
 
         let stored = client.tls_certs().expect("certs should be present");

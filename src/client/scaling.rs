@@ -409,6 +409,7 @@ impl ValkeyClient {
             source_port,
             self.config().password.as_deref(),
             self.tls_certs(),
+            self.tls_server_name(),
         )
         .await
         .map_err(|e| {

@@ -29,7 +29,7 @@ use tracing::{debug, error, info};
 
 use controller::{
     cluster_reconciler::reconcile as reconcile_cluster, context::Context,
-    upgrade_reconciler::reconcile as reconcile_upgrade,
+    transport::TransportMode, upgrade_reconciler::reconcile as reconcile_upgrade,
 };
 use crd::{ValkeyCluster, ValkeyUpgrade};
 
@@ -89,8 +89,12 @@ where
 /// background task during integration tests.
 ///
 /// If health_state is provided, metrics will be recorded for reconciliations.
-pub async fn run_controller(client: Client, health_state: Option<Arc<HealthState>>) {
-    run_controller_scoped(client, health_state, None).await
+pub async fn run_controller(
+    client: Client,
+    health_state: Option<Arc<HealthState>>,
+    mode: TransportMode,
+) {
+    run_controller_scoped(client, health_state, None, mode).await
 }
 
 /// Run the operator controller with optional namespace scoping.
@@ -103,6 +107,7 @@ pub async fn run_controller_scoped(
     client: Client,
     health_state: Option<Arc<HealthState>>,
     namespace: Option<&str>,
+    mode: TransportMode,
 ) {
     let scope_msg = namespace.unwrap_or("cluster-wide");
     info!(
@@ -115,7 +120,7 @@ pub async fn run_controller_scoped(
         state.set_ready(true).await;
     }
 
-    let ctx = Arc::new(Context::new(client.clone(), health_state));
+    let ctx = Arc::new(Context::new(client.clone(), health_state, mode));
 
     // Set up APIs for the controller (namespaced or cluster-wide)
     let valkeyclusters: Api<ValkeyCluster> = scoped_api(client.clone(), namespace);
@@ -180,22 +185,26 @@ pub async fn run_controller_scoped(
 ///
 /// This controller watches ValkeyUpgrade resources and orchestrates
 /// rolling upgrades of ValkeyCluster instances.
-pub async fn run_upgrade_controller(client: Client) {
-    run_upgrade_controller_scoped(client, None).await
+pub async fn run_upgrade_controller(client: Client, mode: TransportMode) {
+    run_upgrade_controller_scoped(client, None, mode).await
 }
 
 /// Run the ValkeyUpgrade controller with optional namespace scoping.
 ///
 /// When `namespace` is `Some(ns)`, only watches resources in that namespace.
 /// When `namespace` is `None`, watches resources cluster-wide.
-pub async fn run_upgrade_controller_scoped(client: Client, namespace: Option<&str>) {
+pub async fn run_upgrade_controller_scoped(
+    client: Client,
+    namespace: Option<&str>,
+    mode: TransportMode,
+) {
     let scope_msg = namespace.unwrap_or("cluster-wide");
     info!(
         "Starting controller for ValkeyUpgrade resources (scope: {})",
         scope_msg
     );
 
-    let ctx = Arc::new(Context::new(client.clone(), None));
+    let ctx = Arc::new(Context::new(client.clone(), None, mode));
 
     // Set up APIs for the controller
     let valkeyupgrades: Api<ValkeyUpgrade> = scoped_api(client.clone(), namespace);

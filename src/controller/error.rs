@@ -51,6 +51,10 @@ pub enum Error {
     /// Failover verification failed
     #[error("Failover verification timed out after {elapsed_secs}s")]
     FailoverVerificationTimeout { elapsed_secs: u64 },
+
+    /// Transport layer error
+    #[error("Transport error: {0}")]
+    Transport(#[from] crate::controller::transport::TransportError),
 }
 
 impl Error {
@@ -80,6 +84,8 @@ impl Error {
             Error::InsufficientQuorum { .. } | Error::ForgetQuorumFailed { .. } => false,
             // Failover verification timeout requires investigation
             Error::FailoverVerificationTimeout { .. } => false,
+            // Transport errors are transient (pod not ready, port-forward failure)
+            Error::Transport(_) => true,
         }
     }
 
@@ -358,6 +364,18 @@ mod tests {
     // ==========================================================================
     // Error classification comprehensive tests
     // ==========================================================================
+
+    #[test]
+    fn test_is_retryable_transport_error() {
+        use crate::controller::transport::TransportError;
+        use crate::crd::PodOrdinal;
+
+        let error = Error::Transport(TransportError::PortForwardFailed {
+            ordinal: PodOrdinal::new(0),
+            reason: "timeout".to_string(),
+        });
+        assert!(error.is_retryable());
+    }
 
     #[test]
     fn test_error_classification_matrix() {

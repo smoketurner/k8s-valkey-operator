@@ -329,63 +329,6 @@ pub fn get_available_port() -> Result<u16, PortForwardError> {
     Ok(port)
 }
 
-/// Helper to create port forwards for all pods in a ValkeyCluster
-pub struct PodPortForwards {
-    forwards: Vec<(String, PortForward)>,
-}
-
-impl PodPortForwards {
-    /// Create port forwards for a list of pod names
-    pub async fn new(
-        client: Client,
-        namespace: &str,
-        pod_names: Vec<String>,
-        remote_port: u16,
-    ) -> Result<Self, PortForwardError> {
-        let mut forwards = Vec::with_capacity(pod_names.len());
-
-        for pod_name in pod_names {
-            let pf = PortForward::start(
-                client.clone(),
-                namespace,
-                PortForwardTarget::pod(&pod_name, remote_port),
-                None,
-            )
-            .await?;
-
-            forwards.push((pod_name, pf));
-        }
-
-        Ok(Self { forwards })
-    }
-
-    /// Get the local endpoint (127.0.0.1:port) for a pod by name
-    pub fn local_endpoint(&self, pod_name: &str) -> Option<Endpoint> {
-        self.forwards
-            .iter()
-            .find(|(name, _)| name == pod_name)
-            .map(|(_, pf)| Endpoint::new("127.0.0.1", pf.local_port()))
-    }
-
-    /// Get all local endpoints as a map from pod name to Endpoint
-    pub fn all_local_endpoints(&self) -> Vec<(String, Endpoint)> {
-        self.forwards
-            .iter()
-            .map(|(name, pf)| (name.clone(), Endpoint::new("127.0.0.1", pf.local_port())))
-            .collect()
-    }
-
-    /// Get the number of port forwards
-    pub fn len(&self) -> usize {
-        self.forwards.len()
-    }
-
-    /// Check if there are no port forwards
-    pub fn is_empty(&self) -> bool {
-        self.forwards.is_empty()
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
