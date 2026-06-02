@@ -1036,8 +1036,16 @@ pub(crate) async fn check_cluster_health(
 
     let masters = cluster_nodes.masters();
 
-    let replica_lags = observe_replica_lags(obj, ctx, namespace, &cluster_nodes).await;
-    let max_replica_lag = replica_lags.values().copied().max();
+    // observe_replica_lags uses connect_to_host with pod IPs, which are
+    // unreachable in LocalForward mode. Skip to avoid connection timeouts.
+    let (replica_lags, max_replica_lag) =
+        if ctx.transport_pool().mode() == crate::controller::transport::TransportMode::InCluster {
+            let lags = observe_replica_lags(obj, ctx, namespace, &cluster_nodes).await;
+            let max = lags.values().copied().max();
+            (lags, max)
+        } else {
+            (std::collections::HashMap::new(), None)
+        };
 
     let topology = ClusterTopology {
         masters: masters
