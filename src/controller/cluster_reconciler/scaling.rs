@@ -57,8 +57,10 @@ pub(crate) async fn execute_scaling_operation(
 
     let cluster_nodes = client.cluster_nodes().await?;
 
-    // Count masters at expected ordinals (< target_masters) to exclude
-    // unconfigured pods at replica ordinals and stale gossip entries.
+    // Count masters that map to an existing pod, excluding stale gossip
+    // entries for deleted nodes. We don't filter by ordinal range here
+    // because during scale-down the current masters sit at ordinals >=
+    // target_masters and must be counted.
     let cluster_name = obj.name_any();
     let topology =
         ClusterTopology::build(&ctx.client, namespace, &cluster_name, Some(&cluster_nodes)).await?;
@@ -67,11 +69,7 @@ pub(crate) async fn execute_scaling_operation(
     let current_masters = cluster_nodes
         .masters()
         .iter()
-        .filter(|m| {
-            ip_to_ordinal
-                .get(&m.ip)
-                .is_some_and(|&ord| ord < target_masters)
-        })
+        .filter(|m| ip_to_ordinal.contains_key(&m.ip))
         .count() as i32;
 
     let scaling_ctx = ScalingContext {
