@@ -101,7 +101,8 @@ make clean-all          # Uninstall and clean
 | `operation_coordination.rs` | Cross-resource operation coordination |
 | `error.rs` | Error types and transient/permanent classification |
 | `status.rs` | Condition management and generation tracking |
-| `context.rs` | Shared context (client, recorder) |
+| `context.rs` | Shared context (client, recorder, transport pool) |
+| `transport.rs` | Transport mode (InCluster/LocalForward) and connection pool |
 | `diagnostic_hints.rs` | Actionable error hints surfaced via events |
 | `common.rs` | Shared controller helpers |
 
