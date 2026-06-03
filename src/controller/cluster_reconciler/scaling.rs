@@ -33,13 +33,20 @@ pub(crate) async fn execute_scaling_operation(
 
     let cluster_nodes = client.cluster_nodes().await?;
 
-    let current_masters = cluster_nodes.masters().len() as i32;
+    // Count only masters with assigned slots for the scaling decision.
+    // Raw masters() count may include unconfigured pods at replica ordinals
+    // that appear as masters (CLUSTER REPLICATE runs in a later phase).
+    let masters_with_slots = cluster_nodes
+        .masters()
+        .iter()
+        .filter(|m| !m.slots.is_empty())
+        .count() as i32;
     let target_masters = obj.spec.masters;
     let _ = client.close().await;
 
-    if target_masters > current_masters {
+    if target_masters > masters_with_slots {
         let promoted =
-            promote_replicas_to_masters(obj, ctx, namespace, current_masters, target_masters)
+            promote_replicas_to_masters(obj, ctx, namespace, masters_with_slots, target_masters)
                 .await?;
         if !promoted.is_empty() {
             info!(promoted = ?promoted, "Promoted replicas to masters before scaling");
@@ -50,7 +57,20 @@ pub(crate) async fn execute_scaling_operation(
 
     let cluster_nodes = client.cluster_nodes().await?;
 
-    let current_masters = cluster_nodes.masters().len() as i32;
+    // Count masters that map to an existing pod, excluding stale gossip
+    // entries for deleted nodes. We don't filter by ordinal range here
+    // because during scale-down the current masters sit at ordinals >=
+    // target_masters and must be counted.
+    let cluster_name = obj.name_any();
+    let topology =
+        ClusterTopology::build(&ctx.client, namespace, &cluster_name, Some(&cluster_nodes)).await?;
+    let ip_to_ordinal = topology.ip_to_ordinal_map();
+
+    let current_masters = cluster_nodes
+        .masters()
+        .iter()
+        .filter(|m| ip_to_ordinal.contains_key(&m.ip))
+        .count() as i32;
 
     let scaling_ctx = ScalingContext {
         current_masters,
@@ -327,6 +347,15 @@ pub(crate) async fn execute_rebalance_slots(
     target_masters: i32,
 ) -> Result<crate::client::ScalingResult, ValkeyError> {
     let mut result = crate::client::ScalingResult::default();
+
+    let cluster_name = obj.name_any();
+    let topology =
+        ClusterTopology::build(&ctx.client, namespace, &cluster_name, Some(cluster_nodes)).await?;
+    let ip_to_ordinal = topology.ip_to_ordinal_map();
+
+    // Filter masters to only include pods in the expected master ordinal range.
+    // After CLUSTER MEET, pods at replica ordinals may appear as masters because
+    // CLUSTER REPLICATE hasn't run yet (ConfiguringNewReplicas is a later phase).
     let masters: Vec<_> = cluster_nodes
         .nodes
         .iter()
@@ -335,6 +364,9 @@ pub(crate) async fn execute_rebalance_slots(
                 && n.master_id
                     .as_ref()
                     .is_none_or(|id| id == "-" || id.is_empty())
+                && ip_to_ordinal
+                    .get(&n.ip)
+                    .is_some_and(|&ord| ord < target_masters)
         })
         .collect();
 
@@ -345,12 +377,6 @@ pub(crate) async fn execute_rebalance_slots(
             masters.len()
         )));
     }
-
-    let cluster_name = obj.name_any();
-    let topology =
-        ClusterTopology::build(&ctx.client, namespace, &cluster_name, Some(cluster_nodes)).await?;
-
-    let ip_to_ordinal = topology.ip_to_ordinal_map();
 
     let target_distribution = calculate_distribution(target_masters as u16);
 
