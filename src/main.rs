@@ -53,10 +53,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Detect transport mode from kube config, with optional env override
     let mode_override = TransportMode::from_env()?;
-    let (config, detected_mode) = match kube::Config::incluster() {
+    let (mut config, detected_mode) = match kube::Config::incluster() {
         Ok(c) => (c, TransportMode::InCluster),
         Err(_) => (kube::Config::infer().await?, TransportMode::LocalForward),
     };
+    // kube 4.0 changed the default read_timeout from Some(295s) to None (no timeout).
+    // Pin it explicitly so non-watch calls (patch_status, secret gets) cannot hang indefinitely.
+    config.read_timeout = Some(Duration::from_secs(295));
     let mode = mode_override.unwrap_or(detected_mode);
     let client = Client::try_from(config)?;
     info!(?mode, "Connected to Kubernetes cluster");

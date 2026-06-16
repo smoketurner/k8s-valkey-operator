@@ -22,7 +22,8 @@ use futures::{Stream, StreamExt};
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Service};
 use kube::runtime::watcher::Config as WatcherConfig;
-use kube::runtime::{Controller, WatchStreamExt, metadata_watcher, predicates, reflector, watcher};
+use kube::core::PartialObjectMeta;
+use kube::runtime::{Controller, WatchStreamExt, predicates, reflector, watcher};
 use kube::{Api, Client, Resource};
 use serde::de::DeserializeOwned;
 use tracing::{debug, error, info};
@@ -125,9 +126,9 @@ pub async fn run_controller_scoped(
     // Set up APIs for the controller (namespaced or cluster-wide)
     let valkeyclusters: Api<ValkeyCluster> = scoped_api(client.clone(), namespace);
     let statefulsets: Api<StatefulSet> = scoped_api(client.clone(), namespace);
-    let pods: Api<Pod> = scoped_api(client.clone(), namespace);
-    let services: Api<Service> = scoped_api(client.clone(), namespace);
-    let configmaps: Api<ConfigMap> = scoped_api(client.clone(), namespace);
+    let pods: Api<PartialObjectMeta<Pod>> = scoped_api(client.clone(), namespace);
+    let services: Api<PartialObjectMeta<Service>> = scoped_api(client.clone(), namespace);
+    let configmaps: Api<PartialObjectMeta<ConfigMap>> = scoped_api(client.clone(), namespace);
 
     // Use consistent watcher configuration across all controllers
     let watcher_config = default_watcher_config();
@@ -135,17 +136,13 @@ pub async fn run_controller_scoped(
     // Create filtered stream with standard optimizations (reflector, backoff, generation predicate)
     let (reader, resource_stream) = create_filtered_stream(valkeyclusters, watcher_config.clone());
 
-    // Create and run the controller using for_stream with the pre-filtered stream
-    // Memory optimization: Use metadata_watcher for owned resources where we only need to know
-    // they exist/changed (Services, ConfigMaps). Use full watcher for StatefulSet and Pods
-    // since we may read their status (e.g., StatefulSet .status.readyReplicas, Pod .status.phase).
-    // metadata_watcher returns PartialObjectMeta which only contains TypeMeta + ObjectMeta,
-    // reducing memory and IO for resources where we only need metadata changes.
+    // Create and run the controller using for_stream with the pre-filtered stream.
+    // Pods, Services, and ConfigMaps use PartialObjectMeta to reduce memory and IO.
     Controller::for_stream(resource_stream, reader)
         .owns(statefulsets, watcher_config.clone()) // Watch StatefulSets (operator creates these)
-        .owns_stream(metadata_watcher(pods, watcher_config.clone()).touched_objects()) // Watch Pods for status changes
-        .owns_stream(metadata_watcher(services, watcher_config.clone()).touched_objects())
-        .owns_stream(metadata_watcher(configmaps, watcher_config).touched_objects())
+        .owns_stream(watcher(pods, watcher_config.clone()).touched_objects())
+        .owns_stream(watcher(services, watcher_config.clone()).touched_objects())
+        .owns_stream(watcher(configmaps, watcher_config).touched_objects())
         .run(
             reconcile_cluster,
             controller::cluster_reconciler::error_policy,
