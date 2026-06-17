@@ -33,7 +33,7 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 # HTTP server for health endpoints and metrics
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
 axum-server = { version = "=0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
-prometheus-client = { version = "=0.24.1", default-features = false }
+prometheus-client = { version = "=0.25.0", default-features = false }
 rustls-pemfile = { version = "=2.2.0", default-features = false, features = ["std"] }
 
 # TLS crypto backend for rustls
@@ -60,7 +60,7 @@ hostname = { version = "=0.4.2", default-features = false }
 
 [dev-dependencies]
 tokio-test = { version = "=0.4.5", default-features = false }
-uuid = { version = "=1.23.2", default-features = false, features = ["v4"] }
+uuid = { version = "=1.23.3", default-features = false, features = ["v4"] }
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 
 [lints.clippy]
