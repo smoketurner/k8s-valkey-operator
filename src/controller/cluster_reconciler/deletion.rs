@@ -96,7 +96,24 @@ pub(crate) async fn forget_nodes_with_quorum(
                             );
                         }
                         Err(e) => {
-                            failures.push(format!("{}:{}", node.node_id, e));
+                            // CLUSTER FORGET is idempotent from our perspective: if this
+                            // source already doesn't know the target (e.g. it was forgotten
+                            // on a previous, partially-successful attempt), or the target is
+                            // the source itself, the desired end state already holds. Count
+                            // these as successes so retries don't stall on already-removed
+                            // nodes. Mirrors the handling in cluster_init's forget loop.
+                            let error_str = e.to_string().to_lowercase();
+                            if error_str.contains("unknown node") || error_str.contains("myself") {
+                                successes += 1;
+                                debug!(
+                                    name = %name,
+                                    node_id = %node_id,
+                                    source = %node.node_id,
+                                    "Node already forgotten or is self, treating as success"
+                                );
+                            } else {
+                                failures.push(format!("{}:{}", node.node_id, e));
+                            }
                         }
                     }
                     let _ = node_client.close().await;
