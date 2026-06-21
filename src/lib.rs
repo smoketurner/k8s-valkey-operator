@@ -140,9 +140,24 @@ pub async fn run_controller_scoped(
     // Pods, Services, and ConfigMaps use PartialObjectMeta to reduce memory and IO.
     Controller::for_stream(resource_stream, reader)
         .owns(statefulsets, watcher_config.clone()) // Watch StatefulSets (operator creates these)
-        .owns_stream(watcher(pods, watcher_config.clone()).touched_objects())
-        .owns_stream(watcher(services, watcher_config.clone()).touched_objects())
-        .owns_stream(watcher(configmaps, watcher_config).touched_objects())
+        // Filter owned-resource streams on generation, consistent with the main
+        // ValkeyCluster stream, so status-only updates (e.g. Pod phase/IP churn) do not
+        // trigger unnecessary reconciliations. Timer-based requeues bound any added latency.
+        .owns_stream(
+            watcher(pods, watcher_config.clone())
+                .touched_objects()
+                .predicate_filter(predicates::generation, Default::default()),
+        )
+        .owns_stream(
+            watcher(services, watcher_config.clone())
+                .touched_objects()
+                .predicate_filter(predicates::generation, Default::default()),
+        )
+        .owns_stream(
+            watcher(configmaps, watcher_config)
+                .touched_objects()
+                .predicate_filter(predicates::generation, Default::default()),
+        )
         .run(
             reconcile_cluster,
             controller::cluster_reconciler::error_policy,

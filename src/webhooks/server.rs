@@ -65,8 +65,12 @@ async fn validate_valkeycluster(
         Ok(req) => req,
         Err(e) => {
             error!(error = %e, "Failed to extract admission request");
+            // Admission webhooks must respond HTTP 200 and encode the decision in the
+            // AdmissionReview body. Returning a non-200 status makes the API server treat
+            // this as an infrastructure failure (applying failurePolicy) and discard the
+            // invalid/denial body, so a malformed review could be admitted under fail-open.
             return (
-                StatusCode::BAD_REQUEST,
+                StatusCode::OK,
                 Json(
                     AdmissionResponse::invalid(format!("Invalid AdmissionReview: {}", e))
                         .into_review(),

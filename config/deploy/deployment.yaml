@@ -37,7 +37,7 @@ spec:
               containerPort: 8080
               protocol: TCP
             - name: webhook
-              containerPort: 8443
+              containerPort: 9443
               protocol: TCP
           env:
             - name: RUST_LOG

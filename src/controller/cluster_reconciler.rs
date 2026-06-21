@@ -33,6 +33,7 @@ use crate::{
         context::Context,
         diagnostic_hints::DiagnosticHint,
         error::Error,
+        operation_coordination::{self, OperationType},
         tls_status,
     },
     crd::{ClusterPhase, ValkeyCluster, total_pods},
@@ -455,6 +456,7 @@ async fn dispatch_phase(
             let result = cluster_phases::handle_rebalancing_slots(
                 obj,
                 ctx,
+                api,
                 phase_ctx,
                 execute_scale_up_rebalance(obj, ctx, namespace),
             )
@@ -540,6 +542,24 @@ async fn handle_failed_phase(
     namespace: &str,
     name: &str,
 ) -> Result<ClusterPhase, Error> {
+    // Clear any stale operation lock before attempting recovery. A cluster can enter
+    // Failed (e.g. via stuck detection) while an operation lock is held, and
+    // StatusUpdate::apply() preserves current_operation across phase transitions. Without
+    // this, a cluster that recovers to Running/Degraded keeps the stale lock and blocks
+    // all future operations of a different type (e.g. upgrades blocked by a leftover
+    // "scaling" lock). complete_operation is idempotent and only clears a matching lock.
+    if let Some(current_op) = obj
+        .status
+        .as_ref()
+        .and_then(|s| s.current_operation.clone())
+        && let Ok(op_type) = OperationType::from_str(&current_op)
+    {
+        let api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), namespace);
+        if let Err(e) = operation_coordination::complete_operation(&api, name, op_type).await {
+            warn!(name = %name, error = %e, "Failed to clear stale operation lock during Failed recovery");
+        }
+    }
+
     let running_pods = check_running_pods(obj, ctx, namespace).await.unwrap_or(0);
     let ready_replicas = check_ready_replicas(obj, ctx, namespace).await.unwrap_or(0);
     let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);

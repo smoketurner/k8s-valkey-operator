@@ -1,0 +1,96 @@
+{{- if .Values.webhook.enabled }}
+{{- $fullName := include "valkey-operator.fullname" . -}}
+{{- $webhookName := printf "%s-webhook" $fullName -}}
+{{/*
+Admission webhook wiring. Exposes the operator's webhook server (listening on
+.Values.webhook.port) to the API server and registers the ValidatingWebhookConfiguration
+so ValkeyCluster spec changes are validated (upgrade protection, downgrade protection).
+Requires cert-manager.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $webhookName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "valkey-operator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+spec:
+  type: ClusterIP
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: webhook
+      protocol: TCP
+  selector:
+    {{- include "valkey-operator.selectorLabels" . | nindent 4 }}
+{{- if .Values.webhook.certificate.issuerRef.create }}
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ printf "%s-selfsigned" $webhookName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "valkey-operator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+spec:
+  selfSigned: {}
+{{- end }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $webhookName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "valkey-operator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+spec:
+  secretName: {{ printf "%s-tls" $webhookName }}
+  duration: {{ .Values.webhook.certificate.duration }}
+  renewBefore: {{ .Values.webhook.certificate.renewBefore }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  dnsNames:
+    - {{ printf "%s.%s.svc" $webhookName .Release.Namespace }}
+    - {{ printf "%s.%s.svc.cluster.local" $webhookName .Release.Namespace }}
+  issuerRef:
+    {{- if .Values.webhook.certificate.issuerRef.create }}
+    name: {{ printf "%s-selfsigned" $webhookName }}
+    kind: Issuer
+    group: cert-manager.io
+    {{- else }}
+    name: {{ required "webhook.certificate.issuerRef.name is required when issuerRef.create is false" .Values.webhook.certificate.issuerRef.name }}
+    kind: {{ .Values.webhook.certificate.issuerRef.kind }}
+    group: {{ .Values.webhook.certificate.issuerRef.group }}
+    {{- end }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ $webhookName }}
+  labels:
+    {{- include "valkey-operator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+  annotations:
+    cert-manager.io/inject-ca-from: {{ printf "%s/%s" .Release.Namespace $webhookName }}
+webhooks:
+  - name: validate.valkeycluster.valkey-operator.smoketurner.com
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: {{ .Values.webhook.failurePolicy }}
+    timeoutSeconds: {{ .Values.webhook.timeoutSeconds }}
+    rules:
+      - apiGroups: ["valkey-operator.smoketurner.com"]
+        apiVersions: ["v1alpha1"]
+        resources: ["valkeyclusters"]
+        operations: ["CREATE", "UPDATE"]
+    clientConfig:
+      service:
+        name: {{ $webhookName }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate-valkeycluster
+        port: 443
+{{- end }}

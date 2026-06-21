@@ -1,0 +1,94 @@
+# Admission webhook wiring for the Valkey operator.
+#
+# The operator's webhook server (src/webhooks/server.rs) listens on port 9443 (WEBHOOK_PORT)
+# and serves /validate-valkeycluster. These resources expose that endpoint to the API server
+# and register the ValidatingWebhookConfiguration so spec changes are actually validated —
+# most importantly, blocking ValkeyCluster spec changes while an upgrade is in flight
+# (the `upgrade_protection` policy) and image downgrades (the `image_change` policy).
+#
+# TLS is provisioned by cert-manager. The Certificate populates the
+# `valkey-operator-webhook-tls` secret (mounted into the operator pod at /etc/webhook/certs),
+# and the `cert-manager.io/inject-ca-from` annotation injects the CA bundle into the
+# ValidatingWebhookConfiguration. cert-manager must be installed in the cluster.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey-operator-webhook
+  namespace: valkey-operator-system
+  labels:
+    app.kubernetes.io/name: valkey-operator
+    app.kubernetes.io/component: webhook
+spec:
+  type: ClusterIP
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: webhook
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: valkey-operator
+---
+# Self-signed issuer used to mint the webhook serving certificate.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: valkey-operator-webhook-selfsigned
+  namespace: valkey-operator-system
+  labels:
+    app.kubernetes.io/name: valkey-operator
+    app.kubernetes.io/component: webhook
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: valkey-operator-webhook
+  namespace: valkey-operator-system
+  labels:
+    app.kubernetes.io/name: valkey-operator
+    app.kubernetes.io/component: webhook
+spec:
+  secretName: valkey-operator-webhook-tls
+  duration: 8760h # 1 year
+  renewBefore: 720h # 30 days
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  dnsNames:
+    - valkey-operator-webhook.valkey-operator-system.svc
+    - valkey-operator-webhook.valkey-operator-system.svc.cluster.local
+  issuerRef:
+    name: valkey-operator-webhook-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: valkey-operator-webhook
+  labels:
+    app.kubernetes.io/name: valkey-operator
+    app.kubernetes.io/component: webhook
+  annotations:
+    # cert-manager injects the CA bundle from the webhook Certificate above.
+    cert-manager.io/inject-ca-from: valkey-operator-system/valkey-operator-webhook
+webhooks:
+  - name: validate.valkeycluster.valkey-operator.smoketurner.com
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    # Fail closed so upgrade-protection / downgrade-protection are actually enforced.
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    rules:
+      - apiGroups: ["valkey-operator.smoketurner.com"]
+        apiVersions: ["v1alpha1"]
+        resources: ["valkeyclusters"]
+        operations: ["CREATE", "UPDATE"]
+    clientConfig:
+      service:
+        name: valkey-operator-webhook
+        namespace: valkey-operator-system
+        path: /validate-valkeycluster
+        port: 443
