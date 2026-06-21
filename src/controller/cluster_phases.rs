@@ -207,17 +207,6 @@ pub struct ClusterHealthResult {
     pub healthy_masters: i32,
 }
 
-/// Result of cluster initialization (CLUSTER MEET).
-#[derive(Debug)]
-pub enum InitResult {
-    /// Waiting for pods to be running.
-    WaitingForPods,
-    /// CLUSTER MEET succeeded, proceed to slot assignment.
-    Success,
-    /// CLUSTER MEET failed, will retry.
-    Failed(String),
-}
-
 // ============================================================================
 // Initial Creation Phase Handlers
 // ============================================================================
@@ -1228,70 +1217,6 @@ pub async fn handle_degraded(
     }
 }
 
-/// Handle Failed phase.
-///
-/// Attempts recovery via stale IP detection and cleanup.
-/// Transitions to Degraded or Running if recovery succeeds.
-pub async fn handle_failed(
-    obj: &ValkeyCluster,
-    ctx: &Context,
-    phase_ctx: &PhaseContext,
-    create_resources_fn: impl std::future::Future<Output = Result<(), Error>>,
-    recovery_fn: impl std::future::Future<Output = Result<bool, Error>>,
-) -> Result<PhaseResult, Error> {
-    let name = &phase_ctx.name;
-    let desired_replicas = phase_ctx.desired_replicas();
-
-    // Ensure resources are in sync
-    create_resources_fn.await?;
-
-    // Check if cluster has recovered
-    if phase_ctx.ready_pods >= desired_replicas {
-        ctx.publish_normal_event(
-            obj,
-            "Recovered",
-            "Failed",
-            Some(format!(
-                "Cluster recovered: {}/{} replicas ready",
-                phase_ctx.ready_pods, desired_replicas
-            )),
-        )
-        .await;
-        return Ok(ClusterPhase::Running.into());
-    }
-
-    // Attempt recovery (stale IP detection, etc.)
-    if phase_ctx.ready_pods > 0 {
-        match recovery_fn.await {
-            Ok(true) => {
-                ctx.publish_normal_event(
-                    obj,
-                    "RecoveryInitiated",
-                    "Failed",
-                    Some("Recovery process initiated".to_string()),
-                )
-                .await;
-                return Ok(ClusterPhase::Degraded.into());
-            }
-            Ok(false) => {
-                debug!(name = %name, "No recovery actions taken");
-            }
-            Err(e) => {
-                warn!(name = %name, error = %e, "Recovery attempt failed");
-            }
-        }
-    }
-
-    // Stay in Failed
-    debug!(
-        name = %name,
-        ready = phase_ctx.ready_pods,
-        desired = desired_replicas,
-        "Cluster still failed, waiting for intervention"
-    );
-    Ok(ClusterPhase::Failed.into())
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1438,17 +1363,6 @@ mod tests {
         assert!(!unhealthy.is_healthy);
         assert_eq!(unhealthy.slots_assigned, 8192);
         assert_eq!(unhealthy.healthy_masters, 2);
-    }
-
-    #[test]
-    fn test_init_result_variants() {
-        let waiting = InitResult::WaitingForPods;
-        let success = InitResult::Success;
-        let failed = InitResult::Failed("test error".to_string());
-
-        assert!(matches!(waiting, InitResult::WaitingForPods));
-        assert!(matches!(success, InitResult::Success));
-        assert!(matches!(failed, InitResult::Failed(_)));
     }
 
     #[test]
