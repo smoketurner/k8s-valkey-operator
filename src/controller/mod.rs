@@ -27,4 +27,3 @@ pub mod tls_status;
 
 // ValkeyUpgrade controller
 pub mod upgrade_reconciler;
-pub mod upgrade_state_machine;
