@@ -180,36 +180,3 @@ pub async fn complete_operation(
     Ok(())
 }
 
-/// Check if cluster is in a state that allows operations.
-///
-/// Some operations require the cluster to be in Running state.
-pub fn is_cluster_ready_for_operation(cluster: &ValkeyCluster, operation: OperationType) -> bool {
-    let phase = cluster
-        .status
-        .as_ref()
-        .map(|s| s.phase)
-        .unwrap_or(crate::crd::ClusterPhase::Pending);
-
-    match operation {
-        OperationType::Initializing => {
-            // Initialization can happen from initial creation phases
-            matches!(
-                phase,
-                crate::crd::ClusterPhase::Pending
-                    | crate::crd::ClusterPhase::Creating
-                    | crate::crd::ClusterPhase::WaitingForPods
-                    | crate::crd::ClusterPhase::InitializingCluster
-                    | crate::crd::ClusterPhase::AssigningSlots
-                    | crate::crd::ClusterPhase::ConfiguringReplicas
-            )
-        }
-        OperationType::Scaling => {
-            // Scaling requires cluster to be Running
-            phase == crate::crd::ClusterPhase::Running
-        }
-        OperationType::Upgrading => {
-            // Upgrades require cluster to be Running
-            phase == crate::crd::ClusterPhase::Running
-        }
-    }
-}
