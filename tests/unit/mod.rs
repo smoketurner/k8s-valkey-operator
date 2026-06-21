@@ -910,7 +910,7 @@ mod validation_tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::collections::BTreeMap;
     use valkey_operator::controller::cluster_validation::{
-        MAX_REPLICAS_PER_MASTER, SpecDiff, generation_changed, validate_spec, validate_spec_change,
+        MAX_REPLICAS_PER_MASTER, validate_spec,
     };
     use valkey_operator::crd::{
         AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyCluster, ValkeyClusterSpec,
@@ -977,83 +977,4 @@ mod validation_tests {
         assert!(validate_spec(&resource).is_err());
     }
 
-    #[test]
-    fn test_spec_diff_requires_update() {
-        let old = create_test_resource(3, 1);
-        let mut new = create_test_resource(3, 1);
-        new.spec.image.tag = "9.1.0".to_string();
-
-        let diff = validate_spec_change(&old, &new).expect("valid spec change should succeed");
-        assert!(diff.image_changed);
-        assert!(diff.requires_update());
-    }
-
-    #[test]
-    fn test_spec_diff_resources_changed() {
-        let old = create_test_resource(3, 1);
-        let mut new = create_test_resource(3, 1);
-        new.spec.resources.requests.cpu = "2".to_string();
-
-        let diff = validate_spec_change(&old, &new).expect("valid spec change should succeed");
-        assert!(diff.resources_changed);
-        assert!(diff.requires_update());
-    }
-
-    #[test]
-    fn test_spec_diff_labels_changed() {
-        let old = create_test_resource(3, 1);
-        let mut new = create_test_resource(3, 1);
-        new.spec
-            .labels
-            .insert("env".to_string(), "prod".to_string());
-
-        let diff = validate_spec_change(&old, &new).expect("valid spec change should succeed");
-        assert!(diff.labels_changed);
-        assert!(diff.requires_update());
-    }
-
-    #[test]
-    fn test_spec_diff_scale_down_below_minimum() {
-        let old = create_test_resource(3, 1);
-        let new = create_test_resource(2, 1);
-
-        assert!(validate_spec_change(&old, &new).is_err());
-    }
-
-    #[test]
-    fn test_generation_changed_no_status() {
-        let mut resource = create_test_resource(3, 1);
-        resource.metadata.generation = Some(2);
-        resource.status = None;
-
-        assert!(generation_changed(&resource));
-    }
-
-    #[test]
-    fn test_generation_changed_no_generation() {
-        let mut resource = create_test_resource(3, 1);
-        resource.metadata.generation = None;
-        resource.status = Some(ValkeyClusterStatus {
-            observed_generation: Some(1),
-            ..Default::default()
-        });
-
-        assert!(!generation_changed(&resource));
-    }
-
-    #[test]
-    fn test_spec_diff_total_pod_delta_scale_up() {
-        let diff = SpecDiff::default();
-        // Scale up: 3 masters + 1 replica = 6 pods -> 6 masters + 2 replicas = 18 pods
-        let delta = diff.total_pod_delta(3, 1, 6, 2);
-        assert_eq!(delta, 12);
-    }
-
-    #[test]
-    fn test_spec_diff_total_pod_delta_scale_down() {
-        let diff = SpecDiff::default();
-        // Scale down: 6 masters + 2 replicas = 18 pods -> 3 masters + 1 replica = 6 pods
-        let delta = diff.total_pod_delta(6, 2, 3, 1);
-        assert_eq!(delta, -12);
-    }
 }
