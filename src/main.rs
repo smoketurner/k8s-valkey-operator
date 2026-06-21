@@ -182,22 +182,37 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    // Optionally start webhook server if certificates are available
-    let webhook_handle =
-        if Path::new(WEBHOOK_CERT_PATH).exists() && Path::new(WEBHOOK_KEY_PATH).exists() {
-            info!("TLS certificates found, starting webhook server");
-            let webhook_client = client.clone();
-            Some(tokio::spawn(async move {
-                if let Err(e) =
-                    run_webhook_server(webhook_client, WEBHOOK_CERT_PATH, WEBHOOK_KEY_PATH).await
-                {
-                    error!("Webhook server error: {}", e);
+    // Start the webhook server if the webhook is enabled (its certificate directory is
+    // mounted). cert-manager may populate the TLS certificate *after* the pod starts, so we
+    // wait for the cert files to appear rather than checking only once at boot — with
+    // failurePolicy: Fail, a webhook that never starts blocks all ValkeyCluster admissions.
+    // This wait runs in its own task and does not gate the controllers, so a misconfigured
+    // webhook cert never blocks core reconciliation.
+    let webhook_cert_dir = Path::new(WEBHOOK_CERT_PATH).parent();
+    let webhook_handle = if webhook_cert_dir.is_some_and(Path::exists) {
+        let webhook_client = client.clone();
+        Some(tokio::spawn(async move {
+            let mut logged_waiting = false;
+            while !(Path::new(WEBHOOK_CERT_PATH).exists() && Path::new(WEBHOOK_KEY_PATH).exists()) {
+                if !logged_waiting {
+                    info!(
+                        "Webhook enabled but TLS certificates not yet present, waiting for them to be provisioned..."
+                    );
+                    logged_waiting = true;
                 }
-            }))
-        } else {
-            info!("Webhook certificates not found, webhook server disabled");
-            None
-        };
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            info!("TLS certificates found, starting webhook server");
+            if let Err(e) =
+                run_webhook_server(webhook_client, WEBHOOK_CERT_PATH, WEBHOOK_KEY_PATH).await
+            {
+                error!("Webhook server error: {}", e);
+            }
+        }))
+    } else {
+        info!("Webhook certificate directory not present, webhook server disabled");
+        None
+    };
 
     // Wait for any task to complete (or fail), or shutdown signal
     tokio::select! {

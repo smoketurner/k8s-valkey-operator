@@ -33,6 +33,7 @@ use crate::{
         context::Context,
         diagnostic_hints::DiagnosticHint,
         error::Error,
+        operation_coordination::{self, OperationType},
         tls_status,
     },
     crd::{ClusterPhase, ValkeyCluster, total_pods},
@@ -455,6 +456,7 @@ async fn dispatch_phase(
             let result = cluster_phases::handle_rebalancing_slots(
                 obj,
                 ctx,
+                api,
                 phase_ctx,
                 execute_scale_up_rebalance(obj, ctx, namespace),
             )
@@ -540,6 +542,31 @@ async fn handle_failed_phase(
     namespace: &str,
     name: &str,
 ) -> Result<ClusterPhase, Error> {
+    // Clear a stale cluster-owned operation lock (Scaling/Initializing) before attempting
+    // recovery. These locks are acquired and released within the cluster reconciler's own
+    // phase handlers, so when the cluster jumps to Failed mid-operation the lock is
+    // orphaned and StatusUpdate::apply() preserves current_operation across transitions —
+    // blocking future operations of a different type once the cluster recovers to
+    // Running/Degraded (issues #86, #90). complete_operation is idempotent and only clears
+    // a matching lock.
+    //
+    // The Upgrading lock is intentionally NOT cleared here: it is owned by the upgrade
+    // reconciler (a separate FSM) and may still be legitimately in flight while the cluster
+    // is Failed. Clearing it could let another operation (e.g. scaling) start against a
+    // cluster that is still mid-upgrade.
+    if let Some(current_op) = obj
+        .status
+        .as_ref()
+        .and_then(|s| s.current_operation.clone())
+        && let Ok(op_type @ (OperationType::Scaling | OperationType::Initializing)) =
+            OperationType::from_str(&current_op)
+    {
+        let api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), namespace);
+        if let Err(e) = operation_coordination::complete_operation(&api, name, op_type).await {
+            warn!(name = %name, error = %e, "Failed to clear stale operation lock during Failed recovery");
+        }
+    }
+
     let running_pods = check_running_pods(obj, ctx, namespace).await.unwrap_or(0);
     let ready_replicas = check_ready_replicas(obj, ctx, namespace).await.unwrap_or(0);
     let desired_replicas = total_pods(obj.spec.masters, obj.spec.replicas_per_master);

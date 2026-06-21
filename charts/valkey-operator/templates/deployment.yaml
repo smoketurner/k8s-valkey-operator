@@ -62,6 +62,11 @@ spec:
             - name: health
               containerPort: {{ .Values.operator.healthPort }}
               protocol: TCP
+            {{- if .Values.webhook.enabled }}
+            - name: webhook
+              containerPort: {{ .Values.webhook.port }}
+              protocol: TCP
+            {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -78,13 +83,29 @@ spec:
           readinessProbe:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with .Values.extraVolumeMounts }}
+          {{- if or .Values.webhook.enabled .Values.extraVolumeMounts }}
           volumeMounts:
+            {{- if .Values.webhook.enabled }}
+            # Webhook TLS certificates from the cert-manager Certificate.
+            - name: webhook-certs
+              mountPath: /etc/webhook/certs
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
-      {{- with .Values.extraVolumes }}
+      {{- if or .Values.webhook.enabled .Values.extraVolumes }}
       volumes:
+        {{- if .Values.webhook.enabled }}
+        - name: webhook-certs
+          secret:
+            secretName: {{ include "valkey-operator.fullname" . }}-webhook-tls
+            optional: true # Allow the pod to start before cert-manager issues the cert
+        {{- end }}
+        {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.nodeSelector }}

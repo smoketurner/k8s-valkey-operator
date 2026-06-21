@@ -295,36 +295,27 @@ pub(crate) async fn execute_scale_down(
         let _ = source_client.close().await;
     }
 
-    // CLUSTER FORGET the removed nodes after migrations
-    let client = ctx
-        .connect_to_cluster(obj, namespace, 0)
-        .await
-        .map_err(|e| ValkeyError::Connection(format!("Failed to connect for FORGET: {}", e)))?;
-
-    for node in &nodes_to_remove {
-        info!(node_id = %node.node_id, "Removing node from cluster via CLUSTER FORGET");
-        if let Err(e) = client.cluster_forget(&node.node_id).await {
-            warn!(node_id = %node.node_id, error = %e, "Failed to forget node, continuing");
+    // CLUSTER FORGET the removed nodes after migrations.
+    //
+    // FORGET only removes a node from the *receiving* node's local table; the remaining
+    // nodes will re-propagate it via gossip unless FORGET reaches all of them (Valkey's
+    // documented ban-list behavior). Sending FORGET to a single node therefore leaves
+    // orphaned entries that reappear in CLUSTER NODES. Use the all-nodes quorum helper
+    // (also used by deletion) so the removal sticks, and only report nodes as removed
+    // once FORGET has achieved quorum.
+    let mut node_ids_to_forget: Vec<crate::crd::NodeId> = Vec::new();
+    for node in nodes_to_remove.iter().chain(orphaned_masters.iter()) {
+        if !node_ids_to_forget.contains(&node.node_id) {
+            node_ids_to_forget.push(node.node_id.clone());
         }
-        result.nodes_removed.push(node.node_id.clone());
     }
 
-    for node in &orphaned_masters {
-        if result.nodes_removed.contains(&node.node_id) {
-            continue;
-        }
-        info!(
-            node_id = %node.node_id,
-            has_slots = !node.slots.is_empty(),
-            "Removing orphaned node from cluster via CLUSTER FORGET"
-        );
-        if let Err(e) = client.cluster_forget(&node.node_id).await {
-            warn!(node_id = %node.node_id, error = %e, "Failed to forget orphaned node, continuing");
-        }
-        result.nodes_removed.push(node.node_id.clone());
+    if !node_ids_to_forget.is_empty() {
+        super::deletion::forget_nodes_with_quorum(obj, ctx, namespace, &node_ids_to_forget)
+            .await
+            .map_err(|e| ValkeyError::Connection(format!("CLUSTER FORGET failed: {}", e)))?;
+        result.nodes_removed = node_ids_to_forget;
     }
-
-    let _ = client.close().await;
 
     info!(
         nodes_removed = result.nodes_removed.len(),

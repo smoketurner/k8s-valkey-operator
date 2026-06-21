@@ -32,6 +32,37 @@ operator:
   # Health server port
   healthPort: 8080
 
+# Admission webhook configuration.
+#
+# When enabled, the chart deploys a webhook Service, a cert-manager Certificate for the
+# serving cert, and a ValidatingWebhookConfiguration registering the operator's webhook.
+# This enforces validation the CRD schema cannot express — most importantly blocking
+# ValkeyCluster spec changes while an upgrade is in flight, and image downgrades.
+#
+# Requires cert-manager to be installed in the cluster.
+webhook:
+  # Enable the admission webhook (Service + Certificate + ValidatingWebhookConfiguration).
+  enabled: false
+  # Port the operator's webhook server listens on (matches WEBHOOK_PORT in the binary).
+  port: 9443
+  # failurePolicy for the ValidatingWebhookConfiguration. "Fail" enforces protection
+  # (recommended); "Ignore" fails open if the webhook is unreachable.
+  failurePolicy: Fail
+  # Webhook call timeout in seconds.
+  timeoutSeconds: 5
+  # cert-manager certificate settings for the webhook serving cert.
+  certificate:
+    # Duration and renewal window for the issued certificate.
+    duration: 8760h # 1 year
+    renewBefore: 720h # 30 days
+    # Issuer to mint the serving cert. By default the chart creates a self-signed Issuer.
+    # Set create=false and provide an existing issuerRef to use your own CA.
+    issuerRef:
+      create: true
+      name: ""
+      kind: Issuer
+      group: cert-manager.io
+
 # Service account configuration
 serviceAccount:
   # Create service account

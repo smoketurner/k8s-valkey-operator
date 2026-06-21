@@ -757,6 +757,7 @@ pub async fn handle_adding_nodes_to_cluster(
 pub async fn handle_rebalancing_slots(
     obj: &ValkeyCluster,
     ctx: &Context,
+    api: &Api<ValkeyCluster>,
     phase_ctx: &PhaseContext,
     rebalance_fn: impl std::future::Future<Output = Result<bool, Error>>,
 ) -> Result<PhaseResult, Error> {
@@ -779,6 +780,12 @@ pub async fn handle_rebalancing_slots(
             if phase_ctx.target_replicas_per_master > 0 {
                 Ok(ClusterPhase::ConfiguringNewReplicas.into())
             } else {
+                // No new replicas to configure, so ConfiguringNewReplicas (which
+                // releases the scaling lock) is skipped. Release the lock here to avoid
+                // leaking it, mirroring the initialization path in handle_assigning_slots.
+                let _ =
+                    operation_coordination::complete_operation(api, name, OperationType::Scaling)
+                        .await;
                 Ok(ClusterPhase::VerifyingClusterHealth.into())
             }
         }

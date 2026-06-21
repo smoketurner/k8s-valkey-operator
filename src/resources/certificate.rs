@@ -123,7 +123,7 @@ pub fn generate_certificate(resource: &ValkeyCluster) -> Certificate {
     let issuer_ref = &tls.issuer_ref;
 
     // Build DNS names for the certificate
-    let dns_names = vec![
+    let mut dns_names = vec![
         // Wildcard for all pod DNS names via headless service
         format!("*.{}-headless.{}.svc.cluster.local", name, namespace),
         // Client service endpoint
@@ -136,6 +136,21 @@ pub fn generate_certificate(resource: &ValkeyCluster) -> Certificate {
         // Client service itself
         name.clone(),
     ];
+
+    // The read service (`{name}-read`) is a separate client-facing endpoint. When
+    // enabled, clients may connect via its hostname, so its DNS names must be covered
+    // by the certificate to pass TLS hostname verification. The wildcard SAN above only
+    // matches pod DNS names behind the headless service, not service DNS names.
+    if resource
+        .spec
+        .read_service
+        .as_ref()
+        .is_some_and(|r| r.enabled)
+    {
+        dns_names.push(format!("{}-read.{}.svc.cluster.local", name, namespace));
+        dns_names.push(format!("{}-read.{}.svc", name, namespace));
+        dns_names.push(format!("{}-read", name));
+    }
 
     // Build labels and annotations
     let mut labels = standard_labels(resource);
@@ -291,6 +306,47 @@ mod tests {
         let usages = cert.spec.usages.unwrap();
         assert!(usages.contains(&"server auth".to_string()));
         assert!(usages.contains(&"client auth".to_string()));
+    }
+
+    #[test]
+    fn test_read_service_dns_names_absent_by_default() {
+        let resource = test_resource("my-cluster", "production");
+        let cert = generate_certificate(&resource);
+
+        // With no read service configured, read-service SANs must not be present.
+        assert!(
+            !cert
+                .spec
+                .dns_names
+                .iter()
+                .any(|n| n.starts_with("my-cluster-read"))
+        );
+    }
+
+    #[test]
+    fn test_read_service_dns_names_added_when_enabled() {
+        use crate::crd::ReadServiceSpec;
+
+        let mut resource = test_resource("my-cluster", "production");
+        resource.spec.read_service = Some(ReadServiceSpec {
+            enabled: true,
+            ..Default::default()
+        });
+        let cert = generate_certificate(&resource);
+
+        // Enabling the read service must add its DNS names so clients connecting via the
+        // `{name}-read` hostname pass TLS hostname verification.
+        for expected in [
+            "my-cluster-read.production.svc.cluster.local",
+            "my-cluster-read.production.svc",
+            "my-cluster-read",
+        ] {
+            assert!(
+                cert.spec.dns_names.contains(&expected.to_string()),
+                "expected read-service SAN {expected} in {:?}",
+                cert.spec.dns_names
+            );
+        }
     }
 
     #[test]

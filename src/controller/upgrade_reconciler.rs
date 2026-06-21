@@ -224,7 +224,9 @@ async fn handle_pending_phase(
 
     // Initialize status with shard information
     let total_shards = cluster.spec.masters;
-    let shard_statuses = initialize_shard_statuses(cluster, ctx, namespace).await?;
+    // Use the target cluster's namespace (not the upgrade's) so Valkey auth/TLS
+    // secrets are resolved from where the cluster — and its secrets — actually live.
+    let shard_statuses = initialize_shard_statuses(cluster, ctx, cluster_namespace).await?;
 
     let mut status = ValkeyUpgradeStatus {
         phase: UpgradePhase::PreChecks,
@@ -294,7 +296,9 @@ async fn handle_prechecks_phase(
         return Err(e);
     }
 
-    let client = ctx.connect_to_cluster(cluster, namespace, 0).await?;
+    let client = ctx
+        .connect_to_cluster(cluster, cluster_namespace, 0)
+        .await?;
 
     // Check cluster health - always required before upgrade
     let cluster_info = client.cluster_info().await?;
@@ -1730,9 +1734,10 @@ async fn check_rollback_completion(
     // Construct original image
     let original_image = format!("{}:{}", cluster.spec.image.repository, original_version);
 
-    // Check if all pods are running with the original image
+    // Check if all pods are running with the original image. Pods live in the target
+    // cluster's namespace, which may differ from the upgrade's namespace.
     let pod_api: Api<k8s_openapi::api::core::v1::Pod> =
-        Api::namespaced(ctx.client.clone(), namespace);
+        Api::namespaced(ctx.client.clone(), cluster_namespace);
     let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
 
     let mut all_pods_ready = true;
@@ -1801,7 +1806,7 @@ async fn check_rollback_completion(
     }
 
     // Check cluster health
-    let client = match ctx.connect_to_cluster(cluster, namespace, 0).await {
+    let client = match ctx.connect_to_cluster(cluster, cluster_namespace, 0).await {
         Ok(c) => c,
         Err(e) => {
             debug!(name = %name, error = %e, "Cannot connect to cluster to check health, will retry");
@@ -2023,7 +2028,11 @@ async fn validate_upgrade_spec(
 /// Always uses alpine variant for smaller image size and reduced attack surface.
 fn resolve_target_image(spec: &ValkeyUpgradeSpec, cluster: &ValkeyCluster) -> String {
     let repository = &cluster.spec.image.repository;
-    format!("{}:{}-alpine", repository, spec.target_version)
+    // Reuse the guarded tag resolver so a user-supplied `target_version` that already
+    // contains `-alpine` does not produce a double `-alpine-alpine` suffix. The image is
+    // used for verification comparisons against the StatefulSet (built with the same tag),
+    // so the two must agree or the upgrade hangs.
+    format!("{}:{}", repository, resolve_target_tag(spec))
 }
 
 /// Resolve the target tag (version with alpine suffix) from the upgrade spec.
@@ -2893,6 +2902,18 @@ mod upgrade_reconciler_function_tests {
 
         let image = resolve_target_image(&spec, &cluster);
         assert_eq!(image, "my-registry/valkey:9.0.2-alpine");
+    }
+
+    /// A target_version that already includes `-alpine` must not get a doubled suffix,
+    /// otherwise the image used for verification diverges from the StatefulSet image and
+    /// the upgrade hangs.
+    #[test]
+    fn test_resolve_target_image_already_alpine() {
+        let cluster = create_test_cluster("test-cluster", "valkeyio/valkey", "9.0.0");
+        let spec = create_test_upgrade_spec("test-upgrade", "test-cluster", "9.0.1-alpine");
+
+        let image = resolve_target_image(&spec, &cluster);
+        assert_eq!(image, "valkeyio/valkey:9.0.1-alpine");
     }
 
     /// Test compute_upgrade_conditions for Completed phase
