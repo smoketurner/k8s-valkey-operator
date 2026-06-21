@@ -1700,5 +1700,4 @@ mod tests {
         assert_eq!(FINALIZER, "valkey-operator.smoketurner.com/finalizer");
         assert!(FINALIZER.contains("valkey-operator"));
     }
-
 }
