@@ -66,23 +66,20 @@ pub(crate) async fn forget_nodes_with_quorum(
 ) -> Result<(), Error> {
     let name = obj.name_any();
 
-    let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
-    let cluster_nodes = client.cluster_nodes().await?;
-    let _ = client.close().await;
-
-    let total_nodes = cluster_nodes.nodes.len();
-    let required = ((total_nodes / 2) + 1) as i32;
+    // FORGET must be sent from the surviving cluster members, which are the pods that
+    // remain after any scale-down: ordinals 0..total_pods (the spec already reflects the
+    // target size at this point). Iterate real StatefulSet pod ordinals — a node's position
+    // within `CLUSTER NODES` is unrelated to its pod ordinal, so indexing that list would
+    // connect to the wrong pods. The node(s) being removed sit at ordinals >= total_pods
+    // and are therefore naturally excluded as FORGET sources.
+    let total_pods = crate::crd::total_pods(obj.spec.masters, obj.spec.replicas_per_master);
+    let required = (total_pods / 2) + 1;
 
     for node_id in node_ids_to_forget {
         let mut successes = 0i32;
         let mut failures = Vec::new();
 
-        for (idx, node) in cluster_nodes.nodes.iter().enumerate() {
-            if &node.node_id == node_id {
-                continue;
-            }
-
-            let ordinal = i32::try_from(idx).unwrap_or(0);
+        for ordinal in 0..total_pods {
             match ctx.connect_to_cluster(obj, namespace, ordinal).await {
                 Ok(node_client) => {
                     match node_client.cluster_forget(node_id).await {
@@ -91,7 +88,7 @@ pub(crate) async fn forget_nodes_with_quorum(
                             debug!(
                                 name = %name,
                                 node_id = %node_id,
-                                source = %node.node_id,
+                                source_ordinal = %ordinal,
                                 "CLUSTER FORGET succeeded"
                             );
                         }
@@ -108,18 +105,18 @@ pub(crate) async fn forget_nodes_with_quorum(
                                 debug!(
                                     name = %name,
                                     node_id = %node_id,
-                                    source = %node.node_id,
+                                    source_ordinal = %ordinal,
                                     "Node already forgotten or is self, treating as success"
                                 );
                             } else {
-                                failures.push(format!("{}:{}", node.node_id, e));
+                                failures.push(format!("{}:{}", ordinal, e));
                             }
                         }
                     }
                     let _ = node_client.close().await;
                 }
                 Err(e) => {
-                    failures.push(format!("{}:connect failed: {}", node.node_id, e));
+                    failures.push(format!("{}:connect failed: {}", ordinal, e));
                 }
             }
         }
