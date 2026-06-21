@@ -246,7 +246,6 @@ pub fn validate_image_change(
     Ok(())
 }
 
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

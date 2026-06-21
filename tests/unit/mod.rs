@@ -909,9 +909,7 @@ mod upgrade_protection_tests {
 mod validation_tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::collections::BTreeMap;
-    use valkey_operator::controller::cluster_validation::{
-        MAX_REPLICAS_PER_MASTER, validate_spec,
-    };
+    use valkey_operator::controller::cluster_validation::{MAX_REPLICAS_PER_MASTER, validate_spec};
     use valkey_operator::crd::{
         AuthSpec, IssuerRef, SecretKeyRef, TlsSpec, ValkeyCluster, ValkeyClusterSpec,
         ValkeyClusterStatus,
@@ -976,5 +974,4 @@ mod validation_tests {
         resource.spec.auth.secret_ref.name = String::new();
         assert!(validate_spec(&resource).is_err());
     }
-
 }
