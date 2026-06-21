@@ -65,22 +65,6 @@ pub fn parse_info_output(
     Ok(result)
 }
 
-/// Parse a specific value from INFO output by key name.
-///
-/// Returns the value as a string, or None if not found.
-pub fn parse_info_value(info: &str, key: &str) -> Option<String> {
-    parse_info_output(info)
-        .ok()
-        .and_then(|map| map.get(key).cloned())
-}
-
-/// Parse an integer value from INFO output.
-///
-/// Returns the parsed integer, or None if not found or invalid.
-pub fn parse_info_int(info: &str, key: &str) -> Option<i64> {
-    parse_info_value(info, key).and_then(|v| v.trim().parse().ok())
-}
-
 /// Parse replication information from INFO REPLICATION output.
 ///
 /// Returns a structured representation of replication status.
@@ -160,23 +144,6 @@ mod tests {
         assert_eq!(parsed.get("master_repl_offset"), Some(&"12345".to_string()));
         // Section header should be skipped
         assert!(!parsed.contains_key("Replication"));
-    }
-
-    #[test]
-    fn test_parse_info_value() {
-        let info = "master_repl_offset:12345\n";
-        assert_eq!(
-            parse_info_value(info, "master_repl_offset"),
-            Some("12345".to_string())
-        );
-        assert_eq!(parse_info_value(info, "nonexistent"), None);
-    }
-
-    #[test]
-    fn test_parse_info_int() {
-        let info = "master_repl_offset:12345\n";
-        assert_eq!(parse_info_int(info, "master_repl_offset"), Some(12345));
-        assert_eq!(parse_info_int(info, "nonexistent"), None);
     }
 
     #[test]
