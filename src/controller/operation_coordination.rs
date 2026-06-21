@@ -179,4 +179,3 @@ pub async fn complete_operation(
 
     Ok(())
 }
-
