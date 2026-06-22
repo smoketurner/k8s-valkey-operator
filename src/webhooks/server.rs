@@ -7,7 +7,9 @@
 //! 2. Create a ValidatingWebhookConfiguration
 //! 3. Mount the TLS certificate secret to the operator pod at /etc/webhook/certs/
 //!
-//! The webhook server starts automatically when certificates are present.
+//! The webhook server starts when the certificate directory is mounted. If certificates
+//! are not yet present (cert-manager may issue them after pod start), it waits for them
+//! to appear rather than failing immediately.
 
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
 use kube::Client;

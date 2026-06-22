@@ -77,6 +77,7 @@ The operator creates a Certificate resource with:
 - DNS SANs for headless service (cluster discovery)
 - DNS SANs for client service
 - Wildcard SAN for all pod hostnames
+- DNS SANs for read service (when enabled)
 - Server and client auth key usages
 
 ### Example ClusterIssuer
