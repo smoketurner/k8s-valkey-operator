@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 use fred::types::InfoKind;
 
@@ -36,45 +36,6 @@ impl ValkeyClient {
     pub async fn is_cluster_healthy(&self) -> Result<bool, ValkeyError> {
         let info = self.cluster_info().await?;
         Ok(info.is_healthy())
-    }
-
-    /// Wait for the cluster to become healthy.
-    #[instrument(skip(self))]
-    pub async fn wait_for_cluster_healthy(
-        &self,
-        timeout: Duration,
-        poll_interval: Duration,
-    ) -> Result<(), ValkeyError> {
-        let start = std::time::Instant::now();
-
-        loop {
-            if start.elapsed() > timeout {
-                return Err(ValkeyError::Timeout {
-                    operation: "wait_for_cluster_healthy".to_string(),
-                    duration: timeout,
-                });
-            }
-
-            match self.cluster_info().await {
-                Ok(info) => {
-                    if info.is_healthy() {
-                        info!("Cluster is healthy");
-                        return Ok(());
-                    }
-                    debug!(
-                        state = ?info.state,
-                        slots_assigned = info.slots_assigned,
-                        slots_fail = info.slots_fail,
-                        "Cluster not yet healthy"
-                    );
-                }
-                Err(e) => {
-                    warn!(error = %e, "Error checking cluster health");
-                }
-            }
-
-            tokio::time::sleep(poll_interval).await;
-        }
     }
 
     /// Get the replication lag for a replica by comparing with master offset.
