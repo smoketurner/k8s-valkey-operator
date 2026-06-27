@@ -14,9 +14,6 @@ use crate::controller::transport::{TransportMode, TransportPool};
 use crate::crd::{ValkeyCluster, ValkeyUpgrade};
 use crate::health::HealthState;
 
-/// Field manager name for the operator
-pub const FIELD_MANAGER: &str = "valkey-operator";
-
 /// Shared context for the controller
 #[derive(Clone)]
 pub struct Context {
@@ -41,7 +38,7 @@ impl Context {
         Self {
             client,
             reporter: Reporter {
-                controller: FIELD_MANAGER.into(),
+                controller: "valkey-operator".into(),
                 instance: std::env::var("POD_NAME").ok(),
             },
             health_state,
