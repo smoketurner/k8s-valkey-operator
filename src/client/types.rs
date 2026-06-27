@@ -17,10 +17,6 @@ pub enum ParseError {
     InvalidClusterInfo(String),
     #[error("Invalid cluster nodes format: {0}")]
     InvalidClusterNodes(String),
-    #[error("Invalid slot range: {0}")]
-    InvalidSlotRange(String),
-    #[error("Invalid node flags: {0}")]
-    InvalidNodeFlags(String),
     #[error("Missing required field: {0}")]
     MissingField(String),
 }
