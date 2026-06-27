@@ -46,25 +46,6 @@ pub const FIELD_MANAGER: &str = "valkey-operator";
 /// Finalizer name for graceful deletion
 pub const FINALIZER: &str = "valkey-operator.smoketurner.com/finalizer";
 
-/// Annotation key indicating an upgrade is in progress.
-#[allow(dead_code)] // Used in tests
-const UPGRADE_IN_PROGRESS_ANNOTATION: &str = "valkey-operator.smoketurner.com/upgrade-in-progress";
-
-/// Annotation key storing the name of the active upgrade.
-#[allow(dead_code)] // Used in tests
-const UPGRADE_NAME_ANNOTATION: &str = "valkey-operator.smoketurner.com/upgrade-name";
-
-/// Check if an upgrade is in progress for this cluster.
-#[allow(dead_code)] // Used in tests
-fn is_upgrade_in_progress(cluster: &ValkeyCluster) -> bool {
-    cluster
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|a| a.get(UPGRADE_IN_PROGRESS_ANNOTATION))
-        .is_some_and(|v| v == "true")
-}
-
 /// Get the requeue duration for a given phase.
 fn requeue_duration(phase: ClusterPhase) -> std::time::Duration {
     match phase {
@@ -1718,77 +1699,5 @@ mod tests {
     fn test_finalizer_constant() {
         assert_eq!(FINALIZER, "valkey-operator.smoketurner.com/finalizer");
         assert!(FINALIZER.contains("valkey-operator"));
-    }
-
-    fn create_cluster_with_upgrade(name: &str, upgrade_name: &str) -> ValkeyCluster {
-        let mut cluster = create_test_cluster(name, 3, 1);
-        let mut annotations = BTreeMap::new();
-        annotations.insert(
-            UPGRADE_IN_PROGRESS_ANNOTATION.to_string(),
-            "true".to_string(),
-        );
-        annotations.insert(
-            UPGRADE_NAME_ANNOTATION.to_string(),
-            upgrade_name.to_string(),
-        );
-        cluster.metadata.annotations = Some(annotations);
-        cluster
-    }
-
-    #[test]
-    fn test_is_upgrade_in_progress_no_annotations() {
-        let cluster = create_test_cluster("test", 3, 1);
-        assert!(!is_upgrade_in_progress(&cluster));
-    }
-
-    #[test]
-    fn test_is_upgrade_in_progress_empty_annotations() {
-        let mut cluster = create_test_cluster("test", 3, 1);
-        cluster.metadata.annotations = Some(BTreeMap::new());
-        assert!(!is_upgrade_in_progress(&cluster));
-    }
-
-    #[test]
-    fn test_is_upgrade_in_progress_annotation_false() {
-        let mut cluster = create_test_cluster("test", 3, 1);
-        let mut annotations = BTreeMap::new();
-        annotations.insert(
-            UPGRADE_IN_PROGRESS_ANNOTATION.to_string(),
-            "false".to_string(),
-        );
-        cluster.metadata.annotations = Some(annotations);
-        assert!(!is_upgrade_in_progress(&cluster));
-    }
-
-    #[test]
-    fn test_is_upgrade_in_progress_annotation_true() {
-        let cluster = create_cluster_with_upgrade("test", "my-upgrade");
-        assert!(is_upgrade_in_progress(&cluster));
-    }
-
-    #[test]
-    fn test_upgrade_annotation_constants() {
-        assert_eq!(
-            UPGRADE_IN_PROGRESS_ANNOTATION,
-            "valkey-operator.smoketurner.com/upgrade-in-progress"
-        );
-        assert_eq!(
-            UPGRADE_NAME_ANNOTATION,
-            "valkey-operator.smoketurner.com/upgrade-name"
-        );
-    }
-
-    #[test]
-    fn test_is_upgrade_in_progress_preserves_upgrade_name() {
-        let cluster = create_cluster_with_upgrade("test", "production-upgrade-v2");
-        assert!(is_upgrade_in_progress(&cluster));
-
-        let upgrade_name = cluster
-            .metadata
-            .annotations
-            .as_ref()
-            .and_then(|a| a.get(UPGRADE_NAME_ANNOTATION))
-            .cloned();
-        assert_eq!(upgrade_name, Some("production-upgrade-v2".to_string()));
     }
 }
