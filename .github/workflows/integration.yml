@@ -16,8 +16,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CLUSTER_NAME: valkey-it
-  VALKEY_IMAGE_OLD: valkey/valkey:9.0.0-alpine
-  VALKEY_IMAGE_NEW: valkey/valkey:9.0.1-alpine
 
 jobs:
   integration:
@@ -64,11 +62,11 @@ jobs:
             selfSigned: {}
           EOF
 
-      - name: Pre-load Valkey images into kind
-        run: |
-          docker pull "${VALKEY_IMAGE_OLD}"
-          docker pull "${VALKEY_IMAGE_NEW}"
-          kind load docker-image "${VALKEY_IMAGE_OLD}" "${VALKEY_IMAGE_NEW}" --name "${CLUSTER_NAME}"
+      # Valkey images (valkey/valkey:9.0.0-alpine and :9.0.1-alpine, used by the
+      # upgrade tests) are pulled on demand by the kind node when pods are
+      # scheduled. We intentionally do not `kind load` them: the v1.36.1 node
+      # image uses containerd config v4, which the bundled kind's image-import
+      # path does not support.
 
       - name: Install CRDs and RBAC
         run: make install
