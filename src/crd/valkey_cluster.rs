@@ -965,36 +965,6 @@ impl std::fmt::Display for ClusterPhase {
     }
 }
 
-/// Types of conditions for ValkeyCluster.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
-pub enum ConditionType {
-    /// Cluster is fully operational and healthy.
-    Ready,
-    /// Reconciliation is in progress.
-    Progressing,
-    /// Cluster is in a degraded state.
-    Degraded,
-    /// No slot migration is in progress.
-    SlotsStable,
-    /// All replicas are synchronized with their masters.
-    ReplicasInSync,
-    /// TLS certificates are valid and not expiring soon.
-    TLSReady,
-}
-
-impl std::fmt::Display for ConditionType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConditionType::Ready => write!(f, "Ready"),
-            ConditionType::Progressing => write!(f, "Progressing"),
-            ConditionType::Degraded => write!(f, "Degraded"),
-            ConditionType::SlotsStable => write!(f, "SlotsStable"),
-            ConditionType::ReplicasInSync => write!(f, "ReplicasInSync"),
-            ConditionType::TLSReady => write!(f, "TLSReady"),
-        }
-    }
-}
-
 /// Cluster topology information.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1052,12 +1022,6 @@ pub struct OperationProgress {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
-
-/// Default client port for Valkey.
-pub const DEFAULT_CLIENT_PORT: i32 = 6379;
-
-/// Cluster bus port offset from client port (client port + 10000).
-pub const CLUSTER_BUS_PORT_OFFSET: i32 = 10000;
 
 /// Calculate the total number of pods for a cluster.
 pub fn total_pods(masters: i32, replicas_per_master: i32) -> i32 {
@@ -1194,16 +1158,6 @@ mod tests {
         assert_eq!(parsed.replicas_per_master, 1);
         assert_eq!(parsed.tls.issuer_ref.name, "ca-issuer");
         assert_eq!(parsed.auth.secret_ref.name, "valkey-auth");
-    }
-
-    #[test]
-    fn test_condition_type_display() {
-        assert_eq!(ConditionType::Ready.to_string(), "Ready");
-        assert_eq!(ConditionType::Progressing.to_string(), "Progressing");
-        assert_eq!(ConditionType::Degraded.to_string(), "Degraded");
-        assert_eq!(ConditionType::SlotsStable.to_string(), "SlotsStable");
-        assert_eq!(ConditionType::ReplicasInSync.to_string(), "ReplicasInSync");
-        assert_eq!(ConditionType::TLSReady.to_string(), "TLSReady");
     }
 
     #[test]
