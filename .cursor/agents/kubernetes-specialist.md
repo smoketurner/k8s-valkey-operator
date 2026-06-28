@@ -43,7 +43,7 @@ Standard Kubernetes condition types:
 
 Use standard format: `type`, `status`, `reason`, `message`, `lastTransitionTime`
 
-**Reference**: `src/controller/status.rs` for condition builders.
+**Reference**: `src/crd/conditions.rs` for condition builders.
 
 ### ValidatingAdmissionWebhooks
 

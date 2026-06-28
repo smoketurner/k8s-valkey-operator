@@ -96,11 +96,9 @@ make clean-all          # Uninstall and clean
 | `cluster_init.rs` | Initial cluster formation (MEET, ADDSLOTS, REPLICATE) |
 | `cluster_topology.rs` | `ClusterTopology` struct correlating pods to Valkey nodes |
 | `cluster_validation.rs` | Spec validation logic |
-| `upgrade_state_machine.rs` | Upgrade phase transitions |
-| `upgrade_reconciler.rs` | Upgrade reconciliation logic |
+| `upgrade_reconciler.rs` | Upgrade reconciliation and per-shard phase transitions |
 | `operation_coordination.rs` | Cross-resource operation coordination |
 | `error.rs` | Error types and transient/permanent classification |
-| `status.rs` | Condition management and generation tracking |
 | `context.rs` | Shared context (client, recorder, transport pool) |
 | `transport.rs` | Transport mode (InCluster/LocalForward) and connection pool |
 | `diagnostic_hints.rs` | Actionable error hints surfaced via events |
@@ -171,7 +169,7 @@ The operator uses **event-driven finite state machines** for both cluster lifecy
 | State Machine | CRD | File | Purpose |
 |---------------|-----|------|---------|
 | Cluster FSM | ValkeyCluster | `cluster_state_machine.rs` | Creation, scaling, recovery |
-| Upgrade FSM | ValkeyUpgrade | `upgrade_state_machine.rs` | Rolling version upgrades |
+| Upgrade FSM | ValkeyUpgrade | `upgrade_reconciler.rs` | Rolling version upgrades |
 
 ### Key Concepts
 
