@@ -14,7 +14,6 @@ use rustls::pki_types::CertificateDer;
 use thiserror::Error;
 use tracing::{debug, info, instrument};
 
-use crate::crd::ValkeyClusterSpec;
 
 /// Errors that can occur during Valkey operations.
 #[derive(Error, Debug)]
@@ -289,31 +288,6 @@ impl ValkeyClientConfig {
         self
     }
 
-    /// Build configuration from CRD spec.
-    pub fn from_spec(
-        _spec: &ValkeyClusterSpec,
-        hosts: Vec<(String, u16)>,
-        password: Option<String>,
-        tls_paths: Option<(String, String, String)>,
-    ) -> Self {
-        let tls = if let Some((ca_path, cert_path, key_path)) = tls_paths {
-            Some(TlsClientConfig {
-                ca_cert_path: Some(ca_path),
-                cert_path: Some(cert_path),
-                key_path: Some(key_path),
-            })
-        } else {
-            None
-        };
-
-        Self {
-            hosts,
-            tls,
-            password,
-            connection_timeout: Duration::from_secs(10),
-            command_timeout: Duration::from_secs(30),
-        }
-    }
 }
 
 /// Valkey client for cluster operations.
@@ -786,41 +760,6 @@ impl ValkeyClient {
 
             tokio::time::sleep(poll_interval).await;
         }
-    }
-
-    /// Execute MIGRATE to move keys to another node.
-    /// This is used during slot migration.
-    #[instrument(skip(self, keys), fields(key_count = keys.len()))]
-    pub async fn migrate_keys(
-        &self,
-        host: &str,
-        port: u16,
-        keys: &[String],
-        timeout_ms: u64,
-    ) -> Result<(), ValkeyError> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-
-        // Use MIGRATE command with KEYS option for multiple keys
-        // MIGRATE host port "" 0 timeout COPY KEYS key1 key2 ...
-        // Note: We use COPY to avoid data loss during migration, then delete after
-        let cmd = format!(
-            "MIGRATE {} {} \"\" 0 {} KEYS {}",
-            host,
-            port,
-            timeout_ms,
-            keys.join(" ")
-        );
-
-        // For now, log the command - actual implementation would use custom command
-        debug!(command = %cmd, "Would execute MIGRATE");
-
-        // TODO: Implement using custom command when fred supports it
-        // For now, slot migration will rely on Redis Cluster's CLUSTER SETSLOT
-        // which handles key migration automatically in newer versions
-
-        Ok(())
     }
 
     /// Execute CLUSTER MIGRATESLOTS (Valkey 9.0+ atomic slot migration).
