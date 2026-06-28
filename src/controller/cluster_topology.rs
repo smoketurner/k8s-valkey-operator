@@ -42,7 +42,6 @@ use kube::{Api, Client};
 use crate::client::ValkeyError;
 use crate::client::types::{ParsedClusterNodes, SlotRange};
 
-
 // Re-export so callers that import NodeRole from this module still compile.
 pub use crate::client::types::NodeRole;
 
