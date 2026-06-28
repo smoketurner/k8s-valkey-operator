@@ -6,7 +6,6 @@
 //! - `/metrics` - Prometheus metrics endpoint
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use axum::{
     Router,
@@ -40,19 +39,6 @@ impl EncodeLabelSet for ReconcileLabels {
     }
 }
 
-/// Labels for phase-based metrics
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct PhaseLabels {
-    pub phase: String,
-}
-
-impl EncodeLabelSet for PhaseLabels {
-    fn encode(&self, encoder: &mut LabelSetEncoder<'_>) -> Result<(), std::fmt::Error> {
-        ("phase", self.phase.as_str()).encode(encoder.encode_label())?;
-        Ok(())
-    }
-}
-
 /// Shared metrics for the operator
 pub struct Metrics {
     /// Total reconciliations counter
@@ -61,8 +47,6 @@ pub struct Metrics {
     pub reconciliation_errors_total: Family<ReconcileLabels, Counter>,
     /// Reconciliation duration histogram
     pub reconcile_duration_seconds: Family<ReconcileLabels, Histogram>,
-    /// Total resources by phase
-    pub resources_total: Family<PhaseLabels, Gauge>,
     /// Desired replicas per resource
     pub resource_replicas_desired: Family<ReconcileLabels, Gauge>,
     /// Ready replicas per resource
@@ -106,13 +90,6 @@ impl Metrics {
             reconcile_duration_seconds.clone(),
         );
 
-        let resources_total = Family::<PhaseLabels, Gauge>::default();
-        registry.register(
-            "valkey_operator_resources_total",
-            "Total number of ValkeyCluster resources by phase",
-            resources_total.clone(),
-        );
-
         let resource_replicas_desired = Family::<ReconcileLabels, Gauge>::default();
         registry.register(
             "valkey_operator_resource_replicas_desired",
@@ -131,7 +108,6 @@ impl Metrics {
             reconciliations_total,
             reconciliation_errors_total,
             reconcile_duration_seconds,
-            resources_total,
             resource_replicas_desired,
             resource_replicas_ready,
             registry,
@@ -159,14 +135,6 @@ impl Metrics {
         self.reconciliation_errors_total
             .get_or_create(&labels)
             .inc();
-    }
-
-    /// Update resource count by phase
-    pub fn set_resources_by_phase(&self, phase: &str, count: i64) {
-        let labels = PhaseLabels {
-            phase: phase.to_string(),
-        };
-        self.resources_total.get_or_create(&labels).set(count);
     }
 
     /// Update resource replica metrics
@@ -200,8 +168,6 @@ pub struct HealthState {
     ready: RwLock<bool>,
     /// Metrics registry
     pub metrics: Metrics,
-    /// Last successful reconcile timestamp (Unix epoch seconds)
-    pub last_reconcile: AtomicU64,
 }
 
 impl Default for HealthState {
@@ -216,7 +182,6 @@ impl HealthState {
         Self {
             ready: RwLock::new(false),
             metrics: Metrics::new(),
-            last_reconcile: AtomicU64::new(0),
         }
     }
 
@@ -305,19 +270,6 @@ mod tests {
         assert!(encoded.contains("valkey_operator_reconciliations"));
         assert!(encoded.contains("valkey_operator_reconciliation_errors"));
         assert!(encoded.contains("valkey_operator_reconcile_duration_seconds"));
-    }
-
-    #[test]
-    fn test_phase_metrics() {
-        let metrics = Metrics::new();
-
-        // Set resource counts by phase
-        metrics.set_resources_by_phase("Running", 5);
-        metrics.set_resources_by_phase("Degraded", 1);
-        metrics.set_resources_by_phase("Creating", 2);
-
-        let encoded = metrics.encode();
-        assert!(encoded.contains("valkey_operator_resources_total"));
     }
 
     #[test]
