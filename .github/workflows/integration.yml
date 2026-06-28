@@ -16,6 +16,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CLUSTER_NAME: valkey-it
+  # The production runtime allocates an 8 MiB stack per worker thread
+  # (src/main.rs), because the reconcile state machine is stack-heavy. The
+  # #[tokio::test(flavor = "multi_thread")] runtime used by the integration
+  # tests defaults to a 2 MiB worker stack, which overflows on the deepest
+  # reconcile paths in a debug build. RUST_MIN_STACK raises the worker-thread
+  # stack to match/exceed production.
+  RUST_MIN_STACK: "16777216"
 
 jobs:
   integration:
