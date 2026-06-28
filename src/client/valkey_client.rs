@@ -14,7 +14,6 @@ use rustls::pki_types::CertificateDer;
 use thiserror::Error;
 use tracing::{debug, info, instrument};
 
-
 /// Errors that can occur during Valkey operations.
 #[derive(Error, Debug)]
 pub enum ValkeyError {
@@ -287,7 +286,6 @@ impl ValkeyClientConfig {
         self.command_timeout = timeout;
         self
     }
-
 }
 
 /// Valkey client for cluster operations.
