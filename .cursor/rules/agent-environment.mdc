@@ -112,9 +112,9 @@ make deploy             # Deploy operator to cluster
 |---------|------|
 | CRD definition | `src/crd/valkey_cluster.rs`, `src/crd/valkey_upgrade.rs` |
 | Reconciliation | `src/controller/cluster_reconciler.rs`, `src/controller/upgrade_reconciler.rs` |
-| State machine | `src/controller/cluster_state_machine.rs`, `src/controller/upgrade_state_machine.rs` |
+| State machine | `src/controller/cluster_state_machine.rs` (cluster), `src/controller/upgrade_reconciler.rs` (upgrade) |
 | Error handling | `src/controller/error.rs` |
-| Status updates | `src/controller/status.rs` |
+| Status updates | `src/controller/cluster_reconciler/status.rs` |
 | Shared context | `src/controller/context.rs` |
 | Resource generation | `src/resources/` |
 | Health server | `src/health.rs` |

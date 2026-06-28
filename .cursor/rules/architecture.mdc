@@ -119,7 +119,7 @@ Kubernetes-standard detailed status reporting:
 | `Progressing` | Changes being applied | Stable state reached |
 | `Degraded` | Partial functionality | Fully healthy or fully failed |
 
-**Reference**: Condition constants and builders in `src/controller/status.rs`.
+**Reference**: Condition constants and builders in `src/crd/conditions.rs`.
 
 ### Admission Webhooks
 

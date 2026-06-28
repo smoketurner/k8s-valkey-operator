@@ -167,7 +167,7 @@ When evaluating changes, consider impact on:
 - `.cursor/rules/architecture.mdc` - Operator architecture patterns
 - `GUIDE.md` - Detailed pattern explanations and rationale
 - `CLAUDE.md` - Project-specific commands
-- `src/controller/status.rs` - Status condition management
+- `src/crd/conditions.rs` - Status condition management
 - `src/webhooks/server.rs` - Admission webhook implementation
 - `config/rbac/role.yaml` - RBAC configuration
 

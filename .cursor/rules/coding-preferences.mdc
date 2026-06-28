@@ -84,7 +84,7 @@ if observed_gen.is_none_or(|g| g != spec_gen) {
 }
 ```
 
-**Reference**: `src/controller/status.rs` for generation tracking.
+**Reference**: `src/crd/conditions.rs` for generation tracking.
 
 ## Testing Requirements
 

@@ -6,7 +6,7 @@ This document details major cluster operations with their state machine flows an
 
 The ValkeyCluster operator manages clusters through two state machines:
 1. **Cluster State Machine** (`cluster_state_machine.rs`) - Creation, scaling, failure recovery
-2. **Upgrade State Machine** (`upgrade_state_machine.rs`) - Rolling version upgrades
+2. **Upgrade State Machine** (`upgrade_reconciler.rs`) - Rolling version upgrades
 
 ### ClusterPhase Enum (18 phases)
 
@@ -296,8 +296,7 @@ Upgrade Phases:
 - Configurable replication sync timeout (default 300s)
 
 **Code References:**
-- `upgrade_state_machine.rs` - FSM transitions
-- `upgrade_reconciler.rs` - Phase handlers
+- `upgrade_reconciler.rs` - FSM transitions and phase handlers
 - `crd/valkey_upgrade.rs` - UpgradePhase, ShardUpgradeState enums
 
 ---

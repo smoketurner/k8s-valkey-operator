@@ -51,7 +51,7 @@ Invoke this agent when:
 - **Main Files**:
   - `src/controller/cluster_reconciler.rs` - Reconciliation logic
   - `src/controller/error.rs` - Error types
-  - `src/controller/status.rs` - Status conditions
+  - `src/crd/conditions.rs` - Status conditions
   - `src/resources/` - Resource generators
   - `Cargo.toml` - Dependencies and lints
 
