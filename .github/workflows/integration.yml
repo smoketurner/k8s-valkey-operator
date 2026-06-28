@@ -48,6 +48,22 @@ jobs:
           kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s
           kubectl -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=180s
 
+      - name: Create selfsigned ClusterIssuer
+        # TLS is mandatory for every ValkeyCluster, and the test fixtures
+        # (tests/common/fixtures.rs) reference a ClusterIssuer named
+        # "selfsigned-issuer". cert-manager must already have it so it can issue
+        # each cluster's Certificate; otherwise pods never get their TLS secret
+        # and the tests time out waiting for an operational cluster.
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: selfsigned-issuer
+          spec:
+            selfSigned: {}
+          EOF
+
       - name: Pre-load Valkey images into kind
         run: |
           docker pull "${VALKEY_IMAGE_OLD}"
