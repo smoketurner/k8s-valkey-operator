@@ -254,19 +254,6 @@ pub struct ClusterHealthStatus {
     pub max_replica_lag: Option<i64>,
 }
 
-impl From<crate::client::ClusterState> for ClusterHealthStatus {
-    fn from(state: crate::client::ClusterState) -> Self {
-        ClusterHealthStatus {
-            is_healthy: state.is_healthy(0),
-            healthy_masters: state.healthy_masters_count(),
-            healthy_replicas: state.healthy_replicas_count(),
-            slots_assigned: state.cluster_info.slots_assigned,
-            topology: state.topology,
-            max_replica_lag: None,
-        }
-    }
-}
-
 /// All parameters needed to update ValkeyCluster status in one reconciliation.
 ///
 /// Replaces the 7-positional-parameter `update_status` function.
