@@ -8,7 +8,15 @@ name: Integration Tests
 on:
   schedule:
     - cron: "0 7 * * *" # nightly at 07:00 UTC
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      test_filter:
+        description: >-
+          Optional space-separated cargo test name filter(s) to run a focused
+          subset (e.g. "degraded deletion"). Empty runs the full suite. When set,
+          operator debug logging is enabled for easier diagnosis.
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -84,4 +92,17 @@ jobs:
         # once on a 2-core runner starves them and pushes operations past their
         # per-test timeouts (flaky deletion/recovery waits). Tests are
         # namespace-isolated, so serial execution only affects wall-clock.
-        run: cargo test --test integration -- --ignored --test-threads=1
+        #
+        # An optional workflow_dispatch `test_filter` input runs a focused subset
+        # with operator debug logging, for diagnosing specific failures.
+        env:
+          TEST_FILTER: ${{ inputs.test_filter }}
+        run: |
+          read -ra filters <<< "${TEST_FILTER}"
+          if [ "${#filters[@]}" -gt 0 ]; then
+            echo "Running focused subset: ${filters[*]}"
+            RUST_LOG=info,valkey_operator=debug \
+              cargo test --test integration -- --ignored --test-threads=1 "${filters[@]}"
+          else
+            cargo test --test integration -- --ignored --test-threads=1
+          fi
