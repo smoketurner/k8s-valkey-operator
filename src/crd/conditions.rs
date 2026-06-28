@@ -9,8 +9,6 @@
 //! The free-function form is used (rather than inherent methods on
 //! `k8s_openapi::Condition`) because the type lives in another crate and Rust
 //! disallows inherent impls on foreign types.
-//!
-//! Pair with [`crate::crd::ConditionType`] for type-safe condition names.
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
@@ -69,12 +67,6 @@ pub fn degraded_condition(
     generation: Option<i64>,
 ) -> Condition {
     new_condition("Degraded", degraded, reason, message, generation)
-}
-
-/// Construct an `Error` condition (always status True; the error is recorded
-/// in `reason` and `message`).
-pub fn error_condition(reason: &str, message: &str, generation: Option<i64>) -> Condition {
-    new_condition("Error", true, reason, message, generation)
 }
 
 /// Construct a tri-state condition where the status may be unknown.
