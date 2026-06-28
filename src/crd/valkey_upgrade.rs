@@ -229,9 +229,6 @@ pub enum ShardUpgradeState {
 
     /// Shard upgrade failed.
     Failed,
-
-    /// Shard upgrade was skipped.
-    Skipped,
 }
 
 impl std::fmt::Display for ShardUpgradeState {
@@ -245,7 +242,6 @@ impl std::fmt::Display for ShardUpgradeState {
             ShardUpgradeState::UpgradingOldMaster => write!(f, "UpgradingOldMaster"),
             ShardUpgradeState::Completed => write!(f, "Completed"),
             ShardUpgradeState::Failed => write!(f, "Failed"),
-            ShardUpgradeState::Skipped => write!(f, "Skipped"),
         }
     }
 }
