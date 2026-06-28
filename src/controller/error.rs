@@ -89,18 +89,6 @@ impl Error {
         }
     }
 
-    /// Get the recommended requeue duration for this error
-    ///
-    /// Uses simple fixed backoff. For exponential backoff, use `requeue_after_with_retry_count()`.
-    pub fn requeue_after(&self) -> Duration {
-        if self.is_retryable() {
-            Duration::from_secs(30)
-        } else {
-            // Don't requeue for non-retryable errors
-            Duration::from_secs(3600)
-        }
-    }
-
     /// Get the recommended requeue duration with exponential backoff based on retry count.
     ///
     /// # Arguments
@@ -232,38 +220,6 @@ mod tests {
         let json_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
         let error = Error::Serialization(json_err);
         assert!(!error.is_retryable());
-    }
-
-    // ==========================================================================
-    // Error::requeue_after() tests
-    // ==========================================================================
-
-    #[test]
-    fn test_requeue_after_retryable_error() {
-        let error = Error::Transient("test".to_string());
-        let duration = error.requeue_after();
-        assert_eq!(duration.as_secs(), 30);
-    }
-
-    #[test]
-    fn test_requeue_after_non_retryable_error() {
-        let error = Error::Validation("test".to_string());
-        let duration = error.requeue_after();
-        assert_eq!(duration.as_secs(), 3600);
-    }
-
-    #[test]
-    fn test_requeue_after_valkey_error() {
-        let error = Error::Valkey(ValkeyError::ClusterNotReady("CLUSTERDOWN".to_string()));
-        let duration = error.requeue_after();
-        assert_eq!(duration.as_secs(), 30); // Retryable
-    }
-
-    #[test]
-    fn test_requeue_after_permanent_error() {
-        let error = Error::Permanent("fatal".to_string());
-        let duration = error.requeue_after();
-        assert_eq!(duration.as_secs(), 3600); // Non-retryable
     }
 
     // ==========================================================================
