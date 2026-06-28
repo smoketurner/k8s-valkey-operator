@@ -41,8 +41,7 @@ use kube::{Api, Client};
 
 use crate::client::ValkeyError;
 use crate::client::types::{ParsedClusterNodes, SlotRange};
-use crate::crd::ValkeyClusterSpec;
-use crate::slots::TOTAL_SLOTS;
+
 
 // Re-export so callers that import NodeRole from this module still compile.
 pub use crate::client::types::NodeRole;
@@ -97,9 +96,6 @@ pub fn extract_ordinal_from_address(address: &str) -> Option<u16> {
 /// Default Valkey client port.
 pub const DEFAULT_VALKEY_PORT: u16 = 6379;
 
-/// Default Valkey cluster bus port offset.
-pub const CLUSTER_BUS_PORT_OFFSET: u16 = 10000;
-
 /// A network endpoint (IP address and port).
 ///
 /// This struct provides type-safe handling of IP/port pairs, eliminating
@@ -114,7 +110,6 @@ pub const CLUSTER_BUS_PORT_OFFSET: u16 = 10000;
 /// let endpoint = Endpoint::new("10.0.0.5", 6379);
 /// assert_eq!(endpoint.ip(), "10.0.0.5");
 /// assert_eq!(endpoint.port(), 6379);
-/// assert_eq!(endpoint.cluster_bus_port(), 16379);
 /// assert_eq!(endpoint.to_string(), "10.0.0.5:6379");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -147,26 +142,9 @@ impl Endpoint {
         self.port
     }
 
-    /// Get the cluster bus port (client port + 10000).
-    pub fn cluster_bus_port(&self) -> u16 {
-        self.port + CLUSTER_BUS_PORT_OFFSET
-    }
-
     /// Check if this endpoint matches the given IP (port-agnostic comparison).
     pub fn has_ip(&self, ip: &str) -> bool {
         self.ip == ip
-    }
-
-    /// Parse an endpoint from an address string like "10.0.0.5:6379" or "10.0.0.5:6379@16379".
-    pub fn parse(address: &str) -> Option<Self> {
-        // Remove cluster bus port suffix if present (e.g., ":6379@16379" -> ":6379")
-        let address = address.split('@').next()?;
-
-        // Split into IP and port
-        let (ip, port_str) = address.rsplit_once(':')?;
-        let port = port_str.parse().ok()?;
-
-        Some(Self::new(ip, port))
     }
 }
 
@@ -429,106 +407,6 @@ impl ClusterTopology {
         })
     }
 
-    /// Build topology from existing pod endpoints (without K8s API call).
-    ///
-    /// This is useful when pod IPs are already available from a previous call.
-    pub fn from_pod_ips(
-        namespace: &str,
-        cluster_name: &str,
-        pod_ips: &[(String, String, u16)], // (pod_name, ip, port)
-        cluster_nodes: Option<&ParsedClusterNodes>,
-    ) -> Self {
-        // Build IP -> ClusterNode map from cluster_nodes if available
-        let mut ip_to_cluster_node: HashMap<&str, &crate::client::types::ClusterNode> =
-            HashMap::new();
-        if let Some(cn) = cluster_nodes {
-            for node in &cn.nodes {
-                ip_to_cluster_node.insert(&node.ip, node);
-            }
-        }
-
-        // Build nodes from pod_ips
-        let mut nodes = Vec::with_capacity(pod_ips.len());
-
-        for (pod_name, ip, port) in pod_ips {
-            // Extract ordinal from pod name
-            let ordinal = crate::crd::PodOrdinal::new(
-                pod_name
-                    .rsplit('-')
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0),
-            );
-
-            let dns_name = super::cluster_init::pod_dns_name(cluster_name, namespace, ordinal);
-            let endpoint = Endpoint::new(ip.clone(), *port);
-
-            // Try to match with cluster node info using IP
-            let cluster_node = ip_to_cluster_node.get(ip.as_str()).copied();
-
-            // Extract Valkey cluster info if available
-            let (node_id, role, master_id, slots, is_connected, is_failed) =
-                if let Some(cn) = cluster_node {
-                    let role = if cn.is_master() {
-                        NodeRole::Master
-                    } else if cn.is_replica() {
-                        NodeRole::Replica
-                    } else {
-                        NodeRole::Unknown
-                    };
-                    let slots: Vec<SlotRange> = cn.slots.clone();
-                    (
-                        Some(cn.node_id.clone()),
-                        role,
-                        cn.master_id.clone(),
-                        slots,
-                        cn.is_connected(),
-                        cn.flags.fail,
-                    )
-                } else {
-                    (None, NodeRole::Unknown, None, Vec::new(), false, false)
-                };
-
-            nodes.push(ClusterNodeInfo {
-                pod_name: pod_name.clone(),
-                ordinal,
-                endpoint: Some(endpoint),
-                dns_name,
-                current_image: None,
-                node_id,
-                role,
-                master_id,
-                slots,
-                is_connected,
-                is_failed,
-            });
-        }
-
-        // Build indexes
-        let mut ordinal_index = HashMap::with_capacity(nodes.len());
-        let mut ip_index = HashMap::with_capacity(nodes.len());
-        let mut node_id_index = HashMap::with_capacity(nodes.len());
-
-        for (idx, node) in nodes.iter().enumerate() {
-            ordinal_index.insert(node.ordinal, idx);
-            if let Some(ip) = node.ip() {
-                ip_index.insert(ip.to_string(), idx);
-            }
-            if let Some(ref nid) = node.node_id {
-                node_id_index.insert(nid.clone(), idx);
-            }
-        }
-
-        Self {
-            nodes,
-            cluster_name: cluster_name.to_string(),
-            namespace: namespace.to_string(),
-            ordinal_index,
-            ip_index,
-            node_id_index,
-        }
-    }
-
     // =========================================================================
     // Lookups
     // =========================================================================
@@ -657,51 +535,6 @@ impl ClusterTopology {
             .collect()
     }
 
-    /// Find new master ordinals that need replicas configured.
-    ///
-    /// Returns ordinals of masters that don't have their expected replicas set up.
-    pub fn masters_needing_replicas(
-        &self,
-        replicas_per_master: i32,
-        total_masters: i32,
-    ) -> Vec<i32> {
-        let mut result = Vec::new();
-
-        for master_ordinal in 0..total_masters {
-            // Check if this master exists and has the expected replicas
-            if self.by_ordinal(master_ordinal).is_none() {
-                continue;
-            }
-
-            // Check expected replica ordinals for this master
-            let mut has_all_replicas = true;
-            for r in 0..replicas_per_master {
-                let replica_ordinal = total_masters + (master_ordinal * replicas_per_master) + r;
-                let replica = self.by_ordinal(replica_ordinal);
-
-                // Check if replica exists and is replicating this master
-                if let Some(node) = replica {
-                    let master = self.by_ordinal(master_ordinal);
-                    let master_node_id = master.and_then(|m| m.node_id.as_ref());
-
-                    if node.role != NodeRole::Replica || node.master_id.as_ref() != master_node_id {
-                        has_all_replicas = false;
-                        break;
-                    }
-                } else {
-                    has_all_replicas = false;
-                    break;
-                }
-            }
-
-            if !has_all_replicas {
-                result.push(master_ordinal);
-            }
-        }
-
-        result
-    }
-
     // =========================================================================
     // Counts and Stats
     // =========================================================================
@@ -746,80 +579,11 @@ impl ClusterTopology {
         &self.namespace
     }
 
-    // =========================================================================
-    // Spec Comparison
-    // =========================================================================
-
-    /// Compare topology against spec to determine required scaling action.
-    pub fn compare_to_spec(&self, spec: &ValkeyClusterSpec) -> ClusterDiff {
-        let current_masters = self.master_count() as i32;
-        let master_diff = spec.masters - current_masters;
-
-        let nodes_needing_promotion: Vec<ClusterNodeInfo> = self
-            .replicas_that_should_be_masters(spec.masters)
-            .into_iter()
-            .cloned()
-            .collect();
-
-        let nodes_to_add: Vec<ClusterNodeInfo> = self.nodes_not_in_cluster().cloned().collect();
-
-        let nodes_to_remove: Vec<ClusterNodeInfo> = self
-            .masters_to_remove(spec.masters)
-            .into_iter()
-            .cloned()
-            .collect();
-
-        // Check if slots need rebalancing
-        let slots_need_rebalancing = self.needs_slot_rebalancing(spec.masters);
-
-        ClusterDiff {
-            master_diff,
-            nodes_needing_promotion,
-            nodes_to_add,
-            nodes_to_remove,
-            slots_need_rebalancing,
-        }
-    }
-
-    /// Check if slots need rebalancing for the target number of masters.
-    fn needs_slot_rebalancing(&self, target_masters: i32) -> bool {
-        if target_masters <= 0 {
-            return false;
-        }
-
-        let masters: Vec<_> = self.masters().collect();
-        if masters.is_empty() {
-            return false;
-        }
-
-        // Calculate expected slots per master
-        let expected_per_master = i32::from(TOTAL_SLOTS) / target_masters;
-        let tolerance = expected_per_master / 10; // 10% tolerance
-
-        // Check if any master has significantly different slot count
-        for master in &masters {
-            let slot_count = master.slot_count();
-            if (slot_count - expected_per_master).abs() > tolerance {
-                return true;
-            }
-        }
-
-        false
-    }
-
     /// Build an IP to ordinal mapping (for compatibility with existing code).
     pub fn ip_to_ordinal_map(&self) -> HashMap<String, crate::crd::PodOrdinal> {
         self.nodes
             .iter()
             .filter_map(|n| n.ip().map(|ip| (ip.to_string(), n.ordinal)))
-            .collect()
-    }
-
-    /// Build an ordinal to node_id mapping (for compatibility with existing code).
-    pub fn ordinal_to_node_id_map(&self) -> HashMap<crate::crd::PodOrdinal, crate::crd::NodeId> {
-        self.nodes
-            .iter()
-            .filter_map(|n| n.node_id.as_ref().map(|nid| (n.ordinal, nid.clone())))
             .collect()
     }
 
@@ -835,41 +599,6 @@ impl ClusterTopology {
                     .map(|ep| (n.pod_name.clone(), ep.clone()))
             })
             .collect()
-    }
-}
-
-/// Result of comparing topology to spec.
-#[derive(Debug, Clone)]
-pub struct ClusterDiff {
-    /// Master difference: +N = scale up, -N = scale down.
-    pub master_diff: i32,
-    /// Nodes that need to be promoted from replica to master.
-    pub nodes_needing_promotion: Vec<ClusterNodeInfo>,
-    /// Nodes that need to be added to the cluster.
-    pub nodes_to_add: Vec<ClusterNodeInfo>,
-    /// Nodes that need to be removed from the cluster.
-    pub nodes_to_remove: Vec<ClusterNodeInfo>,
-    /// Whether slots need rebalancing.
-    pub slots_need_rebalancing: bool,
-}
-
-impl ClusterDiff {
-    /// Check if scaling up.
-    pub fn is_scale_up(&self) -> bool {
-        self.master_diff > 0
-    }
-
-    /// Check if scaling down.
-    pub fn is_scale_down(&self) -> bool {
-        self.master_diff < 0
-    }
-
-    /// Check if the cluster is stable (no changes needed).
-    pub fn is_stable(&self) -> bool {
-        self.master_diff == 0
-            && self.nodes_needing_promotion.is_empty()
-            && self.nodes_to_add.is_empty()
-            && !self.slots_need_rebalancing
     }
 }
 
@@ -1091,86 +820,6 @@ mod tests {
         let map = topology.ip_to_ordinal_map();
         assert_eq!(map.get("10.0.0.1"), Some(&crate::crd::PodOrdinal::new(0)));
         assert_eq!(map.get("10.0.0.2"), Some(&crate::crd::PodOrdinal::new(1)));
-    }
-
-    #[test]
-    fn test_ordinal_to_node_id_map() {
-        let nodes = vec![
-            make_node(0, NodeRole::Master, Some("abc123")),
-            make_node(1, NodeRole::Master, Some("def456")),
-        ];
-        let topology = make_topology(nodes);
-
-        let map = topology.ordinal_to_node_id_map();
-        assert_eq!(
-            map.get(&crate::crd::PodOrdinal::new(0)),
-            Some(&crate::crd::NodeId::from("abc123"))
-        );
-        assert_eq!(
-            map.get(&crate::crd::PodOrdinal::new(1)),
-            Some(&crate::crd::NodeId::from("def456"))
-        );
-    }
-
-    #[test]
-    fn test_cluster_diff_is_scale_up() {
-        let diff = ClusterDiff {
-            master_diff: 2,
-            nodes_needing_promotion: vec![],
-            nodes_to_add: vec![],
-            nodes_to_remove: vec![],
-            slots_need_rebalancing: false,
-        };
-        assert!(diff.is_scale_up());
-        assert!(!diff.is_scale_down());
-    }
-
-    #[test]
-    fn test_cluster_diff_is_scale_down() {
-        let diff = ClusterDiff {
-            master_diff: -1,
-            nodes_needing_promotion: vec![],
-            nodes_to_add: vec![],
-            nodes_to_remove: vec![],
-            slots_need_rebalancing: false,
-        };
-        assert!(diff.is_scale_down());
-        assert!(!diff.is_scale_up());
-    }
-
-    #[test]
-    fn test_cluster_diff_is_stable() {
-        let diff = ClusterDiff {
-            master_diff: 0,
-            nodes_needing_promotion: vec![],
-            nodes_to_add: vec![],
-            nodes_to_remove: vec![],
-            slots_need_rebalancing: false,
-        };
-        assert!(diff.is_stable());
-
-        let diff_with_promotions = ClusterDiff {
-            master_diff: 0,
-            nodes_needing_promotion: vec![make_node(0, NodeRole::Replica, Some("node-0"))],
-            nodes_to_add: vec![],
-            nodes_to_remove: vec![],
-            slots_need_rebalancing: false,
-        };
-        assert!(!diff_with_promotions.is_stable());
-    }
-
-    #[test]
-    fn test_from_pod_ips() {
-        let pod_ips = vec![
-            ("test-cluster-0".to_string(), "10.0.0.1".to_string(), 6379),
-            ("test-cluster-1".to_string(), "10.0.0.2".to_string(), 6379),
-        ];
-
-        let topology = ClusterTopology::from_pod_ips("default", "test-cluster", &pod_ips, None);
-
-        assert_eq!(topology.len(), 2);
-        assert!(topology.by_ordinal(0).is_some());
-        assert!(topology.by_ip("10.0.0.1").is_some());
     }
 
     // =========================================================================
