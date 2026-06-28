@@ -558,18 +558,6 @@ async fn handle_inprogress_phase(
             update_status(api, &name, new_status).await?;
             Ok(Action::requeue(Duration::from_secs(1)))
         }
-        ShardUpgradeState::Skipped => {
-            // Move to next shard
-            let mut new_status = status.clone();
-            new_status.current_shard = current_shard + 1;
-            merge_into_status(
-                &mut new_status,
-                UpgradePhase::InProgress,
-                obj.metadata.generation,
-            );
-            update_status(api, &name, new_status).await?;
-            Ok(Action::requeue(Duration::from_secs(1)))
-        }
     }
 }
 
