@@ -301,13 +301,18 @@ async fn test_degraded_state() {
     let api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create resource with 3 masters and 0 replicas = 3 total pods
-    let resource = test_cluster_with_config("degraded-test", 3, 0);
+    // Create resource with 3 masters and 1 replica per master = 6 total pods.
+    // A replica is required for the cluster to recover to a fully operational
+    // (Running) state after a master pod is deleted: with 0 replicas and no
+    // persistence the lost master's slots are unrecoverable, and the operator
+    // only assigns slots during initial formation, so the cluster would
+    // correctly stay Degraded forever and this test could never pass.
+    let resource = test_cluster_with_config("degraded-test", 3, 1);
     api.create(&PostParams::default(), &resource)
         .await
         .expect("Failed to create ValkeyCluster");
 
-    let expected_pods = total_pods(3, 0);
+    let expected_pods = total_pods(3, 1);
 
     // Wait for resource to be operational
     wait_for_operational(&api, "degraded-test", LONG_TIMEOUT)

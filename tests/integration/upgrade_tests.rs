@@ -396,9 +396,12 @@ async fn test_upgrade_execution_with_replicas() {
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster with 3 masters and 1 replica per master (6 total pods)
-    // Upgrades require at least 1 replica for safe failover
-    let cluster = test_cluster_with_replicas("upgrade-exec-target", 1);
+    // Create cluster with 3 masters and 1 replica per master (6 total pods).
+    // Upgrades require at least 1 replica for safe failover. Start on an older
+    // patch release so the upgrade below is a real version bump (9.0.0 -> 9.0.1);
+    // both images exist on Docker Hub.
+    let mut cluster = test_cluster_with_replicas("upgrade-exec-target", 1);
+    cluster.spec.image.tag = "9.0.0-alpine".to_string();
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await
@@ -409,21 +412,11 @@ async fn test_upgrade_execution_with_replicas() {
         .await
         .expect("Cluster should become operational");
 
-    // Get current image version from cluster
-    let cluster_resource = cluster_api
-        .get("upgrade-exec-target")
-        .await
-        .expect("Should get cluster");
-    let current_version = cluster_resource.spec.image.tag.clone();
-
-    // Create upgrade to a different version (use a version that exists)
-    // Note: In real scenarios, this would be a valid Valkey version
-    // For testing, we'll use a version that should trigger the upgrade flow
-    let target_version = if current_version == "9.0.0" {
-        "9.0.1"
-    } else {
-        "9.0.0"
-    };
+    // Upgrade to the next patch release (a real 9.0.0 -> 9.0.1 bump). The old
+    // logic derived the target from the cluster's current tag, but the default
+    // image is 9.1.0-alpine, so it selected 9.0.0 — a downgrade the operator
+    // correctly rejects, leaving the upgrade stuck before PreChecks.
+    let target_version = "9.0.1";
     let upgrade = test_upgrade("upgrade-exec-test", "upgrade-exec-target", target_version);
     upgrade_api
         .create(&PostParams::default(), &upgrade)

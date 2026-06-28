@@ -138,9 +138,11 @@ async fn test_concurrent_upgrade_prevention() {
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(client.clone(), &ns_name);
     let upgrade_api: Api<ValkeyUpgrade> = Api::namespaced(client.clone(), &ns_name);
 
-    // Create cluster with 1 replica per master (required for upgrades)
-    // Upgrades require at least 1 replica for safe failover
-    let cluster = test_cluster_with_replicas("concurrent-target", 1);
+    // Create cluster with 1 replica per master (required for upgrades).
+    // Start on an older patch release so the upgrade below is a real version
+    // bump (9.0.0 -> 9.0.1); both images exist on Docker Hub.
+    let mut cluster = test_cluster_with_replicas("concurrent-target", 1);
+    cluster.spec.image.tag = "9.0.0-alpine".to_string();
     cluster_api
         .create(&PostParams::default(), &cluster)
         .await
@@ -151,17 +153,9 @@ async fn test_concurrent_upgrade_prevention() {
         .await
         .expect("Cluster should become operational");
 
-    // Get current image version
-    let cluster_resource = cluster_api
-        .get("concurrent-target")
-        .await
-        .expect("Should get cluster");
-    let current_version = cluster_resource.spec.image.tag.clone();
-    let target_version = if current_version == "9.0.0" {
-        "9.0.1"
-    } else {
-        "9.0.0"
-    };
+    // Upgrade to the next patch release (a real 9.0.0 -> 9.0.1 bump); deriving
+    // the target from the current tag selected a downgrade the operator rejects.
+    let target_version = "9.0.1";
 
     // Create first upgrade
     let upgrade1 = test_upgrade("concurrent-test-1", "concurrent-target", target_version);
