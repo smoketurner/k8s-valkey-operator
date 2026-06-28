@@ -79,4 +79,9 @@ jobs:
         run: make install
 
       - name: Run integration tests
-        run: cargo test --test integration -- --ignored --test-threads=2
+        # Run serially. Each test stands up its own multi-pod Valkey cluster (and
+        # the upgrade tests drive a full multi-shard upgrade), so running two at
+        # once on a 2-core runner starves them and pushes operations past their
+        # per-test timeouts (flaky deletion/recovery waits). Tests are
+        # namespace-isolated, so serial execution only affects wall-clock.
+        run: cargo test --test integration -- --ignored --test-threads=1
