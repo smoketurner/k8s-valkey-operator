@@ -1,0 +1,61 @@
+name: Integration Tests
+
+# Runs the end-to-end integration suite (tests/integration/) against a real
+# Kubernetes cluster created with kind. These tests are marked #[ignore] and are
+# not part of the regular CI workflow because they require a live cluster, pull
+# Valkey images, and schedule real pods. They run nightly and on demand.
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # nightly at 07:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CLUSTER_NAME: valkey-it
+  VALKEY_IMAGE_OLD: valkey/valkey:9.0.0-alpine
+  VALKEY_IMAGE_NEW: valkey/valkey:9.0.1-alpine
+
+jobs:
+  integration:
+    name: Integration Tests (kind)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Create kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          node_image: kindest/node:v1.36.1
+          cluster_name: ${{ env.CLUSTER_NAME }}
+
+      - name: Install cert-manager
+        run: |
+          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.20.3/cert-manager.yaml
+          kubectl -n cert-manager rollout status deploy/cert-manager --timeout=180s
+          kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s
+          kubectl -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=180s
+
+      - name: Pre-load Valkey images into kind
+        run: |
+          docker pull "${VALKEY_IMAGE_OLD}"
+          docker pull "${VALKEY_IMAGE_NEW}"
+          kind load docker-image "${VALKEY_IMAGE_OLD}" "${VALKEY_IMAGE_NEW}" --name "${CLUSTER_NAME}"
+
+      - name: Install CRDs and RBAC
+        run: make install
+
+      - name: Run integration tests
+        run: cargo test --test integration -- --ignored --test-threads=2
