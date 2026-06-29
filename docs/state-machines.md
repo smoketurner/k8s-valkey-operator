@@ -258,7 +258,6 @@ Each shard (master + replicas) goes through these states:
 | `UpgradingOldMaster` | Upgrading the old master (now a replica) |
 | `Completed` | Shard upgrade completed |
 | `Failed` | Shard upgrade failed |
-| `Skipped` | Shard was skipped |
 
 ### Per-Shard Upgrade Flow
 
