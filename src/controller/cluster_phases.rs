@@ -117,6 +117,16 @@ impl PhaseContext {
     /// The phase name encodes direction, but this is useful for Running phase
     /// to determine which phase to transition to.
     pub fn scale_direction(&self) -> ScaleDirection {
+        // Scaling is only ever driven by a spec change. A live master/pod-count
+        // discrepancy with an UNCHANGED spec is a transient failure — e.g. a
+        // deleted master pod whose slots fail over to a replica — not a scale
+        // request. Such a shortfall must route to Degraded/recovery, never the
+        // scale flow: otherwise the operator reads `current_masters < target`
+        // as a scale-up and gets stuck in RebalancingSlots ("Expected N masters
+        // but found M"), because no pods are actually being added.
+        if !self.spec_changed {
+            return ScaleDirection::None;
+        }
         if self.current_masters > self.target_masters && self.current_masters > 0 {
             ScaleDirection::Down
         } else if self.current_masters < self.target_masters && self.current_masters > 0 {
@@ -1135,8 +1145,8 @@ pub async fn handle_degraded(
     // Same issue as handle_running - we must not reduce StatefulSet replicas until
     // slots are evacuated to prevent data loss.
     if phase_ctx.current_masters > 0 {
-        // Master scale-down: must evacuate slots first
-        if phase_ctx.target_masters < phase_ctx.current_masters {
+        // Master scale-down: must evacuate slots first (spec-driven only)
+        if phase_ctx.spec_changed && phase_ctx.target_masters < phase_ctx.current_masters {
             info!(
                 current = phase_ctx.current_masters,
                 target = phase_ctx.target_masters,
@@ -1156,7 +1166,8 @@ pub async fn handle_degraded(
         }
 
         // Replica-only scale-down (masters unchanged): skip slot evacuation
-        if phase_ctx.target_masters == phase_ctx.current_masters
+        if phase_ctx.spec_changed
+            && phase_ctx.target_masters == phase_ctx.current_masters
             && phase_ctx.running_pods > desired_replicas
         {
             debug!(
@@ -1181,8 +1192,11 @@ pub async fn handle_degraded(
     // Safe to apply resources now - no scale-down in progress
     create_resources_fn.await?;
 
-    // Check for scale-up operations (safe after resource sync)
-    if phase_ctx.current_masters > 0 && phase_ctx.target_masters > phase_ctx.current_masters {
+    // Check for scale-up operations (spec-driven only; safe after resource sync)
+    if phase_ctx.spec_changed
+        && phase_ctx.current_masters > 0
+        && phase_ctx.target_masters > phase_ctx.current_masters
+    {
         return Ok(ClusterPhase::ScalingUpStatefulSet.into());
     }
 
@@ -1198,20 +1212,31 @@ pub async fn handle_degraded(
         )
         .await;
         Ok(ClusterPhase::Running.into())
-    } else if phase_ctx.ready_pods == 0 {
+    } else if phase_ctx.running_pods >= desired_replicas {
+        // All pods are running but not all are Ready. The readiness probe
+        // requires `cluster_state:ok`, so a recreated pod (new IP, fresh node)
+        // stays NotReady until the operator actively re-joins it. Escalate to
+        // Failed, where automatic stale-IP recovery (CLUSTER MEET) runs — it is
+        // rate-limited by its own backoff and MAX_RECOVERY_ATTEMPTS. This also
+        // covers the total-outage case (ready_pods == 0).
         ctx.publish_warning_event(
             obj,
             "Failed",
             "Degraded",
-            Some("Cluster failed: no replicas available".to_string()),
+            Some(format!(
+                "Cluster degraded: {}/{} replicas ready with all pods running — attempting recovery",
+                phase_ctx.ready_pods, desired_replicas
+            )),
         )
         .await;
         Ok(ClusterPhase::Failed.into())
     } else {
+        // Pods are still being (re)created; keep waiting in Degraded.
         debug!(
             ready = phase_ctx.ready_pods,
+            running = phase_ctx.running_pods,
             desired = desired_replicas,
-            "Cluster still degraded, waiting for recovery"
+            "Cluster still degraded, waiting for pods"
         );
         Ok(ClusterPhase::Degraded.into())
     }

@@ -158,7 +158,10 @@ mod phase_context_tests {
             running_pods,
             ready_pods: running_pods,
             nodes_in_cluster: running_pods,
-            spec_changed: false,
+            // These unit tests exercise spec-driven scale/replica detection, so
+            // model a changed spec. scale_direction() only reports a scale when
+            // the spec changed (a shortfall with an unchanged spec is a failure).
+            spec_changed: true,
             generation: 1,
         }
     }
@@ -234,6 +237,20 @@ mod phase_context_tests {
     fn test_scale_direction_real_master_scale_up_still_detected() {
         // Sanity check: a legitimate scale-up (current > 0) is still flagged.
         let ctx = make_context(6, 1, 3, 6);
+        assert_eq!(ctx.scale_direction(), ScaleDirection::Up);
+    }
+
+    /// Regression: a master shortfall with an UNCHANGED spec (e.g. a deleted
+    /// master pod) must NOT be read as a scale-up — that misdetection routed
+    /// the operator into a stuck RebalancingSlots loop. It must resolve to
+    /// None so the cluster routes to Degraded/recovery instead.
+    #[test]
+    fn test_scale_direction_master_loss_without_spec_change_is_not_scale_up() {
+        let mut ctx = make_context(3, 1, 2, 6); // 2 masters live, target 3
+        ctx.spec_changed = false;
+        assert_eq!(ctx.scale_direction(), ScaleDirection::None);
+        // And with a spec change it IS a real scale-up.
+        ctx.spec_changed = true;
         assert_eq!(ctx.scale_direction(), ScaleDirection::Up);
     }
 
