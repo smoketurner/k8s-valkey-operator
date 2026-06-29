@@ -62,7 +62,7 @@ audit: ## Run security audit on dependencies
 	$(CARGO) audit
 
 test-integration: install ## Run integration tests (requires running cluster)
-	$(CARGO) test --test integration -- --ignored
+	RUST_MIN_STACK=16777216 $(CARGO) test --test integration -- --ignored
 
 ##@ Installation
 

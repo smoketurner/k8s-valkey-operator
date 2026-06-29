@@ -13,11 +13,13 @@
 //! Tests are marked with #[ignore] and must be run explicitly:
 //!
 //! ```bash
-//! # Run all functional tests (parallel execution supported)
-//! cargo test --test integration -- --ignored
+//! # Run all integration tests (parallel execution supported)
+//! # Note: RUST_MIN_STACK is required in debug builds to prevent stack overflow
+//! # on deep reconcile paths (see .github/workflows/integration.yml)
+//! RUST_MIN_STACK=16777216 cargo test --test integration -- --ignored
 //!
 //! # Run specific test
-//! cargo test --test integration test_cluster_creates_statefulset -- --ignored
+//! RUST_MIN_STACK=16777216 cargo test --test integration test_cluster_creates_statefulset -- --ignored
 //! ```
 //!
 //! The tests use your existing kubeconfig (~/.kube/config or KUBECONFIG env var).
