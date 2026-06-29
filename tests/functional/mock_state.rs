@@ -621,6 +621,7 @@ mod tests {
     fn test_scale_direction_up() {
         let mut state = MockClusterState::running("test", 3, 1);
         state.target_masters = 6;
+        state.spec_changed = true;
         assert_eq!(state.scale_direction(), ScaleDirection::Up);
     }
 
@@ -628,6 +629,7 @@ mod tests {
     fn test_scale_direction_down() {
         let mut state = MockClusterState::running("test", 6, 1);
         state.target_masters = 3;
+        state.spec_changed = true;
         assert_eq!(state.scale_direction(), ScaleDirection::Down);
     }
 

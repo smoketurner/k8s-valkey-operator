@@ -645,12 +645,14 @@ fn test_phase_context_helpers() {
     // Modify for scale-up
     let mut state = MockClusterState::running("helpers-up", 3, 1);
     state.target_masters = 6;
+    state.spec_changed = true;
     let ctx = state.to_phase_context();
     assert_eq!(ctx.scale_direction(), ScaleDirection::Up);
 
     // Modify for scale-down
     let mut state = MockClusterState::running("helpers-down", 6, 1);
     state.target_masters = 3;
+    state.spec_changed = true;
     let ctx = state.to_phase_context();
     assert_eq!(ctx.scale_direction(), ScaleDirection::Down);
 }

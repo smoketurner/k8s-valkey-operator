@@ -158,7 +158,10 @@ mod phase_context_tests {
             running_pods,
             ready_pods: running_pods,
             nodes_in_cluster: running_pods,
-            spec_changed: false,
+            // These unit tests exercise spec-driven scale/replica detection, so
+            // model a changed spec. scale_direction() only reports a scale when
+            // the spec changed (a shortfall with an unchanged spec is a failure).
+            spec_changed: true,
             generation: 1,
         }
     }
@@ -235,6 +238,41 @@ mod phase_context_tests {
         // Sanity check: a legitimate scale-up (current > 0) is still flagged.
         let ctx = make_context(6, 1, 3, 6);
         assert_eq!(ctx.scale_direction(), ScaleDirection::Up);
+    }
+
+    /// Regression: a master shortfall with an UNCHANGED spec (e.g. a deleted
+    /// master pod) must NOT be read as a scale-up — that misdetection routed
+    /// the operator into a stuck RebalancingSlots loop. It must resolve to
+    /// None so the cluster routes to Degraded/recovery instead.
+    #[test]
+    fn test_scale_direction_master_loss_without_spec_change_is_not_scale_up() {
+        let mut ctx = make_context(3, 1, 2, 6); // 2 masters live, target 3
+        ctx.spec_changed = false;
+        assert_eq!(ctx.scale_direction(), ScaleDirection::None);
+        // And with a spec change it IS a real scale-up.
+        ctx.spec_changed = true;
+        assert_eq!(ctx.scale_direction(), ScaleDirection::Up);
+    }
+
+    /// Regression: a master scale-DOWN must be detected even when the spec
+    /// change has already been observed (spec_changed == false). Gating it on
+    /// spec_changed would let the StatefulSet shrink before slots are evacuated
+    /// — losing data. A failure never adds masters, so current > target is
+    /// always a real, safety-critical scale-down.
+    #[test]
+    fn test_scale_direction_scale_down_detected_without_spec_change() {
+        let mut ctx = make_context(3, 1, 6, 12); // 6 masters live, target 3
+        ctx.spec_changed = false;
+        assert_eq!(ctx.scale_direction(), ScaleDirection::Down);
+    }
+
+    /// Regression: a replica scale-DOWN (more pods deployed than desired) must
+    /// also be detected without a spec change, so node removal stays graceful.
+    #[test]
+    fn test_scale_direction_replica_scale_down_detected_without_spec_change() {
+        let mut ctx = make_context(3, 1, 3, 12); // running 12 > desired 6
+        ctx.spec_changed = false;
+        assert_eq!(ctx.scale_direction(), ScaleDirection::ReplicaChange);
     }
 
     #[test]
