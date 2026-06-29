@@ -45,7 +45,7 @@ make audit              # Run security audit (cargo audit)
 cargo test --test unit -- some_test_name
 cargo test --test functional -- scenario_tests::scale_up
 cargo test --test proptest
-cargo test --test integration -- --ignored some_test_name
+RUST_MIN_STACK=16777216 cargo test --test integration -- --ignored some_test_name
 
 # Installation
 make install            # Install CRD and RBAC
