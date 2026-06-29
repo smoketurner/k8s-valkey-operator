@@ -117,19 +117,29 @@ impl PhaseContext {
     /// The phase name encodes direction, but this is useful for Running phase
     /// to determine which phase to transition to.
     pub fn scale_direction(&self) -> ScaleDirection {
-        // Scaling is only ever driven by a spec change. A live master/pod-count
-        // discrepancy with an UNCHANGED spec is a transient failure — e.g. a
-        // deleted master pod whose slots fail over to a replica — not a scale
-        // request. Such a shortfall must route to Degraded/recovery, never the
-        // scale flow: otherwise the operator reads `current_masters < target`
-        // as a scale-up and gets stuck in RebalancingSlots ("Expected N masters
-        // but found M"), because no pods are actually being added.
+        // REDUCTIONS are real, spec-driven scale-downs and are NEVER gated on
+        // `spec_changed`. A failure only ever drops a live count BELOW target
+        // (it never adds masters or pods), so `current_masters > target_masters`
+        // or `running_pods > desired` can only mean the user reduced the spec.
+        // These must always go through graceful evacuation/forget before the
+        // StatefulSet shrinks (data-loss invariant) — even after the operator
+        // restarts mid-scale-down once `observed_generation` has caught up.
+        if self.current_masters > self.target_masters && self.current_masters > 0 {
+            return ScaleDirection::Down;
+        }
+        if self.running_pods > self.desired_replicas() {
+            return ScaleDirection::ReplicaChange;
+        }
+        // BELOW-target counts are ambiguous: either a spec-driven scale-up or a
+        // transient failure (e.g. a deleted master pod whose slots fail over).
+        // Only treat them as a scale operation when the spec actually changed;
+        // otherwise route to Degraded/recovery, or the operator reads
+        // `current_masters < target` as a scale-up and gets stuck in
+        // RebalancingSlots ("Expected N masters but found M") with no pods added.
         if !self.spec_changed {
             return ScaleDirection::None;
         }
-        if self.current_masters > self.target_masters && self.current_masters > 0 {
-            ScaleDirection::Down
-        } else if self.current_masters < self.target_masters && self.current_masters > 0 {
+        if self.current_masters < self.target_masters && self.current_masters > 0 {
             ScaleDirection::Up
         } else if self.running_pods != self.desired_replicas() {
             ScaleDirection::ReplicaChange
@@ -1145,8 +1155,10 @@ pub async fn handle_degraded(
     // Same issue as handle_running - we must not reduce StatefulSet replicas until
     // slots are evacuated to prevent data loss.
     if phase_ctx.current_masters > 0 {
-        // Master scale-down: must evacuate slots first (spec-driven only)
-        if phase_ctx.spec_changed && phase_ctx.target_masters < phase_ctx.current_masters {
+        // Master scale-down: must evacuate slots first. NOT gated on
+        // spec_changed — current > target can only be a real scale-down, and
+        // skipping evacuation here would shrink the StatefulSet and lose data.
+        if phase_ctx.target_masters < phase_ctx.current_masters {
             info!(
                 current = phase_ctx.current_masters,
                 target = phase_ctx.target_masters,
@@ -1165,9 +1177,11 @@ pub async fn handle_degraded(
             return Ok(ClusterPhase::EvacuatingSlots.into());
         }
 
-        // Replica-only scale-down (masters unchanged): skip slot evacuation
-        if phase_ctx.spec_changed
-            && phase_ctx.target_masters == phase_ctx.current_masters
+        // Replica-only scale-down (masters unchanged): skip slot evacuation.
+        // NOT gated on spec_changed — running_pods > desired can only be a real
+        // reduction, and must go through graceful node removal, not a silent
+        // StatefulSet shrink.
+        if phase_ctx.target_masters == phase_ctx.current_masters
             && phase_ctx.running_pods > desired_replicas
         {
             debug!(

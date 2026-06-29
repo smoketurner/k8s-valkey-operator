@@ -254,6 +254,27 @@ mod phase_context_tests {
         assert_eq!(ctx.scale_direction(), ScaleDirection::Up);
     }
 
+    /// Regression: a master scale-DOWN must be detected even when the spec
+    /// change has already been observed (spec_changed == false). Gating it on
+    /// spec_changed would let the StatefulSet shrink before slots are evacuated
+    /// — losing data. A failure never adds masters, so current > target is
+    /// always a real, safety-critical scale-down.
+    #[test]
+    fn test_scale_direction_scale_down_detected_without_spec_change() {
+        let mut ctx = make_context(3, 1, 6, 12); // 6 masters live, target 3
+        ctx.spec_changed = false;
+        assert_eq!(ctx.scale_direction(), ScaleDirection::Down);
+    }
+
+    /// Regression: a replica scale-DOWN (more pods deployed than desired) must
+    /// also be detected without a spec change, so node removal stays graceful.
+    #[test]
+    fn test_scale_direction_replica_scale_down_detected_without_spec_change() {
+        let mut ctx = make_context(3, 1, 3, 12); // running 12 > desired 6
+        ctx.spec_changed = false;
+        assert_eq!(ctx.scale_direction(), ScaleDirection::ReplicaChange);
+    }
+
     #[test]
     fn test_scale_direction_replica_change_with_zero_current_masters() {
         // Transient failure during initial creation: current_masters=0 and
