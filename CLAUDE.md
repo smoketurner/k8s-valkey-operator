@@ -234,16 +234,17 @@ Running → RemovingNodesFromCluster → ScalingDownStatefulSet → VerifyingClu
 
 ### Scale Detection Logic
 
-Located in `cluster_phases.rs:handle_running()`:
+Located in `cluster_phases.rs:scale_direction()` (called by `handle_running`):
 
 ```rust
-// Master scale change
-if target_masters > current_masters { return ScalingUpStatefulSet }
-if target_masters < current_masters { return EvacuatingSlots }
+// Scale-DOWN is NEVER gated on spec_changed (data-loss invariant)
+if current_masters > target_masters && current_masters > 0 { return Down }
+if running_pods > desired_replicas { return ReplicaChange }
 
-// Replica-only change (masters unchanged)
-if running_pods > desired_replicas { return RemovingNodesFromCluster }  // scale-down
-if running_pods < desired_replicas { return ScalingUpStatefulSet }      // scale-up
+// Scale-UP requires spec_changed (avoids stuck RebalancingSlots on master loss)
+if !spec_changed { return None }
+if current_masters < target_masters { return Up }
+if running_pods != desired_replicas { return ReplicaChange }
 ```
 
 ---

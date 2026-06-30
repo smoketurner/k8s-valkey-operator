@@ -387,10 +387,12 @@ conditions:
 
 ## Generation Tracking
 
-The operator uses Kubernetes generation tracking to avoid redundant reconciliations:
+The operator uses Kubernetes generation tracking to distinguish spec changes from transient failures:
 
 1. `metadata.generation` increments on spec changes
 2. `status.observedGeneration` tracks last processed generation
-3. If equal, skip reconciliation (no changes)
+3. `spec_changed = (metadata.generation != status.observedGeneration)`
 
-This ensures efficient operation and prevents unnecessary work.
+This is critical for scale detection:
+- **Scale-down** is NEVER gated on `spec_changed` (data-loss invariant)
+- **Scale-up** requires `spec_changed` to be true (prevents stuck RebalancingSlots when a master pod fails)
