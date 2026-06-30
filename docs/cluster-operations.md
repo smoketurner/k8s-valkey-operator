@@ -129,10 +129,11 @@ stateDiagram-v2
 **Node Computation:** `compute_nodes_to_add(name, current, target)` returns pods `[name-3, name-4, name-5]` for 3→6
 
 **Code References:**
-- `cluster_phases.rs:539-557` - Scale-up detection in `handle_running`
-- `cluster_phases.rs:603-637` - `handle_scaling_up_statefulset`
-- `cluster_phases.rs:681-732` - `handle_adding_nodes_to_cluster`
-- `cluster_phases.rs:738-783` - `handle_rebalancing_slots`
+- `cluster_phases.rs:119-149` - `scale_direction()` method (scale detection)
+- `cluster_phases.rs:496-620` - `handle_running` phase handler
+- `cluster_phases.rs:631-667` - `handle_scaling_up_statefulset`
+- `cluster_phases.rs:709-762` - `handle_adding_nodes_to_cluster`
+- `cluster_phases.rs:766-818` - `handle_rebalancing_slots`
 
 ---
 
@@ -162,7 +163,7 @@ stateDiagram-v2
 
 | Step | Phase | Handler | Detection Logic | Valkey Commands |
 |------|-------|---------|-----------------|-----------------|
-| 1 | Running | `handle_running` | `target_masters < current_masters && current > 0` | - |
+| 1 | Running | `handle_running` | `target_masters < current_masters && current > 0` (never gated on `spec_changed`) | - |
 | 2 | EvacuatingSlots | `handle_evacuating_slots` | - | `CLUSTER MIGRATESLOTS` (slots off masters 3,4,5) |
 | 3 | RemovingNodesFromCluster | `handle_removing_nodes_from_cluster` | - | `CLUSTER FORGET` (masters + their replicas) |
 | 4 | ScalingDownStatefulSet | `handle_scaling_down_statefulset` | `running_pods <= desired` | Patch StatefulSet |
@@ -173,9 +174,10 @@ stateDiagram-v2
 **Node Computation:** `compute_nodes_to_remove(name, current, target)` returns pods `[name-3, name-4, name-5]` for 6→3
 
 **Code References:**
-- `cluster_phases.rs:487-505` - Scale-down detection in `handle_running`
-- `cluster_phases.rs:838-885` - `handle_evacuating_slots`
-- `cluster_phases.rs:891-930` - `handle_removing_nodes_from_cluster`
+- `cluster_phases.rs:119-149` - `scale_direction()` method (scale detection)
+- `cluster_phases.rs:510-528` - Scale-down detection in `handle_running`
+- `cluster_phases.rs:874-922` - `handle_evacuating_slots`
+- `cluster_phases.rs:928-967` - `handle_removing_nodes_from_cluster`
 
 ---
 
@@ -224,15 +226,14 @@ Running → RemovingNodesFromCluster → ScalingDownStatefulSet → VerifyingClu
 | 3 | ScalingDownStatefulSet | `handle_scaling_down_statefulset` | - (patches StatefulSet) |
 | 4 | VerifyingClusterHealth | `handle_verifying_cluster_health` | `CLUSTER INFO` |
 
-**Detection Logic (cluster_phases.rs:510-532):**
+**Detection Logic (cluster_phases.rs:530-552):**
 ```rust
-// Check for replica-only scale-down (masters unchanged) BEFORE resource sync.
-let desired_replicas = phase_ctx.desired_replicas();
-if phase_ctx.running_pods > desired_replicas
-    && phase_ctx.current_masters > 0
-    && phase_ctx.current_masters == phase_ctx.target_masters
+// Replica-only scale-down (masters unchanged): NOT gated on spec_changed.
+// Replicas don't hold slots, so skip EvacuatingSlots but defer StatefulSet
+// scaling until RemovingNodesFromCluster completes.
+ScaleDirection::ReplicaChange
+    if phase_ctx.current_masters > 0 && phase_ctx.running_pods > desired_replicas =>
 {
-    // Replica scale-DOWN: go directly to node removal (skip slot evacuation)
     return Ok(ClusterPhase::RemovingNodesFromCluster.into());
 }
 ```
@@ -339,14 +340,14 @@ stateDiagram-v2
 | Failed | 0 | 6 | Failed |
 | Recovering | 4 | 6 | Degraded (transitioning) |
 
-**Detection Logic (cluster_phases.rs:186-198):**
+**Detection Logic (cluster_phases.rs:205-217):**
 ```rust
 is_cluster_healthy(ready, desired) = ready >= desired && desired > 0
 is_cluster_degraded(ready, desired) = ready > 0 && ready < desired
 is_cluster_failed(ready) = ready == 0
 ```
 
-**Automatic Recovery:** Stale IP recovery in Failed state (`cluster_reconciler.rs:490-600`):
+**Automatic Recovery:** Stale IP recovery in Failed state (`cluster_reconciler.rs:519-650`):
 1. Detects all pods Running but not Ready (stale nodes.conf)
 2. Executes `CLUSTER MEET` with current pod IPs
 3. Transitions to Degraded on success
@@ -417,10 +418,12 @@ is_cluster_failed(ready) = ready == 0
 | `src/controller/cluster_state_machine.rs` | 196-651 | Transition table |
 | `src/controller/cluster_state_machine.rs` | 654-690 | `transition()` execution |
 | `src/controller/cluster_state_machine.rs` | 740-806 | `determine_event()` |
-| `src/controller/cluster_phases.rs` | 230-251 | `handle_creating` |
-| `src/controller/cluster_phases.rs` | 475-593 | `handle_running` (scale detection) |
-| `src/controller/cluster_phases.rs` | 603-637 | `handle_scaling_up_statefulset` |
-| `src/controller/cluster_phases.rs` | 838-885 | `handle_evacuating_slots` |
+| `src/controller/cluster_phases.rs` | 119-149 | `scale_direction()` method |
+| `src/controller/cluster_phases.rs` | 239-262 | `handle_creating` |
+| `src/controller/cluster_phases.rs` | 496-620 | `handle_running` (scale detection) |
+| `src/controller/cluster_phases.rs` | 631-667 | `handle_scaling_up_statefulset` |
+| `src/controller/cluster_phases.rs` | 874-922 | `handle_evacuating_slots` |
+| `src/controller/cluster_phases.rs` | 1146-1250 | `handle_degraded` |
 | `src/controller/upgrade_reconciler.rs` | - | All upgrade handlers |
 | `src/crd/valkey_cluster.rs` | 860-914 | ClusterPhase enum |
 
