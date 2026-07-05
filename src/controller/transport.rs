@@ -43,9 +43,6 @@ impl TransportMode {
 
 #[derive(thiserror::Error, Debug)]
 pub enum TransportError {
-    #[error("Pod {ordinal} not resolvable: {reason}")]
-    NotResolvable { ordinal: PodOrdinal, reason: String },
-
     #[error("Port forward to pod {ordinal} failed: {reason}")]
     PortForwardFailed { ordinal: PodOrdinal, reason: String },
 
