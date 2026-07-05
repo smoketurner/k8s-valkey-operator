@@ -7,7 +7,6 @@
 //! When a `PortForward` goes out of scope, it will automatically stop
 //! the forwarding (RAII pattern).
 
-use crate::controller::cluster_topology::Endpoint;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::ListParams;
 use kube::{Api, Client};
@@ -156,11 +155,6 @@ impl PortForward {
     /// Get the local port that is forwarding to the remote target
     pub fn local_port(&self) -> u16 {
         self.local_port
-    }
-
-    /// Get the local endpoint (127.0.0.1:local_port) for this port forward
-    pub fn local_endpoint(&self) -> Endpoint {
-        Endpoint::new("127.0.0.1", self.local_port)
     }
 
     /// Stop the port-forward
