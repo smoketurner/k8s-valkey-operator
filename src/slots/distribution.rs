@@ -121,7 +121,6 @@ pub fn calculate_distribution(master_count: u16) -> Vec<SlotRange> {
     ranges
 }
 
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -249,6 +248,4 @@ mod tests {
             }
         }
     }
-
-
 }
