@@ -115,13 +115,11 @@ make clean-all          # Uninstall and clean
 | `parsing.rs` | Output parsers for Valkey responses |
 | `types.rs` | Client-side domain types |
 
-**`src/slots/`** — Slot distribution and migration
+**`src/slots/`** — Slot distribution
 
 | File | Purpose |
 |------|---------|
 | `distribution.rs` | Even distribution of 16384 slots across masters |
-| `migration.rs` | Slot migration execution |
-| `planner.rs` | Migration planning for scale operations |
 
 **`src/resources/`** — Kubernetes resource generators
 

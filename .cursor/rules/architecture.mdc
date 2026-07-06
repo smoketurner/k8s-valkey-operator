@@ -200,9 +200,8 @@ fn is_pod_synced(pod: &Pod) -> bool {
 ### Slot Distribution
 
 - Even distribution of 16384 slots across masters
-- Slot migration planning for scaling operations
 
-**Reference**: `src/slots/distribution.rs` and `src/slots/migration.rs`.
+**Reference**: `src/slots/distribution.rs`.
 
 ### Scaling Operations
 
