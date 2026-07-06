@@ -10,7 +10,7 @@ use std::time::Duration;
 use kube::ResourceExt;
 use tracing::{debug, info, instrument, warn};
 
-use crate::client::valkey_client::{ValkeyClient, ValkeyError};
+use crate::client::valkey_client::ValkeyError;
 use crate::controller::cluster_topology::{ClusterTopology, extract_ordinal_from_address};
 use crate::controller::context::Context;
 use crate::controller::error::Error;
@@ -31,17 +31,6 @@ pub fn pod_dns_name(
         "{}-{}.{}.{}.svc.cluster.local",
         cluster_name, ordinal, headless, namespace
     )
-}
-
-/// Build a list of all pod DNS names for a cluster.
-pub fn all_pod_dns_names(cluster: &ValkeyCluster) -> Vec<(String, u16)> {
-    let name = cluster.name_any();
-    let namespace = cluster.namespace().unwrap_or_else(|| "default".to_string());
-    let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
-
-    (0..total_pods)
-        .map(|i| (pod_dns_name(&name, &namespace, i), 6379))
-        .collect()
 }
 
 /// Get the DNS names for master nodes only.
@@ -78,14 +67,6 @@ pub fn replica_pod_dns_names_for_master(
 pub fn pod_name(cluster_name: &str, ordinal: impl Into<crate::crd::PodOrdinal>) -> String {
     let ordinal = ordinal.into();
     format!("{}-{}", cluster_name, ordinal)
-}
-
-/// Get all pod names for a cluster
-pub fn all_pod_names(cluster: &ValkeyCluster) -> Vec<String> {
-    let name = cluster.name_any();
-    let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
-
-    (0..total_pods).map(|i| pod_name(&name, i)).collect()
 }
 
 // NOTE: get_pod_ips was removed - use ClusterTopology.pod_endpoints() instead.
@@ -670,153 +651,6 @@ fn get_ordinal_from_address(
 // NOTE: initialize_cluster was removed as dead code.
 // The reconciler handles cluster initialization through individual phase handlers.
 
-/// Detect orphaned nodes - masters with no slots that exceed expected master count.
-///
-/// These can occur when CLUSTER FORGET fails during scale-down (e.g., if a node dies
-/// before CLUSTER FORGET can be executed). Orphaned nodes are identified as:
-/// - Master nodes (has master flag)
-/// - No slots assigned
-/// - Total master count exceeds expected masters
-///
-/// Returns a list of orphaned node IDs that should be removed via CLUSTER FORGET.
-#[instrument(skip(client))]
-pub async fn detect_orphaned_nodes(
-    client: &ValkeyClient,
-    expected_masters: i32,
-) -> Result<Vec<crate::client::ClusterNode>, ValkeyError> {
-    let cluster_nodes = client.cluster_nodes().await?;
-    let masters: Vec<_> = cluster_nodes
-        .nodes
-        .iter()
-        .filter(|n| n.flags.master)
-        .collect();
-
-    // If we have more masters than expected, find the ones with no slots
-    if masters.len() as i32 > expected_masters {
-        let orphans: Vec<_> = masters
-            .into_iter()
-            .filter(|m| m.slots.is_empty()) // No slots assigned
-            .cloned()
-            .collect();
-
-        if !orphans.is_empty() {
-            info!(
-                orphan_count = orphans.len(),
-                expected_masters = expected_masters,
-                "Detected orphaned nodes (masters with no slots)"
-            );
-            for orphan in &orphans {
-                debug!(
-                    node_id = %orphan.node_id,
-                    address = %orphan.address,
-                    flags_fail = orphan.flags.fail,
-                    flags_pfail = orphan.flags.pfail,
-                    "Orphaned node details"
-                );
-            }
-        }
-        return Ok(orphans);
-    }
-
-    Ok(vec![])
-}
-
-/// Execute CLUSTER FORGET for nodes, trying multiple source nodes if needed.
-///
-/// This function attempts to forget the specified nodes by connecting to each
-/// pod in the cluster and issuing CLUSTER FORGET. This is necessary because:
-/// - CLUSTER FORGET must be issued from every node in the cluster
-/// - Some nodes may be unreachable (the ones we're trying to forget)
-/// - We need to try from multiple nodes in case some are down
-///
-/// Returns the list of successfully forgotten node IDs.
-#[instrument(skip(cluster, ctx))]
-pub async fn forget_nodes_with_retry(
-    cluster: &ValkeyCluster,
-    nodes_to_forget: &[crate::crd::NodeId],
-    ctx: &Context,
-    namespace: &str,
-) -> Result<Vec<crate::crd::NodeId>, Error> {
-    let total_pods = crate::crd::total_pods(cluster.spec.masters, cluster.spec.replicas_per_master);
-    let mut forgotten = Vec::new();
-    let cluster_name = cluster.name_any();
-
-    // CLUSTER FORGET must be executed on ALL nodes in the cluster to prevent
-    // gossip from re-propagating the node info. We iterate over all pods and
-    // forget each node from every pod.
-    for node_id in nodes_to_forget {
-        let mut success_count = 0;
-        let mut total_attempts = 0;
-
-        // Execute CLUSTER FORGET from EVERY pod (not just one)
-        for ordinal in 0..total_pods {
-            let client = match ctx.connect_to_cluster(cluster, namespace, ordinal).await {
-                Ok(c) => c,
-                Err(e) => {
-                    debug!(
-                        ordinal = %ordinal,
-                        error = %e,
-                        "Failed to connect to pod, skipping"
-                    );
-                    continue;
-                }
-            };
-
-            total_attempts += 1;
-
-            match client.cluster_forget(node_id).await {
-                Ok(()) => {
-                    debug!(
-                        node_id = %node_id,
-                        from_ordinal = %ordinal,
-                        "Forgot node from pod"
-                    );
-                    success_count += 1;
-                }
-                Err(e) => {
-                    let error_str = e.to_string().to_lowercase();
-                    // Node might already be forgotten or is the current node - that's OK
-                    if error_str.contains("unknown node") || error_str.contains("myself") {
-                        debug!(
-                            node_id = %node_id,
-                            from_ordinal = %ordinal,
-                            "Node already forgotten or is self"
-                        );
-                        success_count += 1;
-                    } else {
-                        debug!(
-                            node_id = %node_id,
-                            from_ordinal = %ordinal,
-                            error = %e,
-                            "CLUSTER FORGET failed on this pod"
-                        );
-                    }
-                }
-            }
-            let _ = client.close().await;
-        }
-
-        if success_count > 0 {
-            info!(
-                node_id = %node_id,
-                cluster = %cluster_name,
-                success_count = success_count,
-                total_attempts = total_attempts,
-                "Forgot node from cluster"
-            );
-            forgotten.push(node_id.clone());
-        } else {
-            warn!(
-                node_id = %node_id,
-                cluster = %cluster_name,
-                "Failed to forget node from any pod"
-            );
-        }
-    }
-
-    Ok(forgotten)
-}
-
 // NOTE: setup_replicas_for_new_masters was removed as dead code.
 // Replica setup for new masters during scale-up is handled in the reconciler
 // with proper ClusterTopology integration.
@@ -873,23 +707,6 @@ mod tests {
         assert_eq!(
             pod_dns_name("my-cluster", "production", 5),
             "my-cluster-5.my-cluster-headless.production.svc.cluster.local"
-        );
-    }
-
-    #[test]
-    fn test_all_pod_dns_names() {
-        let cluster = test_cluster("my-cluster", 3, 1);
-        let pods = all_pod_dns_names(&cluster);
-
-        // 3 masters + 3 replicas = 6 pods
-        assert_eq!(pods.len(), 6);
-        assert_eq!(
-            pods[0].0,
-            "my-cluster-0.my-cluster-headless.default.svc.cluster.local"
-        );
-        assert_eq!(
-            pods[5].0,
-            "my-cluster-5.my-cluster-headless.default.svc.cluster.local"
         );
     }
 
@@ -1000,7 +817,7 @@ ghi789 10.0.0.3:6379@16379 master - 0 1234567890 3 connected 10923-16383"#;
     }
 
     // ==========================================================================
-    // Additional pod_name and all_pod_names tests
+    // Additional pod_name tests
     // ==========================================================================
 
     #[test]
@@ -1008,28 +825,6 @@ ghi789 10.0.0.3:6379@16379 master - 0 1234567890 3 connected 10923-16383"#;
         assert_eq!(pod_name("my-cluster", 0), "my-cluster-0");
         assert_eq!(pod_name("my-cluster", 5), "my-cluster-5");
         assert_eq!(pod_name("valkey-prod", 10), "valkey-prod-10");
-    }
-
-    #[test]
-    fn test_all_pod_names() {
-        let cluster = test_cluster("my-cluster", 3, 1);
-        let names = all_pod_names(&cluster);
-
-        // 3 masters + 3 replicas = 6 pods
-        assert_eq!(names.len(), 6);
-        assert_eq!(names[0], "my-cluster-0");
-        assert_eq!(names[5], "my-cluster-5");
-    }
-
-    #[test]
-    fn test_all_pod_names_no_replicas() {
-        let cluster = test_cluster("my-cluster", 3, 0);
-        let names = all_pod_names(&cluster);
-
-        // 3 masters + 0 replicas = 3 pods
-        assert_eq!(names.len(), 3);
-        assert_eq!(names[0], "my-cluster-0");
-        assert_eq!(names[2], "my-cluster-2");
     }
 
     #[test]
