@@ -31,12 +31,6 @@ pub mod types;
 pub mod valkey_client;
 
 pub use cluster_state::ClusterState;
-pub use parsing::ReplicationInfo;
 pub use scaling::{ScalingContext, ScalingResult};
-pub use types::{
-    ClusterHealthState, ClusterInfo, ClusterNode, NodeFlags, NodeRole, ParsedClusterNodes,
-    SlotRange,
-};
-pub use valkey_client::{
-    SlotMigrationInfo, TlsCertData, ValkeyClient, ValkeyClientConfig, ValkeyError,
-};
+pub use types::{ClusterNode, NodeRole, ParsedClusterNodes, SlotRange};
+pub use valkey_client::{SlotMigrationInfo, TlsCertData, ValkeyClient, ValkeyError};
