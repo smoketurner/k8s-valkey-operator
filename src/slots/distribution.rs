@@ -121,37 +121,6 @@ pub fn calculate_distribution(master_count: u16) -> Vec<SlotRange> {
     ranges
 }
 
-/// Determine which master index owns a given slot.
-///
-/// This is the inverse of `calculate_distribution` - given a slot, return the master index.
-///
-/// # Examples
-///
-/// ```
-/// use valkey_operator::slots::distribution::slot_owner;
-///
-/// // With 3 masters: slots 0-5461 go to master 0
-/// assert_eq!(slot_owner(0, 3), 0);
-/// assert_eq!(slot_owner(5461, 3), 0);
-/// assert_eq!(slot_owner(5462, 3), 1);
-/// assert_eq!(slot_owner(16383, 3), 2);
-/// ```
-pub fn slot_owner(slot: u16, master_count: u16) -> u16 {
-    if master_count == 0 {
-        return 0;
-    }
-
-    let slots_per_master = TOTAL_SLOTS / master_count;
-    let remainder = TOTAL_SLOTS % master_count;
-    let boundary = remainder * (slots_per_master + 1);
-
-    if slot < boundary {
-        slot / (slots_per_master + 1)
-    } else {
-        remainder + (slot - boundary) / slots_per_master
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -276,46 +245,6 @@ mod tests {
                     "Ranges must be contiguous for master_count={}",
                     master_count
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn test_slot_owner_zero_masters() {
-        assert_eq!(slot_owner(0, 0), 0);
-        assert_eq!(slot_owner(100, 0), 0);
-    }
-
-    #[test]
-    fn test_slot_owner_one_master() {
-        assert_eq!(slot_owner(0, 1), 0);
-        assert_eq!(slot_owner(16383, 1), 0);
-    }
-
-    #[test]
-    fn test_slot_owner_three_masters() {
-        assert_eq!(slot_owner(0, 3), 0);
-        assert_eq!(slot_owner(5461, 3), 0);
-        assert_eq!(slot_owner(5462, 3), 1);
-        assert_eq!(slot_owner(10922, 3), 1);
-        assert_eq!(slot_owner(10923, 3), 2);
-        assert_eq!(slot_owner(16383, 3), 2);
-    }
-
-    #[test]
-    fn test_slot_owner_is_inverse_of_distribution() {
-        for master_count in 1..=10 {
-            let dist = calculate_distribution(master_count);
-            for (idx, range) in dist.iter().enumerate() {
-                for slot in range.iter() {
-                    assert_eq!(
-                        slot_owner(slot, master_count),
-                        idx as u16,
-                        "slot_owner should be inverse of distribution for slot {} with {} masters",
-                        slot,
-                        master_count
-                    );
-                }
             }
         }
     }
