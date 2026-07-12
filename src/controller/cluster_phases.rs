@@ -1039,9 +1039,7 @@ pub async fn handle_verifying_cluster_health(
                 "Cluster verification passed"
             );
 
-            // Clear operation progress
             let mut status = obj.status.clone().unwrap_or_default();
-            status.operation_progress = None;
             status.message = "Cluster healthy".to_string();
 
             let patch = serde_json::json!({ "status": status });

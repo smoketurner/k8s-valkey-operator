@@ -321,7 +321,6 @@ impl<'a> StatusUpdate<'a> {
         let current_operation = existing_status.and_then(|s| s.current_operation.clone());
         let operation_started_at = existing_status.and_then(|s| s.operation_started_at.clone());
         let connection_secret = Some(obj.spec.auth.secret_ref.name.clone());
-        let operation_progress = existing_status.and_then(|s| s.operation_progress.clone());
         let message = existing_status
             .map(|s| s.message.clone())
             .unwrap_or_default();
@@ -405,7 +404,6 @@ impl<'a> StatusUpdate<'a> {
             tls_secret: Some(tls_secret_name),
             current_operation,
             operation_started_at,
-            operation_progress,
             message,
             reconcile_count,
             last_phase_transition,
