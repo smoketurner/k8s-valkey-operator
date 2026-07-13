@@ -832,10 +832,6 @@ pub struct ValkeyClusterStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_started_at: Option<String>,
 
-    /// Progress tracking for multi-step operations.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_progress: Option<OperationProgress>,
-
     /// Human-readable status message for operators.
     #[serde(default)]
     pub message: String,
@@ -997,30 +993,6 @@ pub struct ReplicaNode {
     pub pod_name: String,
     /// Replication lag in bytes (0 means fully synchronized).
     pub replication_lag: i64,
-}
-
-/// Progress tracking for multi-step operations.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct OperationProgress {
-    /// Total steps in the operation.
-    pub total_steps: i32,
-    /// Completed steps.
-    pub completed_steps: i32,
-    /// Current step description for human operators.
-    pub current_step: String,
-    /// Slots migrated so far (for resharding operations).
-    #[serde(default)]
-    pub slots_migrated: i32,
-    /// Total slots to migrate.
-    #[serde(default)]
-    pub total_slots_to_migrate: i32,
-    /// Nodes that have been processed.
-    #[serde(default)]
-    pub nodes_processed: Vec<String>,
-    /// Error details if any step failed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
 }
 
 /// Calculate the total number of pods for a cluster.
