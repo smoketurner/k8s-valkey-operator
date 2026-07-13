@@ -413,16 +413,6 @@ spec:
                 tlsSecret:
                   type: string
                   description: Secret containing TLS certificates
-                operationProgress:
-                  type: object
-                  description: Progress tracking for multi-step operations
-                  properties:
-                    currentStep:
-                      type: string
-                    totalSteps:
-                      type: integer
-                    completedSteps:
-                      type: integer
                 message:
                   type: string
                   description: Human-readable status message
