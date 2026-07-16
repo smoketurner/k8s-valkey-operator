@@ -163,7 +163,14 @@ pub(crate) async fn verify_scale_down_quorum(
     let total_masters = cluster_nodes.masters().len() as i32;
     let required_quorum = (total_masters / 2) + 1;
 
-    let reachable_masters = total_masters;
+    // Only count masters the cluster itself reports as healthy (no fail/pfail
+    // flags and a connected link). Counting every known master made this check
+    // a no-op: reachable == total can never be below (total/2)+1.
+    let reachable_masters = cluster_nodes
+        .masters()
+        .iter()
+        .filter(|m| m.is_healthy())
+        .count() as i32;
 
     debug!(
         name = %name,

@@ -52,6 +52,8 @@ pub enum ClusterEvent {
     ReplicaScaleDownDetected,
     /// Cluster health verification passed
     ClusterHealthy,
+    /// Spec was changed while in a failure state (retry from initial state)
+    SpecChanged,
 }
 
 impl fmt::Display for ClusterEvent {
@@ -69,6 +71,7 @@ impl fmt::Display for ClusterEvent {
             ClusterEvent::ScaleDownDetected => write!(f, "ScaleDownDetected"),
             ClusterEvent::ReplicaScaleDownDetected => write!(f, "ReplicaScaleDownDetected"),
             ClusterEvent::ClusterHealthy => write!(f, "ClusterHealthy"),
+            ClusterEvent::SpecChanged => write!(f, "SpecChanged"),
         }
     }
 }
@@ -642,6 +645,12 @@ impl ClusterStateMachine {
                     ClusterEvent::DeletionRequested,
                     "Resource deletion requested while failed",
                 ),
+                Transition::new(
+                    ClusterPhase::Failed,
+                    ClusterPhase::Pending,
+                    ClusterEvent::SpecChanged,
+                    "Spec changed while failed, retrying from initial state",
+                ),
                 // ========================================
                 // Deleting state transitions (terminal)
                 // ========================================
@@ -760,7 +769,12 @@ pub fn determine_event(
             }
         }
         ClusterPhase::Failed => {
-            if ctx.all_replicas_ready() {
+            if ctx.spec_changed {
+                // A spec edit is the user's fix for whatever drove the cluster
+                // to Failed (e.g. a validation error at creation, before any
+                // pods existed) — retry from Pending so validation re-runs.
+                ClusterEvent::SpecChanged
+            } else if ctx.all_replicas_ready() {
                 ClusterEvent::RecoveryInitiated
             } else {
                 ClusterEvent::ReconcileError
@@ -959,6 +973,36 @@ mod tests {
         let ctx = TransitionContext::new(3, 3);
         let result = sm.transition(&ClusterPhase::Running, ClusterEvent::ReplicasDegraded, &ctx);
         assert!(matches!(result, TransitionResult::GuardFailed { .. }));
+    }
+
+    #[test]
+    fn test_failed_to_pending_on_spec_change() {
+        let sm = ClusterStateMachine::new();
+        // Validation failure at creation: no pods ever started.
+        let ctx = TransitionContext::new(0, 3).with_spec_changed(true);
+
+        let result = sm.transition(&ClusterPhase::Failed, ClusterEvent::SpecChanged, &ctx);
+        match result {
+            TransitionResult::Success { from, to, .. } => {
+                assert_eq!(from, ClusterPhase::Failed);
+                assert_eq!(to, ClusterPhase::Pending);
+            }
+            _ => panic!("Expected successful transition to Pending"),
+        }
+    }
+
+    #[test]
+    fn test_determine_event_failed_spec_changed() {
+        // Spec change while Failed fires SpecChanged even with zero pods ready,
+        // so a cluster that failed validation at creation can retry.
+        let ctx = TransitionContext::new(0, 3).with_spec_changed(true);
+        let event = determine_event(&ClusterPhase::Failed, &ctx, false);
+        assert_eq!(event, ClusterEvent::SpecChanged);
+
+        // Without a spec change the previous behavior is preserved.
+        let ctx = TransitionContext::new(0, 3);
+        let event = determine_event(&ClusterPhase::Failed, &ctx, false);
+        assert_eq!(event, ClusterEvent::ReconcileError);
     }
 
     #[test]

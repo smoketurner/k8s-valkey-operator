@@ -391,6 +391,17 @@ async fn handle_inprogress_phase(
         .as_ref()
         .ok_or_else(|| Error::MissingField("status".to_string()))?;
 
+    // The target ValkeyCluster may live in a different namespace than the
+    // ValkeyUpgrade (spec.clusterRef.namespace). All cluster-side operations —
+    // pod/StatefulSet lookups, Valkey connections, lock and annotation
+    // handling — must use the cluster's namespace, not the upgrade's.
+    let cluster_namespace = obj
+        .spec
+        .cluster_ref
+        .namespace
+        .as_deref()
+        .unwrap_or(namespace);
+
     let current_shard = status.current_shard;
     let total_shards = status.total_shards;
 
@@ -399,18 +410,8 @@ async fn handle_inprogress_phase(
         info!(name = %name, "All shards upgraded");
 
         // Release operation lock when upgrade completes
-        let cluster_api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), namespace);
-        let cluster_namespace = obj
-            .spec
-            .cluster_ref
-            .namespace
-            .as_deref()
-            .unwrap_or(namespace);
-        let cluster_api: Api<ValkeyCluster> = if cluster_namespace != namespace {
-            Api::namespaced(ctx.client.clone(), cluster_namespace)
-        } else {
-            cluster_api
-        };
+        let cluster_api: Api<ValkeyCluster> =
+            Api::namespaced(ctx.client.clone(), cluster_namespace);
         let _ = operation_coordination::complete_operation(
             &cluster_api,
             &obj.spec.cluster_ref.name,
@@ -472,22 +473,23 @@ async fn handle_inprogress_phase(
     // Process shard based on its state
     match shard_status.status {
         ShardUpgradeState::Pending => {
-            upgrade_shard_replicas(obj, ctx, api, cluster, namespace, current_shard).await
+            upgrade_shard_replicas(obj, ctx, api, cluster, cluster_namespace, current_shard).await
         }
         ShardUpgradeState::UpgradingReplicas => {
-            check_replicas_upgraded(obj, ctx, api, cluster, namespace, current_shard).await
+            check_replicas_upgraded(obj, ctx, api, cluster, cluster_namespace, current_shard).await
         }
         ShardUpgradeState::WaitingForSync => {
-            wait_for_replication_sync(obj, ctx, api, cluster, namespace, current_shard).await
+            wait_for_replication_sync(obj, ctx, api, cluster, cluster_namespace, current_shard)
+                .await
         }
         ShardUpgradeState::FailingOver => {
-            execute_failover(obj, ctx, api, cluster, namespace, current_shard).await
+            execute_failover(obj, ctx, api, cluster, cluster_namespace, current_shard).await
         }
         ShardUpgradeState::WaitingForClusterStable => {
-            wait_for_cluster_stable(obj, ctx, api, cluster, namespace, current_shard).await
+            wait_for_cluster_stable(obj, ctx, api, cluster, cluster_namespace, current_shard).await
         }
         ShardUpgradeState::UpgradingOldMaster => {
-            upgrade_old_master(obj, ctx, api, cluster, namespace, current_shard).await
+            upgrade_old_master(obj, ctx, api, cluster, cluster_namespace, current_shard).await
         }
         ShardUpgradeState::Completed => {
             // Move to next shard
@@ -508,18 +510,8 @@ async fn handle_inprogress_phase(
         }
         ShardUpgradeState::Failed => {
             // Release operation lock when upgrade fails
-            let cluster_api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), namespace);
-            let cluster_namespace = obj
-                .spec
-                .cluster_ref
-                .namespace
-                .as_deref()
-                .unwrap_or(namespace);
-            let cluster_api: Api<ValkeyCluster> = if cluster_namespace != namespace {
-                Api::namespaced(ctx.client.clone(), cluster_namespace)
-            } else {
-                cluster_api
-            };
+            let cluster_api: Api<ValkeyCluster> =
+                Api::namespaced(ctx.client.clone(), cluster_namespace);
             let _ = operation_coordination::complete_operation(
                 &cluster_api,
                 &obj.spec.cluster_ref.name,
@@ -701,22 +693,25 @@ async fn check_replicas_upgraded(
             )
             .await;
 
-            // Transition to RollingBack phase
-            let obj_fresh = api.get(&name).await?;
-            let mut new_status = obj_fresh.status.unwrap_or_default();
-            new_status.phase = UpgradePhase::RollingBack;
-            new_status.error_message = Some(format!(
-                "Pod ready timeout exceeded for shard {} after {}s",
-                shard_index, elapsed
-            ));
-            merge_into_status(
-                &mut new_status,
-                UpgradePhase::RollingBack,
-                obj.metadata.generation,
-            );
-            update_status(api, &name, new_status).await?;
+            // Mark the shard Failed so the ShardUpgradeState::Failed handler
+            // performs the actual rollback (release the operation lock, restore
+            // the original cluster image via initiate_rollback, clear the
+            // upgrade annotation) before transitioning to RollingBack.
+            // Setting UpgradePhase::RollingBack directly here would skip
+            // initiate_rollback: check_rollback_completion only observes pod
+            // images and would wait forever for an image that is never restored.
+            update_shard_status_with_error(
+                api,
+                &name,
+                shard_index,
+                format!(
+                    "Pod ready timeout exceeded for shard {} after {}s (timeout: {}s)",
+                    shard_index, elapsed, pod_ready_timeout
+                ),
+            )
+            .await?;
 
-            return Ok(Action::requeue(Duration::from_secs(5)));
+            return Ok(Action::requeue(Duration::from_secs(1)));
         }
     }
 

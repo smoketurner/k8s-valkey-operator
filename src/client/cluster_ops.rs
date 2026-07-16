@@ -158,33 +158,18 @@ impl ValkeyClient {
                     );
                 }
                 (Some(repl), None) => {
-                    // Can't get master offset, fall back to checking replica offsets match
-                    // This is less reliable but better than nothing
-                    let read_offset: Option<i64> = replica_info.lines().find_map(|line| {
-                        if line.starts_with("slave_read_repl_offset:") {
-                            line.split(':').nth(1).and_then(|v| v.trim().parse().ok())
-                        } else {
-                            None
-                        }
-                    });
-
-                    if let Some(read) = read_offset
-                        && read == repl
-                    {
-                        info!(
-                            "Replication appears in sync (replica offsets match, master offset unavailable)"
-                        );
-                        return Ok(());
-                    }
-
-                    debug!(
-                        replica_offset = ?repl,
-                        "Waiting for replication sync (master offset unavailable)"
-                    );
+                    // Without the master's master_repl_offset there is no way to
+                    // know how far behind this replica is. Comparing the replica's
+                    // own read/applied offsets only proves it processed what it
+                    // already received, so claiming sync here could fail over to a
+                    // stale replica and lose data. Report failure and let the
+                    // caller retry once the master is reachable again.
+                    return Err(ValkeyError::ClusterNotReady(format!(
+                        "cannot verify replication sync: master offset unavailable (replica offset: {repl})"
+                    )));
                 }
-                _ => {
-                    debug!("Could not determine replication offsets, assuming in sync");
-                    return Ok(());
+                (None, _) => {
+                    debug!("Replica replication offset unavailable, waiting");
                 }
             }
 

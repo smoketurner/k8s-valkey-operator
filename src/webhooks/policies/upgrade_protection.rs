@@ -66,6 +66,13 @@ fn has_spec_changed(ctx: &ValidationContext<'_>) -> bool {
         || old.spec.persistence.size != new.spec.persistence.size
         || old.spec.persistence.storage_class_name != new.spec.persistence.storage_class_name
         || old.spec.labels != new.spec.labels
+        // Scheduling changes rewrite the pod template; the upgrade reconciler
+        // deletes pods directly (OnDelete does not stop recreation), so a
+        // mid-upgrade change could reschedule or strand pods.
+        || old.spec.scheduling.node_selector != new.spec.scheduling.node_selector
+        || old.spec.scheduling.tolerations != new.spec.scheduling.tolerations
+        || old.spec.scheduling.spread_masters != new.spec.scheduling.spread_masters
+        || old.spec.scheduling.topology_key != new.spec.scheduling.topology_key
 }
 
 /// Validate that spec changes are not made during an active upgrade
@@ -192,6 +199,34 @@ mod tests {
         assert!(!result.allowed);
         assert_eq!(result.reason.unwrap(), "UpgradeInProgress");
         assert!(result.message.unwrap().contains("test-upgrade"));
+    }
+
+    #[test]
+    fn test_upgrade_blocks_scheduling_changes() {
+        let mut old = create_resource_with_upgrade_annotation(3, "test-upgrade");
+        old.spec
+            .scheduling
+            .node_selector
+            .insert("zone".to_string(), "us-east-1a".to_string());
+        let mut new = create_resource(3);
+        new.spec
+            .scheduling
+            .node_selector
+            .insert("zone".to_string(), "us-east-1b".to_string());
+
+        let ctx = ValidationContext {
+            resource: &new,
+            old_resource: Some(&old),
+            dry_run: false,
+            namespace: Some("default"),
+        };
+
+        let result = validate(&ctx);
+        assert!(
+            !result.allowed,
+            "node_selector change during upgrade must be blocked"
+        );
+        assert_eq!(result.reason.unwrap(), "UpgradeInProgress");
     }
 
     #[test]

@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use kube::{
     Api, ResourceExt,
-    api::{ApiResource, DynamicObject, Patch, PatchParams},
+    api::{ApiResource, DeleteParams, DynamicObject, Patch, PatchParams},
     runtime::controller::Action,
 };
 use tracing::{debug, error, info, warn};
@@ -511,18 +511,39 @@ async fn dispatch_phase(
             .await?;
             Ok(result.next_phase)
         }
-        ClusterPhase::Failed => handle_failed_phase(obj, ctx, namespace, name).await,
+        ClusterPhase::Failed => {
+            handle_failed_phase(obj, ctx, namespace, name, phase_ctx.spec_changed).await
+        }
         ClusterPhase::Deleting => Ok(ClusterPhase::Deleting),
     }
 }
 
-/// Handle the Failed phase: attempt automatic stale-IP recovery or stay failed.
+/// Handle the Failed phase: retry after a spec fix, attempt automatic
+/// stale-IP recovery, or stay failed.
 async fn handle_failed_phase(
     obj: &ValkeyCluster,
     ctx: &Context,
     namespace: &str,
     name: &str,
+    spec_changed: bool,
 ) -> Result<ClusterPhase, Error> {
+    // A spec edit is the user's fix for whatever drove the cluster to Failed.
+    // This matters most for validation failures at creation time: no pods ever
+    // started, so the pod-count-gated recovery paths below can never trigger
+    // and Failed would otherwise be terminal. Return to Pending so validation
+    // re-runs against the corrected spec.
+    if spec_changed {
+        info!(name = %name, "Spec changed while in Failed phase, retrying from Pending");
+        ctx.publish_normal_event(
+            obj,
+            "SpecChanged",
+            "Retrying",
+            Some("Spec changed while failed, retrying from initial state".to_string()),
+        )
+        .await;
+        return Ok(ClusterPhase::Pending);
+    }
+
     // Clear a stale cluster-owned operation lock (Scaling/Initializing) before attempting
     // recovery. These locks are acquired and released within the cluster reconciler's own
     // phase handlers, so when the cluster jumps to Failed mid-operation the lock is
@@ -795,6 +816,22 @@ async fn create_owned_resources(
                 &Patch::Apply(&read_svc),
             )
             .await?;
+    } else {
+        // The read service was disabled (or never enabled). Delete any
+        // existing Service: the certificate SANs drop the {name}-read DNS
+        // name when disabled, so leaving the Service behind serves an
+        // endpoint whose hostname no longer verifies against the TLS cert.
+        let read_svc_name = common::read_service_name(obj);
+        match svc_api
+            .delete(&read_svc_name, &DeleteParams::default())
+            .await
+        {
+            Ok(_) => {
+                info!(name = %name, service = %read_svc_name, "Deleted disabled read service");
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => return Err(Error::Kube(e)),
+        }
     }
 
     let pdb = pdb::generate_pod_disruption_budget(obj);
@@ -1226,6 +1263,10 @@ async fn add_new_replicas_to_cluster(
     let masters = obj.spec.masters;
     let replicas_per_master = obj.spec.replicas_per_master;
 
+    if replicas_per_master == 0 {
+        return Ok(0);
+    }
+
     let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
 
     let cluster_nodes = client.cluster_nodes().await?;
@@ -1297,7 +1338,12 @@ async fn add_new_replicas_to_cluster(
             continue;
         }
 
-        let master_index = ((node.ordinal.get() - masters) % masters) as usize;
+        // Replica ordinals are laid out in contiguous blocks per master
+        // (ordinal = masters + master_index * replicas_per_master + replica_index),
+        // so the inverse mapping divides by replicas_per_master. Modulo by the
+        // master count would round-robin replicas onto the wrong masters
+        // whenever replicas_per_master > 1.
+        let master_index = ((node.ordinal.get() - masters) / replicas_per_master) as usize;
         let master_node_id = match master_node_ids.get(master_index) {
             Some(Some(id)) => id,
             Some(None) => {

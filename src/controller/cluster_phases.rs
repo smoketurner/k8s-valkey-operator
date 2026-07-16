@@ -1205,11 +1205,26 @@ pub async fn handle_degraded(
     create_resources_fn.await?;
 
     // Check for scale-up operations (spec-driven only; safe after resource sync)
-    if phase_ctx.spec_changed
-        && phase_ctx.current_masters > 0
-        && phase_ctx.target_masters > phase_ctx.current_masters
-    {
-        return Ok(ClusterPhase::ScalingUpStatefulSet.into());
+    if phase_ctx.spec_changed && phase_ctx.current_masters > 0 {
+        if phase_ctx.target_masters > phase_ctx.current_masters {
+            return Ok(ClusterPhase::ScalingUpStatefulSet.into());
+        }
+
+        // Replica-only scale-up (masters unchanged, need more pods), mirroring
+        // handle_running. This must route through the scale-up flow so
+        // ConfiguringNewReplicas runs CLUSTER REPLICATE on the new pods —
+        // otherwise they would join the cluster as empty masters with no
+        // replication and the cluster would go Running with them unconfigured.
+        if phase_ctx.target_masters == phase_ctx.current_masters
+            && phase_ctx.running_pods < desired_replicas
+        {
+            debug!(
+                running = phase_ctx.running_pods,
+                desired = desired_replicas,
+                "Replica scale-up detected in degraded state"
+            );
+            return Ok(ClusterPhase::ScalingUpStatefulSet.into());
+        }
     }
 
     if phase_ctx.ready_pods >= desired_replicas {
@@ -1417,8 +1432,9 @@ mod tests {
             generation: 1,
         };
 
-        // With 0 current_masters, we should not report scale up/down
-        assert_eq!(ctx.scale_direction(), ScaleDirection::ReplicaChange);
+        // With 0 current_masters and no spec change, we should not report
+        // any scale operation (spec_changed gating returns None).
+        assert_eq!(ctx.scale_direction(), ScaleDirection::None);
     }
 
     #[test]
