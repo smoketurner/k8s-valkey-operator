@@ -511,18 +511,39 @@ async fn dispatch_phase(
             .await?;
             Ok(result.next_phase)
         }
-        ClusterPhase::Failed => handle_failed_phase(obj, ctx, namespace, name).await,
+        ClusterPhase::Failed => {
+            handle_failed_phase(obj, ctx, namespace, name, phase_ctx.spec_changed).await
+        }
         ClusterPhase::Deleting => Ok(ClusterPhase::Deleting),
     }
 }
 
-/// Handle the Failed phase: attempt automatic stale-IP recovery or stay failed.
+/// Handle the Failed phase: retry after a spec fix, attempt automatic
+/// stale-IP recovery, or stay failed.
 async fn handle_failed_phase(
     obj: &ValkeyCluster,
     ctx: &Context,
     namespace: &str,
     name: &str,
+    spec_changed: bool,
 ) -> Result<ClusterPhase, Error> {
+    // A spec edit is the user's fix for whatever drove the cluster to Failed.
+    // This matters most for validation failures at creation time: no pods ever
+    // started, so the pod-count-gated recovery paths below can never trigger
+    // and Failed would otherwise be terminal. Return to Pending so validation
+    // re-runs against the corrected spec.
+    if spec_changed {
+        info!(name = %name, "Spec changed while in Failed phase, retrying from Pending");
+        ctx.publish_normal_event(
+            obj,
+            "SpecChanged",
+            "Retrying",
+            Some("Spec changed while failed, retrying from initial state".to_string()),
+        )
+        .await;
+        return Ok(ClusterPhase::Pending);
+    }
+
     // Clear a stale cluster-owned operation lock (Scaling/Initializing) before attempting
     // recovery. These locks are acquired and released within the cluster reconciler's own
     // phase handlers, so when the cluster jumps to Failed mid-operation the lock is

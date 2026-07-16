@@ -122,6 +122,10 @@ spec:
                       properties:
                         name:
                           type: string
+                          # required only enforces presence; minLength rejects ""
+                          # which would otherwise fail operator-side validation
+                          # after admission.
+                          minLength: 1
                           description: Name of the cert-manager Issuer or ClusterIssuer
                         kind:
                           type: string
@@ -150,6 +154,10 @@ spec:
                       properties:
                         name:
                           type: string
+                          # required only enforces presence; minLength rejects ""
+                          # which would otherwise fail operator-side validation
+                          # after admission.
+                          minLength: 1
                           description: Name of the Secret containing the password
                         key:
                           type: string
