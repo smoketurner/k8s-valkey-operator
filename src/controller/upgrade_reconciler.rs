@@ -701,22 +701,25 @@ async fn check_replicas_upgraded(
             )
             .await;
 
-            // Transition to RollingBack phase
-            let obj_fresh = api.get(&name).await?;
-            let mut new_status = obj_fresh.status.unwrap_or_default();
-            new_status.phase = UpgradePhase::RollingBack;
-            new_status.error_message = Some(format!(
-                "Pod ready timeout exceeded for shard {} after {}s",
-                shard_index, elapsed
-            ));
-            merge_into_status(
-                &mut new_status,
-                UpgradePhase::RollingBack,
-                obj.metadata.generation,
-            );
-            update_status(api, &name, new_status).await?;
+            // Mark the shard Failed so the ShardUpgradeState::Failed handler
+            // performs the actual rollback (release the operation lock, restore
+            // the original cluster image via initiate_rollback, clear the
+            // upgrade annotation) before transitioning to RollingBack.
+            // Setting UpgradePhase::RollingBack directly here would skip
+            // initiate_rollback: check_rollback_completion only observes pod
+            // images and would wait forever for an image that is never restored.
+            update_shard_status_with_error(
+                api,
+                &name,
+                shard_index,
+                format!(
+                    "Pod ready timeout exceeded for shard {} after {}s (timeout: {}s)",
+                    shard_index, elapsed, pod_ready_timeout
+                ),
+            )
+            .await?;
 
-            return Ok(Action::requeue(Duration::from_secs(5)));
+            return Ok(Action::requeue(Duration::from_secs(1)));
         }
     }
 
