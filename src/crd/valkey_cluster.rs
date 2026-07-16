@@ -556,7 +556,7 @@ fn default_topology_key() -> String {
 }
 
 /// Toleration for pod scheduling.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Toleration {
     /// Toleration key.
