@@ -69,11 +69,20 @@ impl Error {
             Error::Kube(e) => {
                 // Retry on network errors, rate limiting, server errors, and optimistic concurrency
                 // conflicts (409 = resourceVersion mismatch from concurrent reconciliations).
+                // HyperError and HttpError are transient HTTP transport failures
+                // (connection reset, DNS, TLS handshake) — kube-client maps raw
+                // hyper errors to HyperError, not Service, and its retry layer
+                // only retries on status codes, so these reach us directly.
                 matches!(
                     e,
                     kube::Error::Api(api_err)
                         if api_err.code >= 500 || api_err.code == 429 || api_err.code == 409
-                ) || matches!(e, kube::Error::Service(_))
+                ) || matches!(
+                    e,
+                    kube::Error::Service(_)
+                        | kube::Error::HyperError(_)
+                        | kube::Error::HttpError(_)
+                )
             }
             Error::Transient(_) => true,
             Error::Timeout(_) => true,
@@ -188,6 +197,19 @@ mod tests {
             ..Default::default()
         };
         let error = Error::Kube(kube::Error::Api(Box::new(status)));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_kube_transport_error() {
+        // Transient HTTP transport failures must get the short retry backoff,
+        // not the 1-hour non-retryable delay. HyperError shares the same match
+        // arm as HttpError but hyper::Error cannot be constructed in tests.
+        let http_err = http::Request::builder()
+            .uri("http://[invalid-uri")
+            .body(())
+            .unwrap_err();
+        let error = Error::Kube(kube::Error::HttpError(http_err));
         assert!(error.is_retryable());
     }
 
