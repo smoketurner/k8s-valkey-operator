@@ -822,7 +822,10 @@ async fn create_owned_resources(
         // name when disabled, so leaving the Service behind serves an
         // endpoint whose hostname no longer verifies against the TLS cert.
         let read_svc_name = common::read_service_name(obj);
-        match svc_api.delete(&read_svc_name, &DeleteParams::default()).await {
+        match svc_api
+            .delete(&read_svc_name, &DeleteParams::default())
+            .await
+        {
             Ok(_) => {
                 info!(name = %name, service = %read_svc_name, "Deleted disabled read service");
             }

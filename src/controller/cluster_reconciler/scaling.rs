@@ -536,8 +536,10 @@ pub(crate) async fn execute_rebalance_slots(
             .collect();
         if !conflicting.is_empty() {
             conflicting.sort_unstable_by_key(|(slot, _)| *slot);
-            let owners: std::collections::HashSet<_> =
-                conflicting.iter().map(|(_, owner)| owner.to_string()).collect();
+            let owners: std::collections::HashSet<_> = conflicting
+                .iter()
+                .map(|(_, owner)| owner.to_string())
+                .collect();
             return Err(ValkeyError::SlotMigrationFailed(format!(
                 "{} slot(s) (first: {}) are owned by node(s) [{}] excluded from the \
                  target master set; reassigning them via CLUSTER SETSLOT would lose \
