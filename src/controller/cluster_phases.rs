@@ -1417,8 +1417,9 @@ mod tests {
             generation: 1,
         };
 
-        // With 0 current_masters, we should not report scale up/down
-        assert_eq!(ctx.scale_direction(), ScaleDirection::ReplicaChange);
+        // With 0 current_masters and no spec change, we should not report
+        // any scale operation (spec_changed gating returns None).
+        assert_eq!(ctx.scale_direction(), ScaleDirection::None);
     }
 
     #[test]
