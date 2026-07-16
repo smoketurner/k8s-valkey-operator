@@ -509,6 +509,48 @@ pub(crate) async fn execute_rebalance_slots(
     }
 
     if !unassigned_slots.is_empty() {
+        // Slots missing from current_ownership may still be owned by a master
+        // that was excluded from the target set (e.g. an orphaned node with no
+        // matching pod or an ordinal outside the target range). CLUSTER SETSLOT
+        // only rewrites ownership metadata; reassigning such a slot would strand
+        // the keys on the excluded owner and silently lose data once that node
+        // is forgotten. Refuse to proceed so the operator surfaces the problem.
+        let target_master_ids: std::collections::HashSet<&crate::crd::NodeId> =
+            masters.iter().map(|m| &m.node_id).collect();
+        let mut orphan_owners: HashMap<u16, &crate::crd::NodeId> = HashMap::new();
+        for node in &cluster_nodes.nodes {
+            if target_master_ids.contains(&node.node_id) {
+                continue;
+            }
+            for range in &node.slots {
+                for slot in range.start..=range.end {
+                    orphan_owners.insert(slot, &node.node_id);
+                }
+            }
+        }
+
+        let mut conflicting: Vec<(u16, &crate::crd::NodeId)> = unassigned_slots
+            .values()
+            .flatten()
+            .filter_map(|slot| orphan_owners.get(slot).map(|owner| (*slot, *owner)))
+            .collect();
+        if !conflicting.is_empty() {
+            conflicting.sort_unstable_by_key(|(slot, _)| *slot);
+            let owners: std::collections::HashSet<_> =
+                conflicting.iter().map(|(_, owner)| owner.to_string()).collect();
+            return Err(ValkeyError::SlotMigrationFailed(format!(
+                "{} slot(s) (first: {}) are owned by node(s) [{}] excluded from the \
+                 target master set; reassigning them via CLUSTER SETSLOT would lose \
+                 data. Recover or manually migrate these nodes before rebalancing",
+                conflicting.len(),
+                conflicting
+                    .first()
+                    .map(|(slot, _)| *slot)
+                    .unwrap_or_default(),
+                owners.into_iter().collect::<Vec<_>>().join(", "),
+            )));
+        }
+
         let client = ctx
             .connect_to_cluster(obj, namespace, 0)
             .await
