@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use kube::{
     Api, ResourceExt,
-    api::{ApiResource, DynamicObject, Patch, PatchParams},
+    api::{ApiResource, DeleteParams, DynamicObject, Patch, PatchParams},
     runtime::controller::Action,
 };
 use tracing::{debug, error, info, warn};
@@ -816,6 +816,19 @@ async fn create_owned_resources(
                 &Patch::Apply(&read_svc),
             )
             .await?;
+    } else {
+        // The read service was disabled (or never enabled). Delete any
+        // existing Service: the certificate SANs drop the {name}-read DNS
+        // name when disabled, so leaving the Service behind serves an
+        // endpoint whose hostname no longer verifies against the TLS cert.
+        let read_svc_name = common::read_service_name(obj);
+        match svc_api.delete(&read_svc_name, &DeleteParams::default()).await {
+            Ok(_) => {
+                info!(name = %name, service = %read_svc_name, "Deleted disabled read service");
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => return Err(Error::Kube(e)),
+        }
     }
 
     let pdb = pdb::generate_pod_disruption_budget(obj);
