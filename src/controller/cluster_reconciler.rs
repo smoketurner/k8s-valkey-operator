@@ -1226,6 +1226,10 @@ async fn add_new_replicas_to_cluster(
     let masters = obj.spec.masters;
     let replicas_per_master = obj.spec.replicas_per_master;
 
+    if replicas_per_master == 0 {
+        return Ok(0);
+    }
+
     let client = ctx.connect_to_cluster(obj, namespace, 0).await?;
 
     let cluster_nodes = client.cluster_nodes().await?;
@@ -1297,7 +1301,12 @@ async fn add_new_replicas_to_cluster(
             continue;
         }
 
-        let master_index = ((node.ordinal.get() - masters) % masters) as usize;
+        // Replica ordinals are laid out in contiguous blocks per master
+        // (ordinal = masters + master_index * replicas_per_master + replica_index),
+        // so the inverse mapping divides by replicas_per_master. Modulo by the
+        // master count would round-robin replicas onto the wrong masters
+        // whenever replicas_per_master > 1.
+        let master_index = ((node.ordinal.get() - masters) / replicas_per_master) as usize;
         let master_node_id = match master_node_ids.get(master_index) {
             Some(Some(id)) => id,
             Some(None) => {
