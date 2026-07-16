@@ -73,9 +73,14 @@ spec:
                 - rule: "self.tls.issuerRef.name == oldSelf.tls.issuerRef.name"
                   message: "spec.tls.issuerRef.name is immutable; delete and recreate the cluster to change it"
                 # Immutability: auth secret reference cannot change. Changing it would
-                # require credential rotation across all nodes.
+                # require credential rotation across all nodes. Both name and key
+                # are immutable: pods use OnDelete and keep the old password while
+                # the operator would immediately read the new key, splitting auth
+                # between operator and pods.
                 - rule: "self.auth.secretRef.name == oldSelf.auth.secretRef.name"
                   message: "spec.auth.secretRef.name is immutable; delete and recreate the cluster to change it"
+                - rule: "self.auth.secretRef.key == oldSelf.auth.secretRef.key"
+                  message: "spec.auth.secretRef.key is immutable; delete and recreate the cluster to change it"
               properties:
                 masters:
                   type: integer
