@@ -434,11 +434,17 @@ pub async fn setup_replicas(
     let nodes_raw = client.cluster_nodes_raw().await?;
     client.close().await?;
 
-    // Parse the cluster nodes output to get master node IDs
-    // During initial setup, Valkey uses DNS names (cluster-announce-hostname),
-    // so extract_ordinal_from_address works correctly. Pass None for ip_to_ordinal.
+    // Parse the cluster nodes output to get master node IDs.
+    // CLUSTER NODES leads each address with the pod IP even when
+    // cluster-announce-hostname is set ("ip:port@busport,hostname"), and
+    // extract_ordinal_from_address misreads an IP as its first octet, which
+    // would collapse all masters onto the same sort key and scramble the
+    // master ordering. Build an IP→ordinal map from the pods instead.
+    let topology =
+        ClusterTopology::build(&ctx.client, namespace, &cluster.name_any(), None).await?;
+    let ip_to_ordinal = topology.ip_to_ordinal_map();
     let master_node_ids: Vec<crate::crd::NodeId> =
-        parse_master_node_ids(&nodes_raw, masters as usize, None)?;
+        parse_master_node_ids(&nodes_raw, masters as usize, Some(&ip_to_ordinal))?;
 
     if master_node_ids.len() != masters as usize {
         return Err(ValkeyError::ClusterNotReady(format!(
