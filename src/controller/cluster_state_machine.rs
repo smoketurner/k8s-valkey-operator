@@ -651,6 +651,22 @@ impl ClusterStateMachine {
                     ClusterEvent::SpecChanged,
                     "Spec changed while failed, retrying from initial state",
                 ),
+                // A reduction cannot take the Pending route: Pending leads to
+                // Creating, which force-applies the StatefulSet at the new replica
+                // count and terminates slot-owning masters before evacuation.
+                // Mirrors the equivalent Degraded transitions.
+                Transition::new(
+                    ClusterPhase::Failed,
+                    ClusterPhase::EvacuatingSlots,
+                    ClusterEvent::ScaleDownDetected,
+                    "Scale-down detected while failed",
+                ),
+                Transition::new(
+                    ClusterPhase::Failed,
+                    ClusterPhase::RemovingNodesFromCluster,
+                    ClusterEvent::ReplicaScaleDownDetected,
+                    "Replica scale-down detected while failed",
+                ),
                 // ========================================
                 // Deleting state transitions (terminal)
                 // ========================================

@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     controller::{
         cluster_init,
-        cluster_phases::{self, ClusterHealthResult, PhaseContext},
+        cluster_phases::{self, ClusterHealthResult, FailedSpecChange, PhaseContext},
         cluster_state_machine::ClusterStateMachine,
         cluster_topology::ClusterTopology,
         cluster_validation::validate_spec,
@@ -511,9 +511,7 @@ async fn dispatch_phase(
             .await?;
             Ok(result.next_phase)
         }
-        ClusterPhase::Failed => {
-            handle_failed_phase(obj, ctx, namespace, name, phase_ctx.spec_changed).await
-        }
+        ClusterPhase::Failed => handle_failed_phase(obj, ctx, namespace, name, phase_ctx).await,
         ClusterPhase::Deleting => Ok(ClusterPhase::Deleting),
     }
 }
@@ -525,31 +523,16 @@ async fn handle_failed_phase(
     ctx: &Context,
     namespace: &str,
     name: &str,
-    spec_changed: bool,
+    phase_ctx: &PhaseContext,
 ) -> Result<ClusterPhase, Error> {
-    // A spec edit is the user's fix for whatever drove the cluster to Failed.
-    // This matters most for validation failures at creation time: no pods ever
-    // started, so the pod-count-gated recovery paths below can never trigger
-    // and Failed would otherwise be terminal. Return to Pending so validation
-    // re-runs against the corrected spec.
-    if spec_changed {
-        info!(name = %name, "Spec changed while in Failed phase, retrying from Pending");
-        ctx.publish_normal_event(
-            obj,
-            "SpecChanged",
-            "Retrying",
-            Some("Spec changed while failed, retrying from initial state".to_string()),
-        )
-        .await;
-        return Ok(ClusterPhase::Pending);
-    }
-
-    // Clear a stale cluster-owned operation lock (Scaling/Initializing) before attempting
-    // recovery. These locks are acquired and released within the cluster reconciler's own
+    // Clear a stale cluster-owned operation lock (Scaling/Initializing) before doing
+    // anything else. These locks are acquired and released within the cluster reconciler's own
     // phase handlers, so when the cluster jumps to Failed mid-operation the lock is
     // orphaned and StatusUpdate::apply() preserves current_operation across transitions —
     // blocking future operations of a different type once the cluster recovers to
-    // Running/Degraded (issues #86, #90). complete_operation is idempotent and only clears
+    // Running/Degraded (issues #86, #90). This must run before the spec-change branch
+    // below: that branch can route straight to EvacuatingSlots, whose handler acquires
+    // the Scaling lock and would spin until stuck detection if a stale lock survived. complete_operation is idempotent and only clears
     // a matching lock.
     //
     // The Upgrading lock is intentionally NOT cleared here: it is owned by the upgrade
@@ -567,6 +550,66 @@ async fn handle_failed_phase(
         if let Err(e) = operation_coordination::complete_operation(&api, name, op_type).await {
             warn!(name = %name, error = %e, "Failed to clear stale operation lock during Failed recovery");
         }
+    }
+
+    // A spec edit is the user's fix for whatever drove the cluster to Failed.
+    // This matters most for validation failures at creation time: no pods ever
+    // started, so the pod-count-gated recovery paths below can never trigger
+    // and Failed would otherwise be terminal. Return to Pending so validation
+    // re-runs against the corrected spec.
+    if phase_ctx.spec_changed {
+        match cluster_phases::failed_spec_change(phase_ctx) {
+            FailedSpecChange::EvacuateSlots => {
+                info!(
+                    name = %name,
+                    current = phase_ctx.current_masters,
+                    target = phase_ctx.target_masters,
+                    "Scale-down requested while Failed - evacuating slots before shrinking"
+                );
+                ctx.publish_normal_event(
+                    obj,
+                    "ScaleDownDetected",
+                    "Failed",
+                    Some(format!(
+                        "Scaling down from {} to {} masters",
+                        phase_ctx.current_masters, phase_ctx.target_masters
+                    )),
+                )
+                .await;
+                return Ok(ClusterPhase::EvacuatingSlots);
+            }
+            FailedSpecChange::RemoveNodes => {
+                info!(
+                    name = %name,
+                    running = phase_ctx.running_pods,
+                    desired = phase_ctx.desired_replicas(),
+                    "Replica scale-down requested while Failed - removing nodes first"
+                );
+                ctx.publish_normal_event(
+                    obj,
+                    "ReplicaScaleDownDetected",
+                    "Failed",
+                    Some(format!(
+                        "Scaling down replicas from {} to {} pods",
+                        phase_ctx.running_pods,
+                        phase_ctx.desired_replicas()
+                    )),
+                )
+                .await;
+                return Ok(ClusterPhase::RemovingNodesFromCluster);
+            }
+            FailedSpecChange::RetryFromPending => {}
+        }
+
+        info!(name = %name, "Spec changed while in Failed phase, retrying from Pending");
+        ctx.publish_normal_event(
+            obj,
+            "SpecChanged",
+            "Retrying",
+            Some("Spec changed while failed, retrying from initial state".to_string()),
+        )
+        .await;
+        return Ok(ClusterPhase::Pending);
     }
 
     let running_pods = check_running_pods(obj, ctx, namespace).await.unwrap_or(0);
@@ -999,6 +1042,7 @@ pub(crate) async fn check_cluster_health(
         return Ok(ClusterHealthStatus {
             is_healthy: false,
             healthy_masters: 0,
+            expected_masters: obj.spec.masters,
             healthy_replicas: 0,
             slots_assigned: 0,
             topology: None,
@@ -1013,6 +1057,7 @@ pub(crate) async fn check_cluster_health(
             return Ok(ClusterHealthStatus {
                 is_healthy: false,
                 healthy_masters: 0,
+                expected_masters: obj.spec.masters,
                 healthy_replicas: 0,
                 slots_assigned: 0,
                 topology: None,
@@ -1029,6 +1074,7 @@ pub(crate) async fn check_cluster_health(
             return Ok(ClusterHealthStatus {
                 is_healthy: false,
                 healthy_masters: 0,
+                expected_masters: obj.spec.masters,
                 healthy_replicas: 0,
                 slots_assigned: 0,
                 topology: None,
@@ -1045,6 +1091,7 @@ pub(crate) async fn check_cluster_health(
             return Ok(ClusterHealthStatus {
                 is_healthy: cluster_info.is_healthy(),
                 healthy_masters: cluster_info.cluster_size,
+                expected_masters: obj.spec.masters,
                 healthy_replicas: 0,
                 slots_assigned: cluster_info.slots_assigned,
                 topology: None,
@@ -1117,6 +1164,7 @@ pub(crate) async fn check_cluster_health(
     Ok(ClusterHealthStatus {
         is_healthy: cluster_state.is_healthy(expected_masters),
         healthy_masters: cluster_state.healthy_masters_count(),
+        expected_masters,
         healthy_replicas: cluster_state.healthy_replicas_count(),
         slots_assigned: cluster_state.cluster_info.slots_assigned,
         topology: Some(topology),
@@ -1711,6 +1759,7 @@ mod tests {
         let status = ClusterHealthStatus {
             is_healthy: false,
             healthy_masters: 0,
+            expected_masters: 3,
             healthy_replicas: 0,
             slots_assigned: 0,
             topology: None,
@@ -1726,6 +1775,7 @@ mod tests {
         let status = ClusterHealthStatus {
             is_healthy: true,
             healthy_masters: 3,
+            expected_masters: 3,
             healthy_replicas: 3,
             slots_assigned: 16384,
             topology: None,

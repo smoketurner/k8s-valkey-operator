@@ -12,7 +12,9 @@
 //!
 //! This ensures tests stay in sync with production behavior automatically.
 
-use valkey_operator::controller::cluster_phases::{PhaseContext, ScaleDirection};
+use valkey_operator::controller::cluster_phases::{
+    FailedSpecChange, PhaseContext, ScaleDirection, failed_spec_change,
+};
 use valkey_operator::controller::cluster_state_machine::{
     ClusterEvent, ClusterStateMachine, TransitionContext, TransitionResult, determine_event,
 };
@@ -232,6 +234,11 @@ impl MockClusterState {
     /// Simulate nodes removed from cluster during scale-down.
     pub fn simulate_nodes_removed(&mut self) {
         self.nodes_in_cluster = self.desired_replicas();
+        // CLUSTER FORGET on the removed master ordinals is what actually drops the
+        // live master count. Never below target, and a no-op for a replica-only
+        // scale-down. This used to be done by simulate_cluster_healthy(), which
+        // masked issue #172 by inventing masters the operator had not created.
+        self.current_masters = self.current_masters.min(self.target_masters);
     }
 
     /// Simulate StatefulSet scale-down completion.
@@ -241,26 +248,34 @@ impl MockClusterState {
     }
 
     /// Simulate cluster becoming healthy.
+    ///
+    /// Deliberately does NOT touch `current_masters`: the health check observes
+    /// the cluster, it does not create masters. Forcing `current_masters =
+    /// target_masters` here is what hid issue #172 — it made every partial scale
+    /// look complete.
     pub fn simulate_cluster_healthy(&mut self) {
         self.ready_pods = self.desired_replicas();
         self.running_pods = self.desired_replicas();
         self.nodes_in_cluster = self.desired_replicas();
-        self.current_masters = self.target_masters;
         self.slots_assigned = true;
+    }
+
+    /// Edit the spec, bumping the generation as Kubernetes would.
+    pub fn set_spec(&mut self, new_masters: i32, new_replicas: i32) {
+        self.target_masters = new_masters;
+        self.target_replicas_per_master = new_replicas;
+        self.spec_changed = true;
+        self.generation += 1;
     }
 
     /// Set the spec to trigger scale-up.
     pub fn set_scale_up(&mut self, new_masters: i32, new_replicas: i32) {
-        self.target_masters = new_masters;
-        self.target_replicas_per_master = new_replicas;
-        self.spec_changed = true;
+        self.set_spec(new_masters, new_replicas);
     }
 
     /// Set the spec to trigger scale-down.
     pub fn set_scale_down(&mut self, new_masters: i32, new_replicas: i32) {
-        self.target_masters = new_masters;
-        self.target_replicas_per_master = new_replicas;
-        self.spec_changed = true;
+        self.set_spec(new_masters, new_replicas);
     }
 
     /// Simulate partial recovery (some pods ready).
@@ -312,6 +327,12 @@ impl MockClusterState {
                     break;
                 }
             }
+
+            // Mirror StatusUpdate::apply(): observed_generation is written on every
+            // status update, so spec_changed is true for exactly one reconcile — not
+            // for the whole operation. Leaving it set let the mock resume a scale-up
+            // that production would have blocked, which is half of issue #172.
+            self.spec_changed = false;
         }
 
         phases
@@ -394,12 +415,29 @@ impl MockClusterState {
     /// The scale detection logic here must mirror the detection logic in:
     /// - `cluster_phases.rs:handle_running()` - Running state scale detection
     /// - `cluster_phases.rs:handle_degraded()` - Degraded state scale detection
+    /// - `cluster_reconciler.rs:handle_failed_phase()` - Failed-phase spec changes
     ///
     /// When adding new events or changing detection logic in production,
     /// update this function accordingly. See CLAUDE.md for details.
     fn determine_next_event(&self) -> ClusterEvent {
         // For Running and Degraded phases, use production scale_direction() for scale detection
         match self.phase {
+            // Mirrors handle_failed_phase: a spec edit that REDUCES the cluster must
+            // not take the Pending route, because Pending leads to Creating, which
+            // force-applies the shrunken StatefulSet and terminates slot-owning
+            // masters before evacuation. Uses the production decision function so the
+            // two cannot drift.
+            ClusterPhase::Failed if self.spec_changed => {
+                match failed_spec_change(&self.to_phase_context()) {
+                    FailedSpecChange::EvacuateSlots => return ClusterEvent::ScaleDownDetected,
+                    FailedSpecChange::RemoveNodes => {
+                        return ClusterEvent::ReplicaScaleDownDetected;
+                    }
+                    // Not a reduction: fall through to determine_event, which fires
+                    // SpecChanged and retries from Pending.
+                    FailedSpecChange::RetryFromPending => {}
+                }
+            }
             ClusterPhase::Running | ClusterPhase::Degraded => {
                 // Use production scale_direction() method from PhaseContext.
                 // Mirrors handle_running/handle_degraded in cluster_phases.rs:

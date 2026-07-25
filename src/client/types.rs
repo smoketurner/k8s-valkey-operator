@@ -267,6 +267,12 @@ pub struct ClusterNode {
     pub address: String,
     /// IP address only.
     pub ip: String,
+    /// Hostname announced via `--cluster-announce-hostname`, if any.
+    ///
+    /// The operator always sets this flag, so for nodes it manages this is the
+    /// pod's headless-service FQDN. It survives pod restarts that change the IP,
+    /// which makes it the reliable key for correlating a cluster node with a pod.
+    pub hostname: Option<String>,
     /// Client port.
     pub port: i32,
     /// Cluster bus port.
@@ -323,6 +329,22 @@ impl ClusterNode {
         self.slots.iter().map(|r| i32::from(r.count())).sum()
     }
 
+    /// Extract the announced hostname from a `CLUSTER NODES` address field.
+    ///
+    /// The field is `ip:port@cport[,hostname[,aux=value]*]`. Valkey emits an
+    /// empty hostname segment (`ip:port@cport,,shard-id=...`) when
+    /// `cluster-announce-hostname` is unset but auxiliary fields are present,
+    /// so an empty segment and any `key=value` segment both mean "no hostname".
+    fn parse_hostname(addr_field: &str) -> Option<String> {
+        let (_, after_at) = addr_field.split_once('@')?;
+        let (_, after_bus_port) = after_at.split_once(',')?;
+        let hostname = after_bus_port.split(',').next()?;
+        if hostname.is_empty() || hostname.contains('=') {
+            return None;
+        }
+        Some(hostname.to_string())
+    }
+
     /// Parse a single line from `CLUSTER NODES` output.
     pub fn parse_line(line: &str) -> Result<Self, ParseError> {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -371,6 +393,8 @@ impl ClusterNode {
             })
             .unwrap_or(port + 10000);
 
+        let hostname = Self::parse_hostname(addr_field);
+
         let flags_str = parts
             .get(2)
             .ok_or_else(|| ParseError::MissingField("flags".to_string()))?;
@@ -405,6 +429,7 @@ impl ClusterNode {
             node_id,
             address: ip_port.to_string(),
             ip,
+            hostname,
             port,
             cluster_bus_port,
             flags,
@@ -641,6 +666,67 @@ cluster_my_epoch:2
             ))
         );
         assert!(node.slots.is_empty());
+    }
+
+    #[test]
+    fn test_parse_cluster_node_announced_hostname() {
+        // The operator always passes --cluster-announce-hostname, so managed
+        // nodes report "ip:port@cport,<pod>.<headless>.<ns>.svc.cluster.local".
+        let line = "07c37dfeb235213a872192d90877d0cd55635b91 10.0.0.5:6379@16379,my-cluster-0.my-cluster-headless.default.svc.cluster.local master - 0 1426238317239 2 connected 0-5460";
+
+        let node = ClusterNode::parse_line(line).expect("should parse");
+        assert_eq!(node.ip, "10.0.0.5");
+        assert_eq!(
+            node.hostname.as_deref(),
+            Some("my-cluster-0.my-cluster-headless.default.svc.cluster.local")
+        );
+    }
+
+    #[test]
+    fn test_parse_cluster_node_hostname_with_aux_fields() {
+        // Aux fields follow the hostname segment and must not be mistaken for it.
+        let line = "07c37dfeb235213a872192d90877d0cd55635b91 10.0.0.5:6379@16379,my-cluster-0,shard-id=abc master - 0 1426238317239 2 connected 0-5460";
+
+        let node = ClusterNode::parse_line(line).expect("should parse");
+        assert_eq!(node.hostname.as_deref(), Some("my-cluster-0"));
+    }
+
+    #[test]
+    fn test_parse_cluster_node_empty_hostname_segment() {
+        // Valkey emits ",,aux=value" when no hostname is announced.
+        let line = "07c37dfeb235213a872192d90877d0cd55635b91 10.0.0.5:6379@16379,,shard-id=abc master - 0 1426238317239 2 connected 0-5460";
+
+        let node = ClusterNode::parse_line(line).expect("should parse");
+        assert_eq!(node.hostname, None);
+    }
+
+    #[test]
+    fn test_parse_cluster_node_aux_field_without_hostname() {
+        // Some builds omit the empty segment entirely and go straight to aux fields.
+        let line = "07c37dfeb235213a872192d90877d0cd55635b91 10.0.0.5:6379@16379,shard-id=abc master - 0 1426238317239 2 connected 0-5460";
+
+        let node = ClusterNode::parse_line(line).expect("should parse");
+        assert_eq!(node.hostname, None);
+    }
+
+    #[test]
+    fn test_parse_cluster_node_no_hostname_segment() {
+        let line = "07c37dfeb235213a872192d90877d0cd55635b91 10.0.0.5:6379@16379 master - 0 1426238317239 2 connected 0-5460";
+
+        let node = ClusterNode::parse_line(line).expect("should parse");
+        assert_eq!(node.hostname, None);
+    }
+
+    #[test]
+    fn test_parse_cluster_node_handshake_placeholder_address() {
+        // A node in handshake reports ":0@0" until the address is known.
+        let line = "07c37dfeb235213a872192d90877d0cd55635b91 :0@0 handshake - 0 0 0 disconnected";
+
+        let node = ClusterNode::parse_line(line).expect("should parse");
+        assert_eq!(node.ip, "");
+        assert_eq!(node.port, 0);
+        assert_eq!(node.hostname, None);
+        assert!(node.flags.handshake);
     }
 
     #[test]

@@ -393,6 +393,15 @@ The operator uses Kubernetes generation tracking to distinguish spec changes fro
 2. `status.observedGeneration` tracks last processed generation
 3. `spec_changed = (metadata.generation != status.observedGeneration)`
 
+`observed_generation` is written on **every** status update — on the first reconcile that
+observes an edit, not when the resulting work finishes. A change needing several phases
+therefore only sees `spec_changed = true` once.
+
 This is critical for scale detection:
 - **Scale-down** is NEVER gated on `spec_changed` (data-loss invariant)
-- **Scale-up** requires `spec_changed` to be true (prevents stuck RebalancingSlots when a master pod fails)
+- **Scale-up** requires `spec_changed` to be true, *or* `pods_converged()` — every desired
+  pod Running and Ready. The `spec_changed` gate prevents a stuck RebalancingSlots when a
+  master pod fails; the `pods_converged()` escape hatch lets a multi-step edit finish after
+  `observed_generation` has already caught up (e.g. masters up + replicas down in one edit,
+  where the replica reduction runs first). Master loss always leaves a pod failing the
+  `cluster_state:ok` readiness probe, so it never takes the escape hatch.

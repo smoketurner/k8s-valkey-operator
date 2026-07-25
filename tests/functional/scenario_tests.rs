@@ -821,3 +821,119 @@ fn test_scale_down_detected_immediately_on_spec_change() {
         _ => panic!("Expected immediate transition to EvacuatingSlots"),
     }
 }
+
+// ============================================================================
+// Combined master + replica spec edits (issue #172)
+// ============================================================================
+
+/// A single edit that raises masters and lowers replicas must converge on both.
+///
+/// (3m, 2r) -> (4m, 1r) shrinks the pod count from 9 to 8 while raising the
+/// master count from 3 to 4. The replica reduction is detected first, and
+/// `observed_generation` catches up on that very first reconcile — so the
+/// pending master scale-up used to be blocked forever by the `spec_changed`
+/// gate, leaving the cluster Running with 3 masters against `spec.masters: 4`
+/// and no further reconciliation.
+#[test]
+fn test_combined_master_scale_up_and_replica_scale_down_converges() {
+    let mut state = MockClusterState::running("combined", 3, 2);
+    assert_eq!(state.running_pods, 9);
+
+    state.set_spec(4, 1);
+    let phases = state.run_until_running(40);
+
+    assert_eq!(
+        state.phase,
+        ClusterPhase::Running,
+        "cluster should settle in Running, got {:?} after {:?}",
+        state.phase,
+        phases
+    );
+    assert_eq!(
+        state.current_masters, 4,
+        "master count must reach spec.masters, got {} after {:?}",
+        state.current_masters, phases
+    );
+    assert_eq!(state.running_pods, 8);
+    assert!(
+        !state.spec_changed,
+        "observed_generation should have caught up"
+    );
+
+    // Both halves of the edit must have been executed.
+    assert!(
+        phases.contains(&ClusterPhase::RemovingNodesFromCluster),
+        "replica reduction should run, got {:?}",
+        phases
+    );
+    assert!(
+        phases.contains(&ClusterPhase::RebalancingSlots),
+        "master scale-up should run, got {:?}",
+        phases
+    );
+}
+
+/// The #129 guard, expressed with the readiness state master loss produces.
+///
+/// A lost master leaves its recreated pod failing the `cluster_state:ok`
+/// readiness probe until the operator re-joins it, so the shortfall is never
+/// mistaken for the pending spec work above.
+#[test]
+fn test_master_loss_with_not_ready_pod_is_not_treated_as_scale_up() {
+    let mut state = MockClusterState::running("master-loss", 3, 1);
+    state.current_masters = 2;
+    state.ready_pods = 5;
+    state.spec_changed = false;
+
+    let ctx = state.to_phase_context();
+    assert!(!ctx.pods_converged());
+    assert_eq!(
+        ctx.scale_direction(),
+        valkey_operator::controller::cluster_phases::ScaleDirection::None
+    );
+}
+
+/// A scale-down requested while the cluster is Failed must evacuate slots, not
+/// restart from Pending. Pending leads to Creating, which force-applies the
+/// shrunken StatefulSet and terminates slot-owning masters before migration.
+#[test]
+fn test_scale_down_while_failed_evacuates_instead_of_restarting() {
+    let mut state = MockClusterState::running("failed-scale-down", 6, 1);
+    state.phase = ClusterPhase::Failed;
+    state.set_spec(3, 1);
+
+    let phases = state.run_until_running(40);
+
+    assert!(
+        phases.contains(&ClusterPhase::EvacuatingSlots),
+        "reduction from Failed must evacuate slots, got {:?}",
+        phases
+    );
+    assert!(
+        !phases.contains(&ClusterPhase::Creating),
+        "reduction from Failed must not restart via Pending/Creating, got {:?}",
+        phases
+    );
+    assert_eq!(state.current_masters, 3);
+}
+
+/// A non-reducing spec edit while Failed still retries from Pending — this is
+/// the issue #159 path, where validation failed before any pod existed.
+#[test]
+fn test_validation_fix_while_failed_still_retries_from_pending() {
+    let mut state = MockClusterState::new("failed-validation", 3, 1);
+    state.phase = ClusterPhase::Failed;
+    state.current_masters = 0;
+    state.running_pods = 0;
+    state.ready_pods = 0;
+    state.set_spec(3, 1);
+
+    let phases = state.run_until_running(40);
+
+    assert!(
+        phases.contains(&ClusterPhase::Pending),
+        "a validation fix must retry from Pending, got {:?}",
+        phases
+    );
+    assert!(!phases.contains(&ClusterPhase::EvacuatingSlots));
+}

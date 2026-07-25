@@ -238,7 +238,7 @@ ScaleDirection::ReplicaChange
 }
 ```
 
-**Key Insight:** Replica scale-down bypasses EvacuatingSlots because replicas don't hold slots. The `execute_forget_removed_nodes` function uses `ClusterTopology.orphaned_nodes()` to identify nodes whose IPs no longer match running pods, then issues `CLUSTER FORGET` for each orphaned node
+**Key Insight:** Replica scale-down bypasses EvacuatingSlots because replicas don't hold slots. The `execute_forget_removed_nodes` function uses `ClusterTopology.orphan_report()` to identify nodes with no backing pod — matching on the announced hostname first and the pod IP second, so a pod that restarted with a new IP is not mistaken for an orphan — then issues `CLUSTER FORGET` for each orphaned node. Nodes that cannot be classified (handshake, `noaddr`, or a pod with no IP yet) are logged and left in the cluster. `forget_nodes_with_quorum` re-reads `CLUSTER NODES` and refuses to forget any node that still owns hash slots, because FORGET does not reassign slots and would leave them unowned.
 
 ---
 

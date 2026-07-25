@@ -239,8 +239,13 @@ Located in `cluster_phases.rs:scale_direction()` (called by `handle_running`):
 if current_masters > target_masters && current_masters > 0 { return Down }
 if running_pods > desired_replicas { return ReplicaChange }
 
-// Scale-UP requires spec_changed (avoids stuck RebalancingSlots on master loss)
-if !spec_changed { return None }
+// Scale-UP requires spec_changed (avoids stuck RebalancingSlots on master loss),
+// OR that every desired pod is Running AND Ready. observed_generation catches up
+// on the first reconcile that sees an edit, not when the work finishes, so a
+// multi-step change (e.g. masters up + replicas down) loses spec_changed partway
+// through and would otherwise strand the pending master scale-up. Master loss
+// always leaves a NotReady pod, so it still resolves to None here.
+if !spec_changed && !pods_converged { return None }
 if current_masters < target_masters { return Up }
 if running_pods != desired_replicas { return ReplicaChange }
 ```

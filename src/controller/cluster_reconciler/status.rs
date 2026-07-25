@@ -21,6 +21,77 @@ use crate::{
 /// well below values that indicate a real replication problem.
 pub const REPLICATION_LAG_TOLERANCE_BYTES: i64 = 1_048_576;
 
+/// Node and slot counts used to render the `Running` summary line.
+pub(crate) struct RunningCounts {
+    pub(crate) masters: i32,
+    pub(crate) replicas: i32,
+    pub(crate) slots: i32,
+}
+
+/// Derive `status.lastError` and `status.summary` for one reconcile.
+///
+/// Both values come from the same source of truth. In `Failed`, `previous_error`
+/// is the fallback because the reconcile tail always passes `error_message: None` —
+/// deriving the summary from `error_message` directly would replace a real message
+/// with "unknown error" on the first reconcile after the cluster entered `Failed`.
+pub(crate) fn derive_error_and_summary(
+    phase: ClusterPhase,
+    error_message: Option<&str>,
+    previous_error: Option<&str>,
+    counts: RunningCounts,
+) -> (Option<String>, Option<String>) {
+    if phase == ClusterPhase::Running {
+        let summary = format!(
+            "Healthy: {} masters, {} replicas, {}/{TOTAL_SLOTS} slots",
+            counts.masters, counts.replicas, counts.slots
+        );
+        return (None, Some(summary));
+    }
+
+    if phase == ClusterPhase::Failed {
+        let err = error_message.or(previous_error).map(str::to_owned);
+        let summary = format!("Failed: {}", err.as_deref().unwrap_or("unknown error"));
+        return (err, Some(summary));
+    }
+
+    // Any other phase keeps whatever error is already recorded; a transient
+    // reconcile error is not promoted to lastError outside of Failed.
+    (
+        previous_error.map(str::to_owned),
+        Some(format!("Phase: {phase}")),
+    )
+}
+
+/// Build the JSON merge-patch body for a status update.
+///
+/// `ValkeyClusterStatus` marks its optional fields `skip_serializing_if =
+/// "Option::is_none"`, so a `None` drops the key entirely — and under RFC 7386 an
+/// absent key means "leave unchanged". Fields the operator deliberately clears
+/// must therefore be written as explicit nulls, or the server keeps the stale
+/// value forever (a recovered cluster would keep reporting the error that failed
+/// it, long after returning to Running).
+///
+/// `topology` is intentionally not cleared this way: a `None` there means the
+/// operator could not read the cluster this reconcile, so preserving the
+/// last-known topology is more useful than blanking it on every transient blip.
+pub(crate) fn build_status_patch(status: &ValkeyClusterStatus) -> serde_json::Value {
+    let mut patch = serde_json::json!({ "status": status });
+
+    if let Some(status_obj) = patch
+        .get_mut("status")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        if status.last_error.is_none() {
+            status_obj.insert("lastError".to_owned(), serde_json::Value::Null);
+        }
+        if status.last_recovery_attempt.is_none() {
+            status_obj.insert("lastRecoveryAttempt".to_owned(), serde_json::Value::Null);
+        }
+    }
+
+    patch
+}
+
 fn is_progressing(phase: ClusterPhase) -> bool {
     matches!(
         phase,
@@ -128,9 +199,28 @@ pub fn derive_cluster_conditions(
     health_status: Option<&ClusterHealthStatus>,
     tls: Option<&TlsObservation>,
 ) -> Vec<Condition> {
-    let ready = phase == ClusterPhase::Running && ready_pods == desired_pods && desired_pods > 0;
+    // Pod counts alone are not enough: a cluster can have every pod Running and
+    // Ready while holding fewer masters than spec.masters (a multi-step spec edit
+    // that only partly completed). Reporting Ready there hides real drift.
+    //
+    // `healthy_masters == 0` means check_cluster_health could not read the
+    // cluster at all, not that every master vanished — don't flap Ready on that.
+    // Use the explicit count rather than `is_healthy`, which also folds in
+    // slots_pfail/slots_fail and would flap on transient gossip state.
+    //
+    // `>=` rather than `==`: healthy_masters_count() counts every non-failed node
+    // carrying the master flag, including slot-free ones — a replica that lost its
+    // PVC rejoins as an empty master until CLUSTER REPLICATE runs. A surplus there
+    // is not an outage, and flagging it would make Ready flap on a serving cluster.
+    let masters_match = health_status
+        .is_none_or(|h| h.healthy_masters == 0 || h.healthy_masters >= h.expected_masters);
+    let ready = phase == ClusterPhase::Running
+        && ready_pods == desired_pods
+        && desired_pods > 0
+        && masters_match;
     let progressing = is_progressing(phase);
-    let degraded = is_degraded(phase, ready_pods, desired_pods);
+    let degraded = is_degraded(phase, ready_pods, desired_pods)
+        || (phase == ClusterPhase::Running && !masters_match);
     let slots_stable = slots_are_stable(phase);
     let replicas_in_sync = health_status
         .and_then(|h| h.max_replica_lag)
@@ -139,6 +229,11 @@ pub fn derive_cluster_conditions(
         (
             "ClusterHealthy",
             "Cluster is running and all pods are ready.",
+        )
+    } else if phase == ClusterPhase::Running && !masters_match {
+        (
+            "MasterCountMismatch",
+            "Cluster master count does not match spec.masters.",
         )
     } else {
         ready_reason(phase)
@@ -241,6 +336,9 @@ pub struct ClusterHealthStatus {
     pub is_healthy: bool,
     /// Number of healthy master nodes.
     pub healthy_masters: i32,
+    /// Number of masters the spec asks for, so conditions can spot drift between
+    /// the live cluster and `spec.masters` without re-reading the resource.
+    pub expected_masters: i32,
     /// Number of healthy replica nodes.
     pub healthy_replicas: i32,
     /// Total slots assigned.
@@ -350,35 +448,19 @@ impl<'a> StatusUpdate<'a> {
             )
         };
 
-        let (last_error, summary) = if self.phase == ClusterPhase::Running {
-            let slots = self
-                .health_status
-                .map(|h| h.slots_assigned)
-                .unwrap_or_else(|| i32::from(TOTAL_SLOTS));
-            let healthy_replicas = self.health_status.map(|h| h.healthy_replicas).unwrap_or(0);
-            (
-                None,
-                Some(format!(
-                    "Healthy: {} masters, {} replicas, {}/{TOTAL_SLOTS} slots",
-                    ready_masters, healthy_replicas, slots
-                )),
-            )
-        } else if self.phase == ClusterPhase::Failed {
-            let err = self
-                .error_message
-                .map(|e| e.to_string())
-                .or_else(|| existing_status.and_then(|s| s.last_error.clone()));
-            (
-                err,
-                Some(format!(
-                    "Failed: {}",
-                    self.error_message.unwrap_or("unknown error")
-                )),
-            )
-        } else {
-            let err = existing_status.and_then(|s| s.last_error.clone());
-            (err, Some(format!("Phase: {}", self.phase)))
-        };
+        let (last_error, summary) = derive_error_and_summary(
+            self.phase,
+            self.error_message,
+            existing_status.and_then(|s| s.last_error.as_deref()),
+            RunningCounts {
+                masters: ready_masters,
+                replicas: self.health_status.map(|h| h.healthy_replicas).unwrap_or(0),
+                slots: self
+                    .health_status
+                    .map(|h| h.slots_assigned)
+                    .unwrap_or_else(|| i32::from(TOTAL_SLOTS)),
+            },
+        );
 
         // Label selector for the scale subresource — must match the pods owned by
         // this cluster so HPA can read replica counts. Mirrors pod_selector_labels
@@ -413,7 +495,7 @@ impl<'a> StatusUpdate<'a> {
             summary,
         };
 
-        let patch = serde_json::json!({ "status": status });
+        let patch = build_status_patch(&status);
 
         debug!(name = %self.name, phase = %self.phase, "Updating cluster status");
 
@@ -429,6 +511,130 @@ impl<'a> StatusUpdate<'a> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn counts() -> RunningCounts {
+        RunningCounts {
+            masters: 3,
+            replicas: 3,
+            slots: 16384,
+        }
+    }
+
+    #[test]
+    fn test_failed_summary_falls_back_to_preserved_error() {
+        // The reconcile tail always passes error_message: None, so a cluster that
+        // stays Failed must keep reporting the error that put it there.
+        let (last_error, summary) = derive_error_and_summary(
+            ClusterPhase::Failed,
+            None,
+            Some("quorum lost: 1 of 3 masters reachable"),
+            counts(),
+        );
+        assert_eq!(
+            last_error.as_deref(),
+            Some("quorum lost: 1 of 3 masters reachable")
+        );
+        assert_eq!(
+            summary.as_deref(),
+            Some("Failed: quorum lost: 1 of 3 masters reachable")
+        );
+    }
+
+    #[test]
+    fn test_failed_summary_prefers_current_error() {
+        let (last_error, summary) = derive_error_and_summary(
+            ClusterPhase::Failed,
+            Some("new failure"),
+            Some("old"),
+            counts(),
+        );
+        assert_eq!(last_error.as_deref(), Some("new failure"));
+        assert_eq!(summary.as_deref(), Some("Failed: new failure"));
+    }
+
+    #[test]
+    fn test_failed_summary_without_any_error() {
+        let (last_error, summary) =
+            derive_error_and_summary(ClusterPhase::Failed, None, None, counts());
+        assert_eq!(last_error, None);
+        assert_eq!(summary.as_deref(), Some("Failed: unknown error"));
+    }
+
+    #[test]
+    fn test_running_clears_last_error() {
+        let (last_error, summary) =
+            derive_error_and_summary(ClusterPhase::Running, None, Some("stale"), counts());
+        assert_eq!(last_error, None);
+        assert_eq!(
+            summary.as_deref(),
+            Some("Healthy: 3 masters, 3 replicas, 16384/16384 slots")
+        );
+    }
+
+    #[test]
+    fn test_other_phase_preserves_last_error() {
+        let (last_error, summary) =
+            derive_error_and_summary(ClusterPhase::Degraded, None, Some("stale"), counts());
+        assert_eq!(last_error.as_deref(), Some("stale"));
+        assert_eq!(summary.as_deref(), Some("Phase: Degraded"));
+    }
+
+    /// Look up a `status.<field>` entry in a merge-patch body.
+    ///
+    /// Returns `None` when the key is absent, which is the distinction that
+    /// matters here — indexing would report an absent key as `Null`.
+    fn patch_field<'a>(patch: &'a serde_json::Value, field: &str) -> Option<&'a serde_json::Value> {
+        patch.get("status").and_then(|s| s.get(field))
+    }
+
+    #[test]
+    fn test_patch_clears_last_error_with_explicit_null() {
+        // A bare `None` is omitted by skip_serializing_if, and RFC 7386 preserves
+        // omitted keys — so the key must be present and null to actually clear.
+        let status = ValkeyClusterStatus {
+            last_error: None,
+            last_recovery_attempt: None,
+            ..Default::default()
+        };
+        let patch = build_status_patch(&status);
+        assert_eq!(
+            patch_field(&patch, "lastError"),
+            Some(&serde_json::Value::Null),
+            "lastError must be present and null to clear it server-side"
+        );
+        assert_eq!(
+            patch_field(&patch, "lastRecoveryAttempt"),
+            Some(&serde_json::Value::Null),
+            "lastRecoveryAttempt must be present and null to clear it server-side"
+        );
+    }
+
+    #[test]
+    fn test_patch_preserves_a_real_last_error() {
+        let status = ValkeyClusterStatus {
+            last_error: Some("boom".to_string()),
+            last_recovery_attempt: Some("2026-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let patch = build_status_patch(&status);
+        assert_eq!(
+            patch_field(&patch, "lastError").and_then(serde_json::Value::as_str),
+            Some("boom")
+        );
+        assert_eq!(
+            patch_field(&patch, "lastRecoveryAttempt").and_then(serde_json::Value::as_str),
+            Some("2026-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn test_patch_omits_topology_rather_than_nulling_it() {
+        // None means "not observed this reconcile", so the last-known topology
+        // must survive rather than being blanked on a transient read failure.
+        let status = ValkeyClusterStatus::default();
+        let patch = build_status_patch(&status);
+        assert_eq!(patch_field(&patch, "topology"), None);
+    }
 
     fn find_condition<'a>(conditions: &'a [Condition], ty: &str) -> &'a Condition {
         conditions
@@ -705,6 +911,7 @@ mod tests {
         ClusterHealthStatus {
             is_healthy: true,
             healthy_masters: 3,
+            expected_masters: 3,
             healthy_replicas: 3,
             slots_assigned: 16384,
             topology: None,
@@ -716,11 +923,64 @@ mod tests {
         ClusterHealthStatus {
             is_healthy: false,
             healthy_masters: 1,
+            expected_masters: 1,
             healthy_replicas: 0,
             slots_assigned: 16384,
             topology: None,
             max_replica_lag: Some(lag),
         }
+    }
+
+    fn short_by_one_master() -> ClusterHealthStatus {
+        ClusterHealthStatus {
+            is_healthy: false,
+            healthy_masters: 3,
+            expected_masters: 4,
+            healthy_replicas: 4,
+            slots_assigned: 16384,
+            topology: None,
+            max_replica_lag: Some(0),
+        }
+    }
+
+    /// Issue #172: a cluster can have every pod Running and Ready while holding
+    /// fewer masters than spec.masters. Pod counts alone reported that as Ready.
+    #[test]
+    fn test_ready_false_when_master_count_below_spec() {
+        let health = short_by_one_master();
+        let c =
+            derive_cluster_conditions(ClusterPhase::Running, 8, 8, Some(2), Some(&health), None);
+        assert_false(&c, "Ready");
+        assert_true(&c, "Degraded");
+        assert_eq!(find_condition(&c, "Ready").reason, "MasterCountMismatch");
+    }
+
+    #[test]
+    fn test_ready_true_when_master_count_matches_spec() {
+        let health = healthy();
+        let c =
+            derive_cluster_conditions(ClusterPhase::Running, 6, 6, Some(2), Some(&health), None);
+        assert_true(&c, "Ready");
+        assert_false(&c, "Degraded");
+    }
+
+    /// check_cluster_health returns healthy_masters: 0 when it cannot reach the
+    /// cluster at all. That is "unreadable", not "every master vanished", so it
+    /// must not flap Ready on a transient connection blip.
+    #[test]
+    fn test_ready_not_flapped_when_health_is_unreadable() {
+        let health = ClusterHealthStatus {
+            is_healthy: false,
+            healthy_masters: 0,
+            expected_masters: 3,
+            healthy_replicas: 0,
+            slots_assigned: 0,
+            topology: None,
+            max_replica_lag: None,
+        };
+        let c =
+            derive_cluster_conditions(ClusterPhase::Running, 6, 6, Some(1), Some(&health), None);
+        assert_true(&c, "Ready");
     }
 
     #[test]
