@@ -414,14 +414,15 @@ impl ClusterTopology {
                 continue;
             };
 
-            // A pod being deleted keeps its IP until the kubelet finishes, which
-            // would keep its cluster node looking live during a scale-down. Pods
-            // in Pending are deliberately kept: they have no IP yet, and orphan
-            // classification needs to see them to stay conservative.
-            if pod.metadata.deletion_timestamp.is_some() {
-                continue;
-            }
-
+            // Terminating pods are deliberately kept. In a StatefulSet a deletion
+            // timestamp almost always means the pod is coming back — eviction, node
+            // drain, OOMKill, `kubectl delete pod` — and dropping it here would make
+            // orphan classification declare its cluster node an orphan, so a replica
+            // that was merely restarting would be CLUSTER FORGET'd and never re-MEET'd.
+            // Genuine scale-downs remove nodes by ordinal via `nodes_to_remove`, not
+            // through orphan detection, so nothing needs this filter. Pods in Pending
+            // are kept for the same reason: no IP yet, and classification needs to see
+            // them to stay conservative.
             // Extract ordinal from pod name (e.g., "my-cluster-3" -> 3)
             let ordinal_raw = pod_name
                 .rsplit('-')

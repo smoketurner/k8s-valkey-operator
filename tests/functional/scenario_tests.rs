@@ -892,3 +892,48 @@ fn test_master_loss_with_not_ready_pod_is_not_treated_as_scale_up() {
         valkey_operator::controller::cluster_phases::ScaleDirection::None
     );
 }
+
+/// A scale-down requested while the cluster is Failed must evacuate slots, not
+/// restart from Pending. Pending leads to Creating, which force-applies the
+/// shrunken StatefulSet and terminates slot-owning masters before migration.
+#[test]
+fn test_scale_down_while_failed_evacuates_instead_of_restarting() {
+    let mut state = MockClusterState::running("failed-scale-down", 6, 1);
+    state.phase = ClusterPhase::Failed;
+    state.set_spec(3, 1);
+
+    let phases = state.run_until_running(40);
+
+    assert!(
+        phases.contains(&ClusterPhase::EvacuatingSlots),
+        "reduction from Failed must evacuate slots, got {:?}",
+        phases
+    );
+    assert!(
+        !phases.contains(&ClusterPhase::Creating),
+        "reduction from Failed must not restart via Pending/Creating, got {:?}",
+        phases
+    );
+    assert_eq!(state.current_masters, 3);
+}
+
+/// A non-reducing spec edit while Failed still retries from Pending — this is
+/// the issue #159 path, where validation failed before any pod existed.
+#[test]
+fn test_validation_fix_while_failed_still_retries_from_pending() {
+    let mut state = MockClusterState::new("failed-validation", 3, 1);
+    state.phase = ClusterPhase::Failed;
+    state.current_masters = 0;
+    state.running_pods = 0;
+    state.ready_pods = 0;
+    state.set_spec(3, 1);
+
+    let phases = state.run_until_running(40);
+
+    assert!(
+        phases.contains(&ClusterPhase::Pending),
+        "a validation fix must retry from Pending, got {:?}",
+        phases
+    );
+    assert!(!phases.contains(&ClusterPhase::EvacuatingSlots));
+}

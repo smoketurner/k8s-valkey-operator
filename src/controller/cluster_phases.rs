@@ -664,28 +664,11 @@ pub async fn handle_running(
         return Ok(ClusterPhase::Degraded.into());
     }
 
-    // Pods are all ready but the cluster does not have the masters the spec asks
-    // for. scale_direction() routes this to a scale-up once pods converge, so
-    // reaching here means that path is not making progress — surface it rather
-    // than sitting in Running with silent drift.
-    if phase_ctx.current_masters > 0 && phase_ctx.current_masters != phase_ctx.target_masters {
-        warn!(
-            name = %name,
-            current = phase_ctx.current_masters,
-            target = phase_ctx.target_masters,
-            "Master count does not match spec while Running"
-        );
-        ctx.publish_warning_event(
-            obj,
-            "MasterCountMismatch",
-            "Running",
-            Some(format!(
-                "Cluster has {} masters but spec.masters is {}",
-                phase_ctx.current_masters, phase_ctx.target_masters
-            )),
-        )
-        .await;
-    }
+    // A master shortfall is not reported here: with converged pods scale_direction()
+    // has already routed it to ScalingUpStatefulSet above, and the remaining states
+    // that reach this point have ready_pods == 0, where a per-reconcile Warning would
+    // just be noise. The drift is surfaced by the Ready/Degraded conditions instead
+    // (see derive_cluster_conditions), which report it once rather than every 30s.
 
     // Cluster is healthy, stay in Running
     debug!(

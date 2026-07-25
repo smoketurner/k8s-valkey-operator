@@ -2241,11 +2241,17 @@ async fn handle_deletion(
 
 /// Best-effort release of the cluster state this upgrade owns.
 ///
-/// Both operations are idempotent — `complete_operation` only clears a lock that
-/// matches `Upgrading`, and removing an absent annotation is a no-op — so this
-/// runs unconditionally rather than branching on the upgrade phase. Errors are
-/// logged and swallowed: the cluster may already be gone, and failing here would
-/// strand the finalizer and block the deletion entirely.
+/// Only releases state this upgrade actually owns. The operation lock records a
+/// type, not an owner, and two ValkeyUpgrades can target the same cluster —
+/// `start_operation` deliberately allows a second acquisition of a matching type.
+/// Releasing unconditionally would let `kubectl delete valkeyupgrade <old>` unlock
+/// a cluster that a *different* upgrade is still mid-failover on, which would both
+/// let a scaling operation start concurrently and drop the webhook's spec-edit
+/// protection. Ownership is read from the `upgrade-name` annotation that
+/// `set_upgrade_annotation` writes alongside the lock.
+///
+/// Errors are logged and swallowed: the cluster may already be gone, and failing
+/// here would strand the finalizer and block the deletion entirely.
 async fn release_cluster_for_deleted_upgrade(obj: &ValkeyUpgrade, ctx: &Context, namespace: &str) {
     let name = obj.name_any();
     let cluster_name = &obj.spec.cluster_ref.name;
@@ -2256,6 +2262,23 @@ async fn release_cluster_for_deleted_upgrade(obj: &ValkeyUpgrade, ctx: &Context,
         .as_deref()
         .unwrap_or(namespace);
     let cluster_api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), cluster_namespace);
+
+    let cluster = match cluster_api.get(cluster_name).await {
+        Ok(c) => c,
+        Err(e) => {
+            log_cleanup_failure(&name, cluster_name, &Error::Kube(e), "read cluster");
+            return;
+        }
+    };
+
+    if !owns_upgrade_lock(&cluster, &name) {
+        info!(
+            name = %name,
+            cluster = %cluster_name,
+            "Deleted upgrade does not own the cluster's upgrade lock, leaving it alone"
+        );
+        return;
+    }
 
     if let Err(e) = operation_coordination::complete_operation(
         &cluster_api,
@@ -2269,6 +2292,19 @@ async fn release_cluster_for_deleted_upgrade(obj: &ValkeyUpgrade, ctx: &Context,
 
     if let Err(e) = clear_upgrade_annotation(&ctx.client, cluster_name, cluster_namespace).await {
         log_cleanup_failure(&name, cluster_name, &e, "clear upgrade annotation");
+    }
+}
+
+/// Whether `upgrade_name` is the upgrade that claimed this cluster.
+///
+/// An absent annotation means no upgrade completed the claim — `start_operation`
+/// runs before `set_upgrade_annotation`, so the lock can exist without it — and
+/// that orphaned lock is exactly what leaks if nobody releases it. A different
+/// name means another upgrade is in flight and owns both.
+pub(crate) fn owns_upgrade_lock(cluster: &ValkeyCluster, upgrade_name: &str) -> bool {
+    match cluster.annotations().get(UPGRADE_NAME_ANNOTATION) {
+        Some(owner) => owner == upgrade_name,
+        None => true,
     }
 }
 
@@ -2666,6 +2702,50 @@ async fn update_shard_status_with_error(
 )]
 mod tests {
     use super::*;
+
+    mod upgrade_lock_ownership {
+        use super::*;
+
+        fn cluster_owned_by(owner: Option<&str>) -> ValkeyCluster {
+            let mut cluster = create_test_cluster("c", ClusterPhase::Running);
+            if let Some(owner) = owner {
+                cluster.metadata.annotations = Some(std::collections::BTreeMap::from([
+                    (
+                        UPGRADE_IN_PROGRESS_ANNOTATION.to_string(),
+                        "true".to_string(),
+                    ),
+                    (UPGRADE_NAME_ANNOTATION.to_string(), owner.to_string()),
+                ]));
+            }
+            cluster
+        }
+
+        #[test]
+        fn test_owns_lock_when_annotation_names_this_upgrade() {
+            assert!(owns_upgrade_lock(
+                &cluster_owned_by(Some("upgrade-a")),
+                "upgrade-a"
+            ));
+        }
+
+        /// Deleting an old ValkeyUpgrade must not unlock a cluster that a
+        /// different upgrade is still mid-failover on — that would let a scaling
+        /// operation start concurrently and drop the webhook's spec-edit block.
+        #[test]
+        fn test_does_not_own_lock_held_by_another_upgrade() {
+            assert!(!owns_upgrade_lock(
+                &cluster_owned_by(Some("upgrade-a")),
+                "upgrade-b"
+            ));
+        }
+
+        /// start_operation runs before set_upgrade_annotation, so a lock can
+        /// exist with no recorded owner. That is the orphan #167 is about.
+        #[test]
+        fn test_owns_unclaimed_lock() {
+            assert!(owns_upgrade_lock(&cluster_owned_by(None), "upgrade-a"));
+        }
+    }
 
     mod status_clearing {
         use super::*;

@@ -207,8 +207,13 @@ pub fn derive_cluster_conditions(
     // cluster at all, not that every master vanished — don't flap Ready on that.
     // Use the explicit count rather than `is_healthy`, which also folds in
     // slots_pfail/slots_fail and would flap on transient gossip state.
+    //
+    // `>=` rather than `==`: healthy_masters_count() counts every non-failed node
+    // carrying the master flag, including slot-free ones — a replica that lost its
+    // PVC rejoins as an empty master until CLUSTER REPLICATE runs. A surplus there
+    // is not an outage, and flagging it would make Ready flap on a serving cluster.
     let masters_match = health_status
-        .is_none_or(|h| h.healthy_masters == 0 || h.healthy_masters == h.expected_masters);
+        .is_none_or(|h| h.healthy_masters == 0 || h.healthy_masters >= h.expected_masters);
     let ready = phase == ClusterPhase::Running
         && ready_pods == desired_pods
         && desired_pods > 0

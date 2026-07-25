@@ -12,7 +12,9 @@
 //!
 //! This ensures tests stay in sync with production behavior automatically.
 
-use valkey_operator::controller::cluster_phases::{PhaseContext, ScaleDirection};
+use valkey_operator::controller::cluster_phases::{
+    FailedSpecChange, PhaseContext, ScaleDirection, failed_spec_change,
+};
 use valkey_operator::controller::cluster_state_machine::{
     ClusterEvent, ClusterStateMachine, TransitionContext, TransitionResult, determine_event,
 };
@@ -413,12 +415,29 @@ impl MockClusterState {
     /// The scale detection logic here must mirror the detection logic in:
     /// - `cluster_phases.rs:handle_running()` - Running state scale detection
     /// - `cluster_phases.rs:handle_degraded()` - Degraded state scale detection
+    /// - `cluster_reconciler.rs:handle_failed_phase()` - Failed-phase spec changes
     ///
     /// When adding new events or changing detection logic in production,
     /// update this function accordingly. See CLAUDE.md for details.
     fn determine_next_event(&self) -> ClusterEvent {
         // For Running and Degraded phases, use production scale_direction() for scale detection
         match self.phase {
+            // Mirrors handle_failed_phase: a spec edit that REDUCES the cluster must
+            // not take the Pending route, because Pending leads to Creating, which
+            // force-applies the shrunken StatefulSet and terminates slot-owning
+            // masters before evacuation. Uses the production decision function so the
+            // two cannot drift.
+            ClusterPhase::Failed if self.spec_changed => {
+                match failed_spec_change(&self.to_phase_context()) {
+                    FailedSpecChange::EvacuateSlots => return ClusterEvent::ScaleDownDetected,
+                    FailedSpecChange::RemoveNodes => {
+                        return ClusterEvent::ReplicaScaleDownDetected;
+                    }
+                    // Not a reduction: fall through to determine_event, which fires
+                    // SpecChanged and retries from Pending.
+                    FailedSpecChange::RetryFromPending => {}
+                }
+            }
             ClusterPhase::Running | ClusterPhase::Degraded => {
                 // Use production scale_direction() method from PhaseContext.
                 // Mirrors handle_running/handle_degraded in cluster_phases.rs:
