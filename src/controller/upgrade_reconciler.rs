@@ -497,7 +497,9 @@ async fn handle_inprogress_phase(
             new_status.current_shard = current_shard + 1;
             new_status.upgraded_shards = current_shard + 1;
             new_status.progress = format!("{}/{} shards upgraded", current_shard + 1, total_shards);
-            // Clear sync tracking when moving to next shard
+            // Clear sync tracking when moving to next shard. Assigning None only
+            // keeps the in-memory struct truthful; clear_sync_tracking below is
+            // what actually removes the fields server-side.
             new_status.sync_started_at = None;
             new_status.sync_elapsed_seconds = None;
             merge_into_status(
@@ -506,6 +508,7 @@ async fn handle_inprogress_phase(
                 obj.metadata.generation,
             );
             update_status(api, &name, new_status).await?;
+            clear_sync_tracking(api, &name).await?;
             Ok(Action::requeue(Duration::from_secs(1)))
         }
         ShardUpgradeState::Failed => {
@@ -726,6 +729,7 @@ async fn check_replicas_upgraded(
         new_status.pod_ready_started_at = None;
         new_status.pod_ready_elapsed_seconds = None;
         update_status(api, &name, new_status).await?;
+        clear_pod_ready_tracking(api, &name).await?;
         update_shard_status(api, &name, shard_index, ShardUpgradeState::WaitingForSync).await?;
         return Ok(Action::requeue(Duration::from_secs(1)));
     }
@@ -793,6 +797,8 @@ async fn check_replicas_upgraded(
     new_status.sync_started_at = None;
     new_status.sync_elapsed_seconds = None;
     update_status(api, &name, new_status).await?;
+    clear_pod_ready_tracking(api, &name).await?;
+    clear_sync_tracking(api, &name).await?;
 
     update_shard_status(api, &name, shard_index, ShardUpgradeState::WaitingForSync).await?;
 
@@ -931,6 +937,7 @@ async fn wait_for_replication_sync(
             new_status.sync_started_at = None;
             new_status.sync_elapsed_seconds = None;
             update_status(api, &name, new_status).await?;
+            clear_sync_tracking(api, &name).await?;
             update_shard_status(api, &name, shard_index, ShardUpgradeState::FailingOver).await?;
             Ok(Action::requeue(Duration::from_secs(1)))
         }
@@ -1383,6 +1390,7 @@ async fn wait_for_cluster_stable(
         new_status.sync_started_at = None;
         new_status.sync_elapsed_seconds = None;
         update_status(api, &name, new_status).await?;
+        clear_sync_tracking(api, &name).await?;
 
         return Ok(Action::requeue(Duration::from_secs(1)));
     }
@@ -1548,6 +1556,7 @@ async fn wait_for_cluster_stable(
     new_status.sync_started_at = None;
     new_status.sync_elapsed_seconds = None;
     update_status(api, &name, new_status).await?;
+    clear_sync_tracking(api, &name).await?;
 
     update_shard_status(
         api,
@@ -2510,6 +2519,49 @@ async fn update_phase(
     update_status(api, name, status).await
 }
 
+/// Serialized names of the replication-sync timeout tracking fields.
+const SYNC_TRACKING_FIELDS: [&str; 2] = ["syncStartedAt", "syncElapsedSeconds"];
+
+/// Serialized names of the pod-readiness timeout tracking fields.
+const POD_READY_TRACKING_FIELDS: [&str; 2] = ["podReadyStartedAt", "podReadyElapsedSeconds"];
+
+/// Delete status fields server-side using explicit nulls.
+///
+/// `ValkeyUpgradeStatus` marks its optional fields `skip_serializing_if =
+/// "Option::is_none"`, so assigning `None` and sending the struct through
+/// [`update_status`] drops the keys entirely — and under RFC 7386 an omitted key
+/// means "leave unchanged". Clearing therefore has to name the fields explicitly.
+async fn clear_status_fields(
+    api: &Api<ValkeyUpgrade>,
+    name: &str,
+    fields: &[&str],
+) -> Result<(), Error> {
+    let mut status = serde_json::Map::new();
+    for field in fields {
+        status.insert((*field).to_owned(), serde_json::Value::Null);
+    }
+
+    let patch = serde_json::json!({ "status": status });
+    api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+    Ok(())
+}
+
+/// Clear replication-sync timeout tracking so the next shard starts from zero.
+///
+/// Without this the elapsed time accumulates across the whole upgrade while each
+/// shard is measured against the per-shard `replicationSyncTimeoutSeconds`, so
+/// once total wall-clock exceeds that budget the next shard fails on entry and
+/// takes the entire cluster into rollback.
+async fn clear_sync_tracking(api: &Api<ValkeyUpgrade>, name: &str) -> Result<(), Error> {
+    clear_status_fields(api, name, &SYNC_TRACKING_FIELDS).await
+}
+
+/// Clear pod-readiness timeout tracking so the next wait starts from zero.
+async fn clear_pod_ready_tracking(api: &Api<ValkeyUpgrade>, name: &str) -> Result<(), Error> {
+    clear_status_fields(api, name, &POD_READY_TRACKING_FIELDS).await
+}
+
 /// Update the full status of an upgrade
 async fn update_status(
     api: &Api<ValkeyUpgrade>,
@@ -2614,6 +2666,61 @@ async fn update_shard_status_with_error(
 )]
 mod tests {
     use super::*;
+
+    mod status_clearing {
+        use super::*;
+
+        /// The tracking fields are `skip_serializing_if = "Option::is_none"`, so
+        /// assigning None drops them from the merge patch — and RFC 7386 preserves
+        /// omitted keys. This is the mechanism the explicit-null clear works around.
+        #[test]
+        fn test_none_tracking_fields_are_omitted_from_the_struct_patch() {
+            let status = ValkeyUpgradeStatus {
+                sync_started_at: None,
+                sync_elapsed_seconds: None,
+                pod_ready_started_at: None,
+                pod_ready_elapsed_seconds: None,
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&status).unwrap();
+
+            for field in SYNC_TRACKING_FIELDS
+                .iter()
+                .chain(&POD_READY_TRACKING_FIELDS)
+            {
+                assert_eq!(
+                    json.get(field),
+                    None,
+                    "{field} is omitted when None, so a merge patch cannot clear it this way"
+                );
+            }
+        }
+
+        /// The clear constants must match the serialized names, or the null patch
+        /// silently adds unknown keys and leaves the real fields untouched.
+        #[test]
+        fn test_tracking_field_names_match_the_serialized_status() {
+            let status = ValkeyUpgradeStatus {
+                sync_started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                sync_elapsed_seconds: Some(42),
+                pod_ready_started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                pod_ready_elapsed_seconds: Some(7),
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&status).unwrap();
+
+            for field in SYNC_TRACKING_FIELDS
+                .iter()
+                .chain(&POD_READY_TRACKING_FIELDS)
+            {
+                assert!(
+                    json.get(field).is_some(),
+                    "{field} does not match the serialized status field name"
+                );
+            }
+        }
+    }
+
     use crate::crd::{
         AuthSpec, ClusterPhase, ClusterReference, ImageSpec, IssuerRef, PersistenceSpec,
         ResourceRequirementsSpec, SchedulingSpec, SecretKeyRef, TlsSpec, ValkeyCluster,
