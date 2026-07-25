@@ -2203,7 +2203,17 @@ async fn initialize_shard_statuses(
     Ok(shard_statuses)
 }
 
-/// Handle deletion of a ValkeyUpgrade
+/// Handle deletion of a ValkeyUpgrade.
+///
+/// Releases the cluster's operation lock and the upgrade annotation before
+/// dropping the finalizer. Deletion is reached before any phase dispatch, so
+/// none of the handlers that normally release the lock ever run; without this
+/// cleanup a ValkeyUpgrade deleted mid-flight leaves the cluster with
+/// `currentOperation = "upgrading"` forever, which blocks every future scaling
+/// operation and makes the admission webhook reject spec edits. The cluster
+/// reconciler deliberately never clears an Upgrading lock (it belongs to this
+/// FSM), and there is no lease or TTL behind it, so this is the only automatic
+/// release path.
 async fn handle_deletion(
     obj: &ValkeyUpgrade,
     ctx: &Context,
@@ -2212,10 +2222,66 @@ async fn handle_deletion(
     let name = obj.name_any();
     info!(name = %name, "Handling deletion");
 
+    release_cluster_for_deleted_upgrade(obj, ctx, namespace).await;
+
     let api: Api<ValkeyUpgrade> = Api::namespaced(ctx.client.clone(), namespace);
     remove_finalizer(&api, &name, UPGRADE_FINALIZER).await?;
 
     Ok(Action::await_change())
+}
+
+/// Best-effort release of the cluster state this upgrade owns.
+///
+/// Both operations are idempotent — `complete_operation` only clears a lock that
+/// matches `Upgrading`, and removing an absent annotation is a no-op — so this
+/// runs unconditionally rather than branching on the upgrade phase. Errors are
+/// logged and swallowed: the cluster may already be gone, and failing here would
+/// strand the finalizer and block the deletion entirely.
+async fn release_cluster_for_deleted_upgrade(obj: &ValkeyUpgrade, ctx: &Context, namespace: &str) {
+    let name = obj.name_any();
+    let cluster_name = &obj.spec.cluster_ref.name;
+    let cluster_namespace = obj
+        .spec
+        .cluster_ref
+        .namespace
+        .as_deref()
+        .unwrap_or(namespace);
+    let cluster_api: Api<ValkeyCluster> = Api::namespaced(ctx.client.clone(), cluster_namespace);
+
+    if let Err(e) = operation_coordination::complete_operation(
+        &cluster_api,
+        cluster_name,
+        OperationType::Upgrading,
+    )
+    .await
+    {
+        log_cleanup_failure(&name, cluster_name, &e, "release upgrade operation lock");
+    }
+
+    if let Err(e) = clear_upgrade_annotation(&ctx.client, cluster_name, cluster_namespace).await {
+        log_cleanup_failure(&name, cluster_name, &e, "clear upgrade annotation");
+    }
+}
+
+/// Log a best-effort cleanup failure during upgrade deletion.
+///
+/// A missing cluster is the expected case when the ValkeyCluster was deleted
+/// first, so it is not worth a warning — there is nothing left to unlock.
+fn log_cleanup_failure(name: &str, cluster_name: &str, error: &Error, action: &str) {
+    if error.is_not_found() {
+        debug!(
+            name = %name,
+            cluster = %cluster_name,
+            "Cluster is already gone, nothing to {action}"
+        );
+    } else {
+        warn!(
+            name = %name,
+            cluster = %cluster_name,
+            error = %error,
+            "Failed to {action} while deleting upgrade"
+        );
+    }
 }
 
 /// Update the phase of an upgrade
