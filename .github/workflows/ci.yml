@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# Every job here only reads the checkout; matches integration.yml.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -34,7 +38,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
-    name: Unit Tests
+    name: Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,7 +46,20 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: cargo test --test unit
+      # Each suite under tests/ is a separate binary declared in Cargo.toml, and
+      # `--test <name>` runs only that one; inline #[test] fns in src/ need --lib.
+      # Running just `--test unit` executed 61 of ~660 tests, so the functional
+      # state-machine suite and every inline test were never run on a PR.
+      # Kept as separate steps so a failure names the suite that broke.
+      # tests/integration is excluded: it is #[ignore]d and needs a live cluster.
+      - name: Library tests
+        run: cargo test --lib
+      - name: Unit tests
+        run: cargo test --test unit
+      - name: Functional tests
+        run: cargo test --test functional
+      - name: Property tests
+        run: cargo test --test proptest
 
   helm:
     name: Helm Chart Validation
