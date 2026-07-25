@@ -159,24 +159,36 @@ pub(crate) async fn execute_scale_down(
         );
     }
 
-    let orphans_with_slots: Vec<_> = orphaned_masters
-        .iter()
-        .filter(|n| !n.slots.is_empty())
-        .collect();
-
-    if !orphans_with_slots.is_empty() {
-        warn!(
-            orphans_with_slots = orphans_with_slots.len(),
-            orphan_ids = ?orphans_with_slots.iter().map(|n| &n.node_id).collect::<Vec<_>>(),
-            "Orphaned nodes have slots - cannot migrate from deleted pods. \
-             These nodes will be forgotten, which may cause data loss."
-        );
+    // Slots cannot be migrated off a pod that no longer exists, and CLUSTER
+    // FORGET would leave them unowned, so refuse rather than lose the keys.
+    // Mirrors the guard in execute_rebalance_slots for excluded slot owners.
+    let mut orphan_slot_count = 0usize;
+    let mut orphan_slot_owners: Vec<String> = Vec::new();
+    for node in &orphaned_masters {
+        if node.slots.is_empty() {
+            continue;
+        }
+        for range in &node.slots {
+            orphan_slot_count += usize::from(range.count());
+        }
+        orphan_slot_owners.push(node.node_id.to_string());
     }
 
-    if nodes_to_remove.is_empty() && orphaned_masters.is_empty() {
+    if !orphan_slot_owners.is_empty() {
+        return Err(ValkeyError::SlotMigrationFailed(format!(
+            "{} slot(s) are still owned by node(s) [{}] whose pods no longer exist; \
+             slots cannot be migrated off a deleted pod and CLUSTER FORGET would \
+             leave them unowned. Restore the pod(s) so their slots can be migrated, \
+             or reassign the slots manually with CLUSTER SETSLOT, before scaling down",
+            orphan_slot_count,
+            orphan_slot_owners.join(", "),
+        )));
+    }
+
+    if nodes_to_remove.is_empty() {
         return Err(ValkeyError::InvalidConfig(format!(
             "Scale-down failed: no nodes found to remove. Expected ordinals {:?}, but none matched IPs. \
-             Master IPs: {:?}, IP→ordinal map: {:?}. No orphan nodes found either.",
+             Master IPs: {:?}, IP→ordinal map: {:?}",
             ordinals_to_remove,
             masters.iter().map(|m| &m.ip).collect::<Vec<_>>(),
             ip_to_ordinal
@@ -192,7 +204,7 @@ pub(crate) async fn execute_scale_down(
         .copied()
         .collect();
 
-    if remaining_masters.is_empty() && !nodes_to_remove.is_empty() {
+    if remaining_masters.is_empty() {
         return Err(ValkeyError::InvalidConfig(
             "Cannot scale down: no remaining masters to receive slots".to_string(),
         ));
@@ -303,8 +315,12 @@ pub(crate) async fn execute_scale_down(
     // orphaned entries that reappear in CLUSTER NODES. Use the all-nodes quorum helper
     // (also used by deletion) so the removal sticks, and only report nodes as removed
     // once FORGET has achieved quorum.
+    //
+    // Only the nodes this scale-down evacuated are forgotten here. Orphans are
+    // removed by the RemovingNodesFromCluster phase, which runs immediately after
+    // EvacuatingSlots and checks each node individually.
     let mut node_ids_to_forget: Vec<crate::crd::NodeId> = Vec::new();
-    for node in nodes_to_remove.iter().chain(orphaned_masters.iter()) {
+    for node in &nodes_to_remove {
         if !node_ids_to_forget.contains(&node.node_id) {
             node_ids_to_forget.push(node.node_id.clone());
         }
@@ -313,7 +329,17 @@ pub(crate) async fn execute_scale_down(
     if !node_ids_to_forget.is_empty() {
         super::deletion::forget_nodes_with_quorum(obj, ctx, namespace, &node_ids_to_forget)
             .await
-            .map_err(|e| ValkeyError::Connection(format!("CLUSTER FORGET failed: {}", e)))?;
+            .map_err(|e| {
+                // Preserve the retry classification: a refusal to forget a
+                // slot-owning node is permanent, and mapping it to Connection
+                // would make is_retryable() report it as transient.
+                let message = format!("CLUSTER FORGET failed: {}", e);
+                if e.is_retryable() {
+                    ValkeyError::Connection(message)
+                } else {
+                    ValkeyError::SlotMigrationFailed(message)
+                }
+            })?;
         result.nodes_removed = node_ids_to_forget;
     }
 

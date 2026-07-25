@@ -229,6 +229,148 @@ mod error_tests {
         let transient_err = Error::Transient("temporary failure".to_string());
         assert!(transient_err.is_retryable());
     }
+
+    #[test]
+    fn test_unsafe_forget_is_not_retryable() {
+        // Retrying cannot make a slot-owning node safe to forget; an operator
+        // has to migrate or recover it first.
+        let error = Error::UnsafeForget {
+            node_count: 1,
+            detail: "abc owns 5461 slot(s)".to_string(),
+        };
+
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("5461 slot(s)"));
+    }
+}
+
+mod orphan_detection_tests {
+    use valkey_operator::client::types::ParsedClusterNodes;
+    use valkey_operator::controller::cluster_topology::{PodIdentity, classify_orphans};
+
+    const NODE_A: &str = "1111111111111111111111111111111111111111";
+    const NODE_B: &str = "2222222222222222222222222222222222222222";
+
+    fn pod(name: &str, ip: Option<&str>) -> PodIdentity {
+        PodIdentity {
+            pod_name: name.to_string(),
+            ip: ip.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_stale_ip_with_matching_hostname_is_not_orphaned() {
+        // Regression for #169: a pod that restarts comes back with a new IP, so
+        // the IP in CLUSTER NODES lags behind the pod's IP for a few seconds.
+        // Matching on the announced hostname keeps the node out of the
+        // CLUSTER FORGET batch.
+        let nodes = ParsedClusterNodes::parse(&format!(
+            "{NODE_A} 10.0.0.9:6379@16379,c-0.c-headless.default.svc.cluster.local master - 0 1 1 connected 0-16383"
+        ))
+        .expect("should parse");
+        let pods = vec![pod("c-0", Some("10.0.0.42"))];
+
+        let report = classify_orphans(&nodes, &pods);
+
+        assert!(report.orphaned.is_empty(), "restarted pod is not an orphan");
+        assert!(report.inconclusive.is_empty());
+    }
+
+    #[test]
+    fn test_handshake_node_is_inconclusive() {
+        // A node in handshake reports ":0@0" until its address is known.
+        let nodes =
+            ParsedClusterNodes::parse(&format!("{NODE_A} :0@0 handshake - 0 0 0 disconnected"))
+                .expect("should parse");
+        let pods = vec![pod("c-0", Some("10.0.0.1"))];
+
+        let report = classify_orphans(&nodes, &pods);
+
+        assert!(report.orphaned.is_empty());
+        assert_eq!(report.inconclusive.len(), 1);
+        let (_, reason) = report.inconclusive.first().expect("one inconclusive node");
+        assert_eq!(*reason, "handshake/noaddr");
+    }
+
+    #[test]
+    fn test_pod_without_ip_makes_hostless_node_inconclusive() {
+        // A Pending pod has no IP yet, so an unmatched hostless node could
+        // belong to it.
+        let nodes = ParsedClusterNodes::parse(&format!(
+            "{NODE_A} 10.0.0.9:6379@16379 master - 0 1 1 connected"
+        ))
+        .expect("should parse");
+        let pods = vec![pod("c-0", Some("10.0.0.1")), pod("c-1", None)];
+
+        let report = classify_orphans(&nodes, &pods);
+
+        assert!(report.orphaned.is_empty());
+        assert_eq!(report.inconclusive.len(), 1);
+        let (_, reason) = report.inconclusive.first().expect("one inconclusive node");
+        assert_eq!(*reason, "pod without IP present");
+    }
+
+    #[test]
+    fn test_deleted_pod_is_orphaned() {
+        // Hostname and IP both point at a pod that no longer exists.
+        let nodes = ParsedClusterNodes::parse(&format!(
+            "{NODE_A} 10.0.0.9:6379@16379,c-5.c-headless.default.svc.cluster.local master - 0 1 1 connected"
+        ))
+        .expect("should parse");
+        let pods = vec![pod("c-0", Some("10.0.0.1"))];
+
+        let report = classify_orphans(&nodes, &pods);
+
+        assert_eq!(report.orphaned.len(), 1);
+        let orphan = report.orphaned.first().expect("one orphan");
+        assert_eq!(orphan.node_id, NODE_A);
+        assert!(report.inconclusive.is_empty());
+    }
+
+    #[test]
+    fn test_orphan_owning_slots_is_still_orphaned() {
+        // Classification answers "does a pod back this node", not "is it safe
+        // to forget" — the slot check lives in forget_nodes_with_quorum.
+        let nodes = ParsedClusterNodes::parse(&format!(
+            "{NODE_A} 10.0.0.9:6379@16379,c-5.c-headless.default.svc.cluster.local master - 0 1 1 connected 0-5460"
+        ))
+        .expect("should parse");
+        let pods = vec![pod("c-0", Some("10.0.0.1"))];
+
+        let report = classify_orphans(&nodes, &pods);
+
+        assert_eq!(report.orphaned.len(), 1);
+        let orphan = report.orphaned.first().expect("one orphan");
+        assert_eq!(orphan.slot_count(), 5461);
+    }
+
+    #[test]
+    fn test_matching_ip_without_hostname_is_matched() {
+        let nodes = ParsedClusterNodes::parse(&format!(
+            "{NODE_A} 10.0.0.1:6379@16379 master - 0 1 1 connected"
+        ))
+        .expect("should parse");
+        let pods = vec![pod("c-0", Some("10.0.0.1"))];
+
+        let report = classify_orphans(&nodes, &pods);
+
+        assert!(report.orphaned.is_empty());
+        assert!(report.inconclusive.is_empty());
+    }
+
+    #[test]
+    fn test_no_pods_leaves_every_addressed_node_orphaned() {
+        let nodes = ParsedClusterNodes::parse(&format!(
+            "{NODE_A} 10.0.0.1:6379@16379,c-0.c-headless.default.svc.cluster.local master - 0 1 1 connected\n\
+             {NODE_B} 10.0.0.2:6379@16379,c-1.c-headless.default.svc.cluster.local master - 0 1 2 connected"
+        ))
+        .expect("should parse");
+
+        let report = classify_orphans(&nodes, &[]);
+
+        assert_eq!(report.orphaned.len(), 2);
+        assert!(report.inconclusive.is_empty());
+    }
 }
 
 mod builder_tests {

@@ -33,14 +33,14 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::ListParams;
 use kube::{Api, Client};
 
 use crate::client::ValkeyError;
-use crate::client::types::{ParsedClusterNodes, SlotRange};
+use crate::client::types::{ClusterNode, ParsedClusterNodes, SlotRange};
 
 // Re-export so callers that import NodeRole from this module still compile.
 pub use crate::client::types::NodeRole;
@@ -86,6 +86,112 @@ pub fn extract_ordinal_from_address(address: &str) -> Option<u16> {
     // Extract ordinal from pod name (last part after last hyphen)
     let ordinal_str = pod_name.rsplit('-').next()?;
     ordinal_str.parse().ok()
+}
+
+// ============================================================================
+// Orphan Classification
+// ============================================================================
+
+/// The subset of pod state needed to decide whether a cluster node is orphaned.
+///
+/// Kept separate from [`ClusterNodeInfo`] so orphan classification is a pure
+/// function that can be exercised without a Kubernetes client.
+#[derive(Debug, Clone)]
+pub struct PodIdentity {
+    /// StatefulSet pod name (e.g. `my-cluster-0`).
+    pub pod_name: String,
+    /// Pod IP, or `None` while the pod is Pending/ContainerCreating.
+    pub ip: Option<String>,
+}
+
+/// Classification of a single `CLUSTER NODES` entry against the live pod set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanVerdict {
+    /// The node belongs to a pod that still exists.
+    Matched,
+    /// Not enough information to decide; treat the node as live.
+    Inconclusive(&'static str),
+    /// The node has no backing pod and can be removed from the cluster.
+    Orphaned,
+}
+
+/// Outcome of classifying every node in a `CLUSTER NODES` listing.
+#[derive(Debug, Default)]
+pub struct OrphanReport<'a> {
+    /// Nodes with no backing pod.
+    pub orphaned: Vec<&'a ClusterNode>,
+    /// Nodes that could not be classified, with the reason.
+    pub inconclusive: Vec<(&'a ClusterNode, &'static str)>,
+}
+
+/// Classify every cluster node as matched, inconclusive, or orphaned.
+///
+/// IP membership alone is not enough: a pod that restarts comes back with a new
+/// IP, and a Pending pod has no IP at all, so a pure IP check reports live nodes
+/// as orphaned. Because the operator always sets `--cluster-announce-hostname`,
+/// the announced hostname's leading DNS label is the pod name and survives
+/// restarts, so it is checked first. Anything still undecided is reported as
+/// inconclusive rather than orphaned — callers remove orphans with
+/// `CLUSTER FORGET`, which is irreversible.
+pub fn classify_orphans<'a>(
+    cluster_nodes: &'a ParsedClusterNodes,
+    pods: &[PodIdentity],
+) -> OrphanReport<'a> {
+    let mut pod_names: HashSet<&str> = HashSet::with_capacity(pods.len());
+    let mut pod_ips: HashSet<&str> = HashSet::with_capacity(pods.len());
+    let mut pod_without_ip = false;
+
+    for pod in pods {
+        pod_names.insert(pod.pod_name.as_str());
+        match pod.ip.as_deref() {
+            Some(ip) => {
+                pod_ips.insert(ip);
+            }
+            None => pod_without_ip = true,
+        }
+    }
+
+    let mut report = OrphanReport::default();
+    for node in &cluster_nodes.nodes {
+        match classify_node(node, &pod_names, &pod_ips, pod_without_ip) {
+            OrphanVerdict::Matched => {}
+            OrphanVerdict::Inconclusive(reason) => report.inconclusive.push((node, reason)),
+            OrphanVerdict::Orphaned => report.orphaned.push(node),
+        }
+    }
+    report
+}
+
+fn classify_node(
+    node: &ClusterNode,
+    pod_names: &HashSet<&str>,
+    pod_ips: &HashSet<&str>,
+    pod_without_ip: bool,
+) -> OrphanVerdict {
+    // A node in handshake, or one flagged noaddr, has no usable address yet.
+    // `parse_line` yields an empty IP for the ":0@0" placeholder.
+    if node.flags.handshake || node.flags.noaddr || node.ip.is_empty() {
+        return OrphanVerdict::Inconclusive("handshake/noaddr");
+    }
+
+    if let Some(hostname) = node.hostname.as_deref() {
+        let pod_name = hostname.split('.').next().unwrap_or(hostname);
+        if pod_names.contains(pod_name) {
+            return OrphanVerdict::Matched;
+        }
+    }
+
+    if pod_ips.contains(node.ip.as_str()) {
+        return OrphanVerdict::Matched;
+    }
+
+    // Without a hostname the only evidence is the IP, and a pod that has not
+    // been assigned one yet could be this node's owner.
+    if node.hostname.is_none() && pod_without_ip {
+        return OrphanVerdict::Inconclusive("pod without IP present");
+    }
+
+    OrphanVerdict::Orphaned
 }
 
 // ============================================================================
@@ -308,6 +414,14 @@ impl ClusterTopology {
                 continue;
             };
 
+            // A pod being deleted keeps its IP until the kubelet finishes, which
+            // would keep its cluster node looking live during a scale-down. Pods
+            // in Pending are deliberately kept: they have no IP yet, and orphan
+            // classification needs to see them to stay conservative.
+            if pod.metadata.deletion_timestamp.is_some() {
+                continue;
+            }
+
             // Extract ordinal from pod name (e.g., "my-cluster-3" -> 3)
             let ordinal_raw = pod_name
                 .rsplit('-')
@@ -500,22 +614,32 @@ impl ClusterTopology {
 
     /// Find orphaned nodes - nodes in the cluster with no matching pod.
     ///
-    /// This uses IP matching instead of ordinal extraction, fixing the bug
-    /// where `extract_ordinal_from_address` fails on IP addresses.
-    ///
-    /// Orphaned nodes are cluster nodes whose IP doesn't match any current pod IP.
+    /// Matching is by announced hostname first and pod IP second, so a pod that
+    /// restarted with a new IP is not misreported as orphaned. Nodes that cannot
+    /// be classified are omitted; use [`ClusterTopology::orphan_report`] to see
+    /// them.
     pub fn orphaned_nodes<'a>(
         &self,
         cluster_nodes: &'a ParsedClusterNodes,
-    ) -> Vec<&'a crate::client::types::ClusterNode> {
-        let pod_ips: std::collections::HashSet<&str> =
-            self.nodes.iter().filter_map(|n| n.ip()).collect();
+    ) -> Vec<&'a ClusterNode> {
+        classify_orphans(cluster_nodes, &self.pod_identities()).orphaned
+    }
 
-        cluster_nodes
-            .nodes
-            .iter()
-            .filter(|cn| !pod_ips.contains(cn.ip.as_str()))
-            .collect()
+    /// Classify every cluster node, keeping the nodes that could not be decided.
+    pub fn orphan_report<'a>(&self, cluster_nodes: &'a ParsedClusterNodes) -> OrphanReport<'a> {
+        classify_orphans(cluster_nodes, &self.pod_identities())
+    }
+
+    /// Project the topology's pods down to the fields orphan detection needs.
+    fn pod_identities(&self) -> Vec<PodIdentity> {
+        let mut identities = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            identities.push(PodIdentity {
+                pod_name: node.pod_name.clone(),
+                ip: node.ip().map(str::to_string),
+            });
+        }
+        identities
     }
 
     /// Find nodes that should be removed during scale-down.
@@ -806,6 +930,27 @@ mod tests {
         let topology = make_topology(vec![node]);
 
         assert_eq!(topology.total_slots_assigned(), 10923);
+    }
+
+    #[test]
+    fn test_orphaned_nodes_matches_restarted_pod_by_hostname() {
+        // make_node(0) is pod "test-cluster-0" at 10.0.0.1. The cluster still
+        // reports the pre-restart IP for it, so only the node whose hostname
+        // names a pod that does not exist may be treated as an orphan.
+        let topology = make_topology(vec![make_node(0, NodeRole::Master, Some("node-0"))]);
+        let cluster_nodes = ParsedClusterNodes::parse(
+            "1111111111111111111111111111111111111111 10.0.0.77:6379@16379,test-cluster-0.test-cluster-headless.default.svc.cluster.local master - 0 1 1 connected 0-5460\n\
+             2222222222222222222222222222222222222222 10.0.0.88:6379@16379,test-cluster-9.test-cluster-headless.default.svc.cluster.local master - 0 1 2 connected",
+        )
+        .unwrap();
+
+        let orphans = topology.orphaned_nodes(&cluster_nodes);
+
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(
+            orphans[0].node_id,
+            "2222222222222222222222222222222222222222"
+        );
     }
 
     #[test]

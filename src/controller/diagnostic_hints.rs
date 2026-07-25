@@ -463,6 +463,8 @@ impl DiagnosticHint {
                 "Target nodes unreachable or full",
                 "Network issues during slot transfer",
                 "Slots stuck in migrating/importing state",
+                "A master still owns slots but its pod is gone, so the slots cannot be \
+                 migrated and the scale-down is refused to avoid losing the keys",
             ],
             commands: vec![
                 DiagnosticCommand::new(
@@ -495,6 +497,18 @@ impl DiagnosticHint {
                         "# To clear a stuck slot, run on BOTH source and target nodes:\n# kubectl exec -n {namespace} {cluster_name}-0 -- valkey-cli --tls --cert /tls/tls.crt --key /tls/tls.key --cacert /tls/ca.crt -a \"$VALKEY_PASSWORD\" CLUSTER SETSLOT <slot_number> STABLE"
                     ),
                 ),
+                DiagnosticCommand::new(
+                    "Find slot owners whose pod no longer exists",
+                    format!(
+                        "# Cross-check the node IPs that own slots against running pod IPs:\nkubectl exec -n {namespace} {cluster_name}-0 -- valkey-cli --tls --cert /tls/tls.crt --key /tls/tls.key --cacert /tls/ca.crt -a \"$VALKEY_PASSWORD\" CLUSTER NODES | grep master\nkubectl get pods -n {namespace} -l app.kubernetes.io/instance={cluster_name} -o wide"
+                    ),
+                ),
+                DiagnosticCommand::new(
+                    "Recover a missing slot owner (CAUTION: manual recovery)",
+                    format!(
+                        "# Preferred: bring the pod back so its slots can migrate normally:\nkubectl get statefulset {cluster_name} -n {namespace} -o wide\n# If the data is unrecoverable, reassign each orphaned slot on EVERY remaining node:\n# kubectl exec -n {namespace} {cluster_name}-0 -- valkey-cli --tls --cert /tls/tls.crt --key /tls/tls.key --cacert /tls/ca.crt -a \"$VALKEY_PASSWORD\" CLUSTER SETSLOT <slot_number> NODE <surviving-node-id>"
+                    ),
+                ),
             ],
         }
     }
@@ -506,6 +520,9 @@ impl DiagnosticHint {
                 "Nodes being removed are unreachable",
                 "Not all nodes received the FORGET command",
                 "Cluster consensus issues",
+                "A node scheduled for removal still owns hash slots, so FORGET is \
+                 refused: forgetting it would leave those slots unowned and their \
+                 keys returning CLUSTERDOWN",
             ],
             commands: vec![
                 DiagnosticCommand::new(
@@ -521,7 +538,19 @@ impl DiagnosticHint {
                     ),
                 ),
                 DiagnosticCommand::new(
-                    "Manually forget a node (CAUTION)",
+                    "Check whether a node awaiting removal still owns slots",
+                    format!(
+                        "# Any slot range printed after 'connected' must be migrated before FORGET:\nkubectl exec -n {namespace} {cluster_name}-0 -- valkey-cli --tls --cert /tls/tls.crt --key /tls/tls.key --cacert /tls/ca.crt -a \"$VALKEY_PASSWORD\" CLUSTER NODES | grep <node-id>"
+                    ),
+                ),
+                DiagnosticCommand::new(
+                    "Migrate slots off a node before removing it",
+                    format!(
+                        "# Run on the node that owns the slots, targeting a surviving master:\n# kubectl exec -n {namespace} {cluster_name}-<ordinal> -- valkey-cli --tls --cert /tls/tls.crt --key /tls/tls.key --cacert /tls/ca.crt -a \"$VALKEY_PASSWORD\" CLUSTER MIGRATESLOTS SLOTSRANGE <start> <end> NODE <target-node-id>"
+                    ),
+                ),
+                DiagnosticCommand::new(
+                    "Manually forget a node (CAUTION: only after it owns zero slots)",
                     format!(
                         "# Get node ID from CLUSTER NODES, then run on ALL other nodes:\n# kubectl exec -n {namespace} {cluster_name}-0 -- valkey-cli --tls --cert /tls/tls.crt --key /tls/tls.key --cacert /tls/ca.crt -a \"$VALKEY_PASSWORD\" CLUSTER FORGET <node-id>"
                     ),

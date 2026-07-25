@@ -48,6 +48,13 @@ pub enum Error {
     #[error("CLUSTER FORGET failed to reach quorum: {successes}/{required} nodes acknowledged")]
     ForgetQuorumFailed { successes: i32, required: i32 },
 
+    /// CLUSTER FORGET refused because the target nodes still own hash slots
+    #[error(
+        "refusing to CLUSTER FORGET {node_count} node(s) that still own hash slots ({detail}); \
+         migrate or recover them first"
+    )]
+    UnsafeForget { node_count: usize, detail: String },
+
     /// Failover verification failed
     #[error("Failover verification timed out after {elapsed_secs}s")]
     FailoverVerificationTimeout { elapsed_secs: u64 },
@@ -91,6 +98,8 @@ impl Error {
             Error::Serialization(_) => false,
             // Quorum errors are permanent - require manual intervention
             Error::InsufficientQuorum { .. } | Error::ForgetQuorumFailed { .. } => false,
+            // Forgetting a slot-owning node loses data; retrying repeats the refusal
+            Error::UnsafeForget { .. } => false,
             // Failover verification timeout requires investigation
             Error::FailoverVerificationTimeout { .. } => false,
             // Transport errors are transient (pod not ready, port-forward failure)
