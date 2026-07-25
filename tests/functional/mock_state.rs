@@ -232,6 +232,11 @@ impl MockClusterState {
     /// Simulate nodes removed from cluster during scale-down.
     pub fn simulate_nodes_removed(&mut self) {
         self.nodes_in_cluster = self.desired_replicas();
+        // CLUSTER FORGET on the removed master ordinals is what actually drops the
+        // live master count. Never below target, and a no-op for a replica-only
+        // scale-down. This used to be done by simulate_cluster_healthy(), which
+        // masked issue #172 by inventing masters the operator had not created.
+        self.current_masters = self.current_masters.min(self.target_masters);
     }
 
     /// Simulate StatefulSet scale-down completion.
@@ -241,26 +246,34 @@ impl MockClusterState {
     }
 
     /// Simulate cluster becoming healthy.
+    ///
+    /// Deliberately does NOT touch `current_masters`: the health check observes
+    /// the cluster, it does not create masters. Forcing `current_masters =
+    /// target_masters` here is what hid issue #172 — it made every partial scale
+    /// look complete.
     pub fn simulate_cluster_healthy(&mut self) {
         self.ready_pods = self.desired_replicas();
         self.running_pods = self.desired_replicas();
         self.nodes_in_cluster = self.desired_replicas();
-        self.current_masters = self.target_masters;
         self.slots_assigned = true;
+    }
+
+    /// Edit the spec, bumping the generation as Kubernetes would.
+    pub fn set_spec(&mut self, new_masters: i32, new_replicas: i32) {
+        self.target_masters = new_masters;
+        self.target_replicas_per_master = new_replicas;
+        self.spec_changed = true;
+        self.generation += 1;
     }
 
     /// Set the spec to trigger scale-up.
     pub fn set_scale_up(&mut self, new_masters: i32, new_replicas: i32) {
-        self.target_masters = new_masters;
-        self.target_replicas_per_master = new_replicas;
-        self.spec_changed = true;
+        self.set_spec(new_masters, new_replicas);
     }
 
     /// Set the spec to trigger scale-down.
     pub fn set_scale_down(&mut self, new_masters: i32, new_replicas: i32) {
-        self.target_masters = new_masters;
-        self.target_replicas_per_master = new_replicas;
-        self.spec_changed = true;
+        self.set_spec(new_masters, new_replicas);
     }
 
     /// Simulate partial recovery (some pods ready).
@@ -312,6 +325,12 @@ impl MockClusterState {
                     break;
                 }
             }
+
+            // Mirror StatusUpdate::apply(): observed_generation is written on every
+            // status update, so spec_changed is true for exactly one reconcile — not
+            // for the whole operation. Leaving it set let the mock resume a scale-up
+            // that production would have blocked, which is half of issue #172.
+            self.spec_changed = false;
         }
 
         phases

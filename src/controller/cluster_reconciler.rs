@@ -1040,6 +1040,7 @@ pub(crate) async fn check_cluster_health(
         return Ok(ClusterHealthStatus {
             is_healthy: false,
             healthy_masters: 0,
+            expected_masters: obj.spec.masters,
             healthy_replicas: 0,
             slots_assigned: 0,
             topology: None,
@@ -1054,6 +1055,7 @@ pub(crate) async fn check_cluster_health(
             return Ok(ClusterHealthStatus {
                 is_healthy: false,
                 healthy_masters: 0,
+                expected_masters: obj.spec.masters,
                 healthy_replicas: 0,
                 slots_assigned: 0,
                 topology: None,
@@ -1070,6 +1072,7 @@ pub(crate) async fn check_cluster_health(
             return Ok(ClusterHealthStatus {
                 is_healthy: false,
                 healthy_masters: 0,
+                expected_masters: obj.spec.masters,
                 healthy_replicas: 0,
                 slots_assigned: 0,
                 topology: None,
@@ -1086,6 +1089,7 @@ pub(crate) async fn check_cluster_health(
             return Ok(ClusterHealthStatus {
                 is_healthy: cluster_info.is_healthy(),
                 healthy_masters: cluster_info.cluster_size,
+                expected_masters: obj.spec.masters,
                 healthy_replicas: 0,
                 slots_assigned: cluster_info.slots_assigned,
                 topology: None,
@@ -1158,6 +1162,7 @@ pub(crate) async fn check_cluster_health(
     Ok(ClusterHealthStatus {
         is_healthy: cluster_state.is_healthy(expected_masters),
         healthy_masters: cluster_state.healthy_masters_count(),
+        expected_masters,
         healthy_replicas: cluster_state.healthy_replicas_count(),
         slots_assigned: cluster_state.cluster_info.slots_assigned,
         topology: Some(topology),
@@ -1752,6 +1757,7 @@ mod tests {
         let status = ClusterHealthStatus {
             is_healthy: false,
             healthy_masters: 0,
+            expected_masters: 3,
             healthy_replicas: 0,
             slots_assigned: 0,
             topology: None,
@@ -1767,6 +1773,7 @@ mod tests {
         let status = ClusterHealthStatus {
             is_healthy: true,
             healthy_masters: 3,
+            expected_masters: 3,
             healthy_replicas: 3,
             slots_assigned: 16384,
             topology: None,

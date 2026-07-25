@@ -244,9 +244,17 @@ mod phase_context_tests {
     /// master pod) must NOT be read as a scale-up — that misdetection routed
     /// the operator into a stuck RebalancingSlots loop. It must resolve to
     /// None so the cluster routes to Degraded/recovery instead.
+    ///
+    /// `ready_pods` is deliberately below `desired`: that is the state master
+    /// loss actually produces, because the recreated pod fails the
+    /// `cluster_state:ok` readiness probe until the operator re-joins it. With
+    /// every pod Ready, handle_running would never have left Running, so this
+    /// scenario cannot arise — and a shortfall there means unfinished spec work
+    /// instead (issue #172), which `pods_converged()` now resumes.
     #[test]
     fn test_scale_direction_master_loss_without_spec_change_is_not_scale_up() {
         let mut ctx = make_context(3, 1, 2, 6); // 2 masters live, target 3
+        ctx.ready_pods = 5; // the recreated pod is not Ready yet
         ctx.spec_changed = false;
         assert_eq!(ctx.scale_direction(), ScaleDirection::None);
         // And with a spec change it IS a real scale-up.
@@ -1111,5 +1119,137 @@ mod failed_spec_change_tests {
         // e.g. a resource-limit change: counts already match the spec.
         let c = ctx(3, 1, 3, 6);
         assert_eq!(failed_spec_change(&c), FailedSpecChange::RetryFromPending);
+    }
+}
+
+// ============================================================================
+// Pending master scale-up after a multi-step spec edit (issue #172)
+// ============================================================================
+
+mod pods_converged_tests {
+    use super::*;
+
+    fn make_context(
+        target_masters: i32,
+        target_replicas: i32,
+        current_masters: i32,
+        running_pods: i32,
+    ) -> PhaseContext {
+        PhaseContext {
+            name: "test".to_string(),
+            namespace: "default".to_string(),
+            target_masters,
+            target_replicas_per_master: target_replicas,
+            current_masters,
+            running_pods,
+            ready_pods: running_pods,
+            nodes_in_cluster: running_pods,
+            spec_changed: false,
+            generation: 2,
+        }
+    }
+
+    #[test]
+    fn test_pods_converged_when_all_running_and_ready() {
+        assert!(make_context(4, 1, 4, 8).pods_converged());
+    }
+
+    #[test]
+    fn test_pods_not_converged_when_pods_missing() {
+        let mut c = make_context(4, 1, 4, 8);
+        c.running_pods = 7;
+        c.ready_pods = 7;
+        assert!(!c.pods_converged());
+    }
+
+    #[test]
+    fn test_pods_not_converged_when_a_pod_is_not_ready() {
+        let mut c = make_context(4, 1, 4, 8);
+        c.ready_pods = 7;
+        assert!(!c.pods_converged());
+    }
+
+    #[test]
+    fn test_pods_not_converged_when_nothing_is_desired() {
+        let mut c = make_context(0, 0, 0, 0);
+        c.running_pods = 0;
+        c.ready_pods = 0;
+        assert!(!c.pods_converged());
+    }
+
+    /// The #172 terminal state: a combined (3m,2r) -> (4m,1r) edit ran the
+    /// replica scale-down first, observed_generation caught up, and the master
+    /// scale-up was left pending. All 8 pods are Running and Ready, so there is
+    /// no failure to recover from — the operator must finish the job.
+    #[test]
+    fn test_pending_master_scale_up_resumes_once_pods_converge() {
+        let c = make_context(4, 1, 3, 8);
+        assert!(!c.spec_changed);
+        assert!(c.pods_converged());
+        assert_eq!(c.scale_direction(), ScaleDirection::Up);
+    }
+
+    /// The #52 guard still holds: a transient `Ok(0)` master count must never be
+    /// read as a scale-up, converged pods or not.
+    #[test]
+    fn test_converged_pods_with_zero_masters_is_not_scale_up() {
+        let c = make_context(4, 1, 0, 8);
+        assert!(c.pods_converged());
+        assert_eq!(c.scale_direction(), ScaleDirection::None);
+    }
+
+    /// A cluster that already matches its spec stays put.
+    #[test]
+    fn test_converged_pods_at_target_is_not_a_scale() {
+        let c = make_context(4, 1, 4, 8);
+        assert_eq!(c.scale_direction(), ScaleDirection::None);
+    }
+}
+
+/// The Failed-phase scale-down routing from issue #163 must exist in the
+/// transition table, not just in the phase handler. Pending leads to Creating,
+/// which force-applies the StatefulSet and terminates slot-owning masters.
+mod failed_scale_down_transitions {
+    use super::*;
+
+    #[test]
+    fn test_failed_to_evacuating_slots_on_scale_down() {
+        let sm = ClusterStateMachine::new();
+        // 12 pods live against a spec that now asks for 6: a real reduction.
+        let mut ctx = TransitionContext::new(12, 6);
+        ctx.spec_changed = true;
+        let result = sm.transition(&ClusterPhase::Failed, ClusterEvent::ScaleDownDetected, &ctx);
+        assert!(
+            matches!(
+                result,
+                TransitionResult::Success {
+                    to: ClusterPhase::EvacuatingSlots,
+                    ..
+                }
+            ),
+            "expected Failed -> EvacuatingSlots, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_failed_to_removing_nodes_on_replica_scale_down() {
+        let sm = ClusterStateMachine::new();
+        let mut ctx = TransitionContext::new(9, 6);
+        ctx.spec_changed = true;
+        let result = sm.transition(
+            &ClusterPhase::Failed,
+            ClusterEvent::ReplicaScaleDownDetected,
+            &ctx,
+        );
+        assert!(
+            matches!(
+                result,
+                TransitionResult::Success {
+                    to: ClusterPhase::RemovingNodesFromCluster,
+                    ..
+                }
+            ),
+            "expected Failed -> RemovingNodesFromCluster, got {result:?}"
+        );
     }
 }

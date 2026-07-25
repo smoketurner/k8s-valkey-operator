@@ -199,9 +199,23 @@ pub fn derive_cluster_conditions(
     health_status: Option<&ClusterHealthStatus>,
     tls: Option<&TlsObservation>,
 ) -> Vec<Condition> {
-    let ready = phase == ClusterPhase::Running && ready_pods == desired_pods && desired_pods > 0;
+    // Pod counts alone are not enough: a cluster can have every pod Running and
+    // Ready while holding fewer masters than spec.masters (a multi-step spec edit
+    // that only partly completed). Reporting Ready there hides real drift.
+    //
+    // `healthy_masters == 0` means check_cluster_health could not read the
+    // cluster at all, not that every master vanished — don't flap Ready on that.
+    // Use the explicit count rather than `is_healthy`, which also folds in
+    // slots_pfail/slots_fail and would flap on transient gossip state.
+    let masters_match = health_status
+        .is_none_or(|h| h.healthy_masters == 0 || h.healthy_masters == h.expected_masters);
+    let ready = phase == ClusterPhase::Running
+        && ready_pods == desired_pods
+        && desired_pods > 0
+        && masters_match;
     let progressing = is_progressing(phase);
-    let degraded = is_degraded(phase, ready_pods, desired_pods);
+    let degraded = is_degraded(phase, ready_pods, desired_pods)
+        || (phase == ClusterPhase::Running && !masters_match);
     let slots_stable = slots_are_stable(phase);
     let replicas_in_sync = health_status
         .and_then(|h| h.max_replica_lag)
@@ -210,6 +224,11 @@ pub fn derive_cluster_conditions(
         (
             "ClusterHealthy",
             "Cluster is running and all pods are ready.",
+        )
+    } else if phase == ClusterPhase::Running && !masters_match {
+        (
+            "MasterCountMismatch",
+            "Cluster master count does not match spec.masters.",
         )
     } else {
         ready_reason(phase)
@@ -312,6 +331,9 @@ pub struct ClusterHealthStatus {
     pub is_healthy: bool,
     /// Number of healthy master nodes.
     pub healthy_masters: i32,
+    /// Number of masters the spec asks for, so conditions can spot drift between
+    /// the live cluster and `spec.masters` without re-reading the resource.
+    pub expected_masters: i32,
     /// Number of healthy replica nodes.
     pub healthy_replicas: i32,
     /// Total slots assigned.
@@ -884,6 +906,7 @@ mod tests {
         ClusterHealthStatus {
             is_healthy: true,
             healthy_masters: 3,
+            expected_masters: 3,
             healthy_replicas: 3,
             slots_assigned: 16384,
             topology: None,
@@ -895,11 +918,64 @@ mod tests {
         ClusterHealthStatus {
             is_healthy: false,
             healthy_masters: 1,
+            expected_masters: 1,
             healthy_replicas: 0,
             slots_assigned: 16384,
             topology: None,
             max_replica_lag: Some(lag),
         }
+    }
+
+    fn short_by_one_master() -> ClusterHealthStatus {
+        ClusterHealthStatus {
+            is_healthy: false,
+            healthy_masters: 3,
+            expected_masters: 4,
+            healthy_replicas: 4,
+            slots_assigned: 16384,
+            topology: None,
+            max_replica_lag: Some(0),
+        }
+    }
+
+    /// Issue #172: a cluster can have every pod Running and Ready while holding
+    /// fewer masters than spec.masters. Pod counts alone reported that as Ready.
+    #[test]
+    fn test_ready_false_when_master_count_below_spec() {
+        let health = short_by_one_master();
+        let c =
+            derive_cluster_conditions(ClusterPhase::Running, 8, 8, Some(2), Some(&health), None);
+        assert_false(&c, "Ready");
+        assert_true(&c, "Degraded");
+        assert_eq!(find_condition(&c, "Ready").reason, "MasterCountMismatch");
+    }
+
+    #[test]
+    fn test_ready_true_when_master_count_matches_spec() {
+        let health = healthy();
+        let c =
+            derive_cluster_conditions(ClusterPhase::Running, 6, 6, Some(2), Some(&health), None);
+        assert_true(&c, "Ready");
+        assert_false(&c, "Degraded");
+    }
+
+    /// check_cluster_health returns healthy_masters: 0 when it cannot reach the
+    /// cluster at all. That is "unreadable", not "every master vanished", so it
+    /// must not flap Ready on a transient connection blip.
+    #[test]
+    fn test_ready_not_flapped_when_health_is_unreadable() {
+        let health = ClusterHealthStatus {
+            is_healthy: false,
+            healthy_masters: 0,
+            expected_masters: 3,
+            healthy_replicas: 0,
+            slots_assigned: 0,
+            topology: None,
+            max_replica_lag: None,
+        };
+        let c =
+            derive_cluster_conditions(ClusterPhase::Running, 6, 6, Some(1), Some(&health), None);
+        assert_true(&c, "Ready");
     }
 
     #[test]

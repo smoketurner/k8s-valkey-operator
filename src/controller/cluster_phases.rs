@@ -112,6 +112,17 @@ impl PhaseContext {
         total_pods(self.target_masters, self.target_replicas_per_master)
     }
 
+    /// Whether every desired pod exists, is Running, and is Ready.
+    ///
+    /// The readiness probe requires `cluster_state:ok`, so this means there is no
+    /// pod-level failure to recover from and the operator can reach every pod.
+    /// That distinguishes "the spec still has work left" from "something broke":
+    /// see [`Self::scale_direction`].
+    pub fn pods_converged(&self) -> bool {
+        let desired = self.desired_replicas();
+        desired > 0 && self.running_pods == desired && self.ready_pods == desired
+    }
+
     /// Determine the scale direction based on current vs target masters.
     ///
     /// The phase name encodes direction, but this is useful for Running phase
@@ -136,7 +147,19 @@ impl PhaseContext {
         // otherwise route to Degraded/recovery, or the operator reads
         // `current_masters < target` as a scale-up and gets stuck in
         // RebalancingSlots ("Expected N masters but found M") with no pods added.
-        if !self.spec_changed {
+        //
+        // EXCEPTION: `observed_generation` catches up on the first reconcile that
+        // sees an edit, not when the work finishes, so a multi-step change loses
+        // `spec_changed` partway through. A combined masters-up/replicas-down edit
+        // matches the replica reduction above first, and the pending master
+        // scale-up would then be blocked forever, leaving the cluster Running with
+        // fewer masters than the spec asks for. When every desired pod is Running
+        // AND Ready there is no failure to recover from, so a shortfall can only be
+        // unfinished spec work — and that is also exactly the precondition under
+        // which replica promotion can succeed. The master-loss case above always
+        // has a NotReady pod (the recreated pod fails the `cluster_state:ok` probe
+        // until the operator re-joins it), so it still resolves to None here.
+        if !self.spec_changed && !self.pods_converged() {
             return ScaleDirection::None;
         }
         if self.current_masters < self.target_masters && self.current_masters > 0 {
@@ -639,6 +662,29 @@ pub async fn handle_running(
         )
         .await;
         return Ok(ClusterPhase::Degraded.into());
+    }
+
+    // Pods are all ready but the cluster does not have the masters the spec asks
+    // for. scale_direction() routes this to a scale-up once pods converge, so
+    // reaching here means that path is not making progress — surface it rather
+    // than sitting in Running with silent drift.
+    if phase_ctx.current_masters > 0 && phase_ctx.current_masters != phase_ctx.target_masters {
+        warn!(
+            name = %name,
+            current = phase_ctx.current_masters,
+            target = phase_ctx.target_masters,
+            "Master count does not match spec while Running"
+        );
+        ctx.publish_warning_event(
+            obj,
+            "MasterCountMismatch",
+            "Running",
+            Some(format!(
+                "Cluster has {} masters but spec.masters is {}",
+                phase_ctx.current_masters, phase_ctx.target_masters
+            )),
+        )
+        .await;
     }
 
     // Cluster is healthy, stay in Running
@@ -1236,8 +1282,10 @@ pub async fn handle_degraded(
     // Safe to apply resources now - no scale-down in progress
     create_resources_fn.await?;
 
-    // Check for scale-up operations (spec-driven only; safe after resource sync)
-    if phase_ctx.spec_changed && phase_ctx.current_masters > 0 {
+    // Check for scale-up operations (safe after resource sync). Spec-driven, or —
+    // once every pod is Running and Ready — a master shortfall left over from a
+    // multi-step edit whose `spec_changed` already lapsed. See scale_direction().
+    if (phase_ctx.spec_changed || phase_ctx.pods_converged()) && phase_ctx.current_masters > 0 {
         if phase_ctx.target_masters > phase_ctx.current_masters {
             return Ok(ClusterPhase::ScalingUpStatefulSet.into());
         }
