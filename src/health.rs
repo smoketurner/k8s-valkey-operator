@@ -1,9 +1,22 @@
 //! Health server for Kubernetes probes and Prometheus metrics.
 //!
 //! Provides:
-//! - `/healthz` - Liveness probe (always returns 200 if server is running)
+//! - `/healthz` - Liveness probe (200 whenever the process can answer)
 //! - `/readyz` - Readiness probe (returns 200 when ready to serve traffic)
 //! - `/metrics` - Prometheus metrics endpoint
+//!
+//! ## Why `/healthz` is deliberately trivial
+//!
+//! A cluster wedged in a phase is *not* a liveness failure. The phase lives in
+//! the ValkeyCluster's status, so restarting the operator would not clear it,
+//! and a reconcile-staleness watchdog would fire spuriously whenever no
+//! ValkeyCluster exists (nothing to reconcile means no reconciles). Actual
+//! controller death already ends the process — `main` selects over the
+//! controller tasks and returns when one finishes — so the kubelet restarts it
+//! without help from this endpoint.
+//!
+//! Wedged clusters are a *monitoring* concern, and the signal for them is
+//! [`Metrics::set_resource_phase`] plus `valkey_operator_stuck_detections`.
 
 use std::sync::Arc;
 
@@ -24,6 +37,8 @@ use prometheus_client::registry::Registry;
 use tokio::sync::RwLock;
 use tracing::info;
 
+use crate::crd::ClusterPhase;
+
 /// Labels for reconciliation metrics (namespace + name)
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ReconcileLabels {
@@ -35,6 +50,23 @@ impl EncodeLabelSet for ReconcileLabels {
     fn encode(&self, encoder: &mut LabelSetEncoder<'_>) -> Result<(), std::fmt::Error> {
         ("namespace", self.namespace.as_str()).encode(encoder.encode_label())?;
         ("name", self.name.as_str()).encode(encoder.encode_label())?;
+        Ok(())
+    }
+}
+
+/// Labels for the per-phase gauge (namespace + name + phase)
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct PhaseLabels {
+    pub namespace: String,
+    pub name: String,
+    pub phase: String,
+}
+
+impl EncodeLabelSet for PhaseLabels {
+    fn encode(&self, encoder: &mut LabelSetEncoder<'_>) -> Result<(), std::fmt::Error> {
+        ("namespace", self.namespace.as_str()).encode(encoder.encode_label())?;
+        ("name", self.name.as_str()).encode(encoder.encode_label())?;
+        ("phase", self.phase.as_str()).encode(encoder.encode_label())?;
         Ok(())
     }
 }
@@ -51,6 +83,10 @@ pub struct Metrics {
     pub resource_replicas_desired: Family<ReconcileLabels, Gauge>,
     /// Ready replicas per resource
     pub resource_replicas_ready: Family<ReconcileLabels, Gauge>,
+    /// Current phase per resource, as a 0/1 state set
+    pub resource_phase: Family<PhaseLabels, Gauge>,
+    /// Times stuck detection has forced a resource to Failed
+    pub stuck_detections_total: Family<ReconcileLabels, Counter>,
     /// Prometheus registry
     registry: Registry,
 }
@@ -104,12 +140,28 @@ impl Metrics {
             resource_replicas_ready.clone(),
         );
 
+        let resource_phase = Family::<PhaseLabels, Gauge>::default();
+        registry.register(
+            "valkey_operator_resource_phase",
+            "Current phase of each resource: 1 for the active phase, 0 otherwise",
+            resource_phase.clone(),
+        );
+
+        let stuck_detections_total = Family::<ReconcileLabels, Counter>::default();
+        registry.register(
+            "valkey_operator_stuck_detections",
+            "Number of times stuck detection forced a resource to Failed",
+            stuck_detections_total.clone(),
+        );
+
         Self {
             reconciliations_total,
             reconciliation_errors_total,
             reconcile_duration_seconds,
             resource_replicas_desired,
             resource_replicas_ready,
+            resource_phase,
+            stuck_detections_total,
             registry,
         }
     }
@@ -149,6 +201,42 @@ impl Metrics {
         self.resource_replicas_ready
             .get_or_create(&labels)
             .set(ready);
+    }
+
+    /// Record the current phase of a resource.
+    ///
+    /// Emits one series per phase, following the `kube_pod_status_phase`
+    /// convention: the active phase is 1 and every other phase is 0. Zeroing
+    /// the others is what stops a stale series from reporting an old phase
+    /// forever after a transition.
+    ///
+    /// This is the only phase-aware signal the operator exports. Without it a
+    /// cluster wedged in a phase, or forced to `Failed` by stuck detection, is
+    /// invisible to monitoring — `/healthz` and `/readyz` both stay green
+    /// because the operator process itself is fine.
+    ///
+    /// Alert on `valkey_operator_resource_phase{phase="Failed"} == 1`, or on a
+    /// non-terminal phase persisting longer than an operation should take.
+    pub fn set_resource_phase(&self, namespace: &str, name: &str, current: ClusterPhase) {
+        for phase in ClusterPhase::ALL {
+            let labels = PhaseLabels {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                phase: phase.to_string(),
+            };
+            self.resource_phase
+                .get_or_create(&labels)
+                .set(i64::from(phase == current));
+        }
+    }
+
+    /// Record that stuck detection forced a resource to Failed.
+    pub fn record_stuck_detection(&self, namespace: &str, name: &str) {
+        let labels = ReconcileLabels {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+        };
+        self.stuck_detections_total.get_or_create(&labels).inc();
     }
 
     /// Encode metrics to Prometheus text format
@@ -198,8 +286,9 @@ impl HealthState {
 
 /// Liveness probe handler
 ///
-/// Returns 200 OK if the process is alive.
-/// This is a simple check - if we can respond, we're alive.
+/// Returns 200 OK if the process is alive. Answering at all is the signal.
+/// See the module docs for why this deliberately does not check reconcile
+/// freshness or cluster phase.
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
@@ -283,6 +372,65 @@ mod tests {
         let encoded = metrics.encode();
         assert!(encoded.contains("valkey_operator_resource_replicas_desired"));
         assert!(encoded.contains("valkey_operator_resource_replicas_ready"));
+    }
+
+    #[test]
+    fn test_resource_phase_marks_exactly_one_phase_active() {
+        let metrics = Metrics::new();
+        metrics.set_resource_phase("default", "app", ClusterPhase::Running);
+
+        let encoded = metrics.encode();
+        assert!(
+            encoded.contains(
+                r#"valkey_operator_resource_phase{namespace="default",name="app",phase="Running"} 1"#
+            ),
+            "active phase should be 1, got:\n{encoded}"
+        );
+        assert!(
+            encoded.contains(
+                r#"valkey_operator_resource_phase{namespace="default",name="app",phase="Failed"} 0"#
+            ),
+            "inactive phases should be 0, got:\n{encoded}"
+        );
+
+        // One series per phase, exactly one of them set.
+        let active = encoded
+            .lines()
+            .filter(|l| l.starts_with("valkey_operator_resource_phase") && l.ends_with(" 1"))
+            .count();
+        assert_eq!(active, 1, "exactly one phase may be active");
+    }
+
+    /// A transition must clear the previous phase, or a wedged cluster keeps
+    /// reporting the phase it was in before it jammed.
+    #[test]
+    fn test_resource_phase_clears_previous_phase() {
+        let metrics = Metrics::new();
+        metrics.set_resource_phase("default", "app", ClusterPhase::EvacuatingSlots);
+        metrics.set_resource_phase("default", "app", ClusterPhase::Failed);
+
+        let encoded = metrics.encode();
+        assert!(
+            encoded.contains(
+                r#"valkey_operator_resource_phase{namespace="default",name="app",phase="EvacuatingSlots"} 0"#
+            ),
+            "the previous phase must be zeroed, got:\n{encoded}"
+        );
+        assert!(encoded.contains(
+            r#"valkey_operator_resource_phase{namespace="default",name="app",phase="Failed"} 1"#
+        ));
+    }
+
+    #[test]
+    fn test_stuck_detection_counter() {
+        let metrics = Metrics::new();
+        metrics.record_stuck_detection("default", "app");
+
+        let encoded = metrics.encode();
+        assert!(
+            encoded.contains("valkey_operator_stuck_detections"),
+            "stuck detection must be visible to monitoring, got:\n{encoded}"
+        );
     }
 
     #[tokio::test]

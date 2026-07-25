@@ -47,6 +47,20 @@ pub const FIELD_MANAGER: &str = "valkey-operator";
 /// Finalizer name for graceful deletion
 pub const FINALIZER: &str = "valkey-operator.smoketurner.com/finalizer";
 
+/// Record that stuck detection forced a resource to Failed.
+///
+/// Both stuck-detection branches return early, so they never reach the metric
+/// block at the end of `reconcile` — the phase gauge has to be set here or a
+/// wedged cluster would keep reporting whatever phase it was in when it jammed.
+fn record_stuck(ctx: &Context, namespace: &str, name: &str) {
+    if let Some(ref health_state) = ctx.health_state {
+        health_state.metrics.record_stuck_detection(namespace, name);
+        health_state
+            .metrics
+            .set_resource_phase(namespace, name, ClusterPhase::Failed);
+    }
+}
+
 /// Get the requeue duration for a given phase.
 fn requeue_duration(phase: ClusterPhase) -> std::time::Duration {
     match phase {
@@ -161,6 +175,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                 current_phase, reconcile_count, MAX_RECONCILE_COUNT, diagnostic_hint
             );
             error!(name = %name, phase = %current_phase, reconcile_count, "Stuck detection triggered");
+            record_stuck(&ctx, &namespace, &name);
             ctx.publish_warning_event(&obj, "StuckDetected", "Reconciling", Some(event_msg))
                 .await;
             StatusUpdate {
@@ -192,6 +207,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     current_phase, elapsed, MAX_STUCK_DURATION_SECS, diagnostic_hint
                 );
                 error!(name = %name, phase = %current_phase, elapsed_secs = elapsed, "Stuck detection triggered");
+                record_stuck(&ctx, &namespace, &name);
                 ctx.publish_warning_event(&obj, "StuckDetected", "Reconciling", Some(event_msg))
                     .await;
                 StatusUpdate {
@@ -284,6 +300,9 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             i64::from(desired_replicas),
             i64::from(ready_replicas_final),
         );
+        health_state
+            .metrics
+            .set_resource_phase(&namespace, &name, next_phase);
     }
 
     Ok(Action::requeue(requeue_duration(next_phase)))
