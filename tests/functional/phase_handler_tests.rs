@@ -1045,3 +1045,71 @@ mod cluster_health_result_tests {
         assert_eq!(result.healthy_masters, 2);
     }
 }
+
+// ============================================================================
+// Failed-phase spec change (issue #163)
+// ============================================================================
+
+mod failed_spec_change_tests {
+    use super::*;
+    use valkey_operator::controller::cluster_phases::{FailedSpecChange, failed_spec_change};
+
+    fn ctx(
+        target_masters: i32,
+        target_replicas: i32,
+        current_masters: i32,
+        running_pods: i32,
+    ) -> PhaseContext {
+        PhaseContext {
+            name: "test".to_string(),
+            namespace: "default".to_string(),
+            target_masters,
+            target_replicas_per_master: target_replicas,
+            current_masters,
+            running_pods,
+            ready_pods: running_pods,
+            nodes_in_cluster: running_pods,
+            spec_changed: true,
+            generation: 2,
+        }
+    }
+
+    #[test]
+    fn test_master_scale_down_while_failed_evacuates_slots() {
+        // 6m/1r (12 pods) -> 3m/1r. Going through Pending would force-apply the
+        // StatefulSet at 6 replicas and terminate slot-owning masters.
+        let c = ctx(3, 1, 6, 12);
+        assert_eq!(failed_spec_change(&c), FailedSpecChange::EvacuateSlots);
+    }
+
+    #[test]
+    fn test_replica_scale_down_while_failed_removes_nodes_first() {
+        // 3m/2r (9 pods) -> 3m/1r. Replicas hold no slots, so slot evacuation is
+        // unnecessary, but the StatefulSet still must not shrink until the nodes
+        // are forgotten.
+        let c = ctx(3, 1, 3, 9);
+        assert_eq!(failed_spec_change(&c), FailedSpecChange::RemoveNodes);
+    }
+
+    #[test]
+    fn test_validation_fix_while_failed_retries_from_pending() {
+        // The original #159 case: validation failed at creation, no pods ever
+        // started, so there is nothing to evacuate.
+        let c = ctx(3, 1, 0, 0);
+        assert_eq!(failed_spec_change(&c), FailedSpecChange::RetryFromPending);
+    }
+
+    #[test]
+    fn test_scale_up_while_failed_retries_from_pending() {
+        // Growing is safe to route through Creating: it only adds pods.
+        let c = ctx(6, 1, 3, 6);
+        assert_eq!(failed_spec_change(&c), FailedSpecChange::RetryFromPending);
+    }
+
+    #[test]
+    fn test_unrelated_spec_edit_while_failed_retries_from_pending() {
+        // e.g. a resource-limit change: counts already match the spec.
+        let c = ctx(3, 1, 3, 6);
+        assert_eq!(failed_spec_change(&c), FailedSpecChange::RetryFromPending);
+    }
+}

@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     controller::{
         cluster_init,
-        cluster_phases::{self, ClusterHealthResult, PhaseContext},
+        cluster_phases::{self, ClusterHealthResult, FailedSpecChange, PhaseContext},
         cluster_state_machine::ClusterStateMachine,
         cluster_topology::ClusterTopology,
         cluster_validation::validate_spec,
@@ -511,9 +511,7 @@ async fn dispatch_phase(
             .await?;
             Ok(result.next_phase)
         }
-        ClusterPhase::Failed => {
-            handle_failed_phase(obj, ctx, namespace, name, phase_ctx.spec_changed).await
-        }
+        ClusterPhase::Failed => handle_failed_phase(obj, ctx, namespace, name, phase_ctx).await,
         ClusterPhase::Deleting => Ok(ClusterPhase::Deleting),
     }
 }
@@ -525,14 +523,57 @@ async fn handle_failed_phase(
     ctx: &Context,
     namespace: &str,
     name: &str,
-    spec_changed: bool,
+    phase_ctx: &PhaseContext,
 ) -> Result<ClusterPhase, Error> {
     // A spec edit is the user's fix for whatever drove the cluster to Failed.
     // This matters most for validation failures at creation time: no pods ever
     // started, so the pod-count-gated recovery paths below can never trigger
     // and Failed would otherwise be terminal. Return to Pending so validation
     // re-runs against the corrected spec.
-    if spec_changed {
+    if phase_ctx.spec_changed {
+        match cluster_phases::failed_spec_change(phase_ctx) {
+            FailedSpecChange::EvacuateSlots => {
+                info!(
+                    name = %name,
+                    current = phase_ctx.current_masters,
+                    target = phase_ctx.target_masters,
+                    "Scale-down requested while Failed - evacuating slots before shrinking"
+                );
+                ctx.publish_normal_event(
+                    obj,
+                    "ScaleDownDetected",
+                    "Failed",
+                    Some(format!(
+                        "Scaling down from {} to {} masters",
+                        phase_ctx.current_masters, phase_ctx.target_masters
+                    )),
+                )
+                .await;
+                return Ok(ClusterPhase::EvacuatingSlots);
+            }
+            FailedSpecChange::RemoveNodes => {
+                info!(
+                    name = %name,
+                    running = phase_ctx.running_pods,
+                    desired = phase_ctx.desired_replicas(),
+                    "Replica scale-down requested while Failed - removing nodes first"
+                );
+                ctx.publish_normal_event(
+                    obj,
+                    "ReplicaScaleDownDetected",
+                    "Failed",
+                    Some(format!(
+                        "Scaling down replicas from {} to {} pods",
+                        phase_ctx.running_pods,
+                        phase_ctx.desired_replicas()
+                    )),
+                )
+                .await;
+                return Ok(ClusterPhase::RemovingNodesFromCluster);
+            }
+            FailedSpecChange::RetryFromPending => {}
+        }
+
         info!(name = %name, "Spec changed while in Failed phase, retrying from Pending");
         ctx.publish_normal_event(
             obj,

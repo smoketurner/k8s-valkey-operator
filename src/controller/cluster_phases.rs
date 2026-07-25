@@ -173,6 +173,38 @@ impl std::fmt::Display for ScaleDirection {
     }
 }
 
+/// How the operator should act on a spec change observed while `Failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedSpecChange {
+    /// Masters were reduced: evacuate slots before the StatefulSet shrinks.
+    EvacuateSlots,
+    /// Replicas were reduced: forget the nodes before the StatefulSet shrinks.
+    RemoveNodes,
+    /// No reduction pending: re-run validation from `Pending`.
+    RetryFromPending,
+}
+
+/// Decide how to act on a spec change while the cluster is `Failed`.
+///
+/// `Pending` leads to `Creating`, which force-applies the StatefulSet at the new
+/// replica count. A `Failed` cluster can still have running pods that own slots —
+/// `handle_degraded` fails a cluster whose pods are running but not ready, and
+/// stuck detection fails any operational phase — so a reduction must take the
+/// same graceful path `handle_running` uses. Otherwise Kubernetes terminates the
+/// masters before their slots are migrated and the keys are lost.
+pub fn failed_spec_change(phase_ctx: &PhaseContext) -> FailedSpecChange {
+    match phase_ctx.scale_direction() {
+        ScaleDirection::Down => FailedSpecChange::EvacuateSlots,
+        ScaleDirection::ReplicaChange
+            if phase_ctx.current_masters > 0
+                && phase_ctx.running_pods > phase_ctx.desired_replicas() =>
+        {
+            FailedSpecChange::RemoveNodes
+        }
+        _ => FailedSpecChange::RetryFromPending,
+    }
+}
+
 // ============================================================================
 // Pure Logic Functions (testable without mocking)
 // ============================================================================
