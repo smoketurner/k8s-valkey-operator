@@ -3,6 +3,7 @@
 //! Provides a type-safe client for connecting to Valkey clusters with
 //! TLS support, connection pooling, and proper error handling.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fred::prelude::*;
@@ -289,6 +290,10 @@ impl ValkeyClientConfig {
 }
 
 /// Valkey client for cluster operations.
+///
+/// Connections are torn down either by an explicit [`ValkeyClient::close`] or, if the
+/// value is dropped before that (an early `?`, an error return, a panic unwind), by the
+/// [`Drop`] impl. Prefer the explicit `close()` so teardown is awaited deterministically.
 pub struct ValkeyClient {
     client: Client,
     config: ValkeyClientConfig,
@@ -304,6 +309,9 @@ pub struct ValkeyClient {
     /// DNS name rather than the raw dial target (which may be an IP or
     /// 127.0.0.1 via port-forward).
     tls_server_name: Option<String>,
+    /// Set once teardown has been initiated, by explicit `close()` or by `Drop`.
+    /// Mirrors `PortForward::cleanup_initiated`.
+    closed: AtomicBool,
 }
 
 impl ValkeyClient {
@@ -367,6 +375,7 @@ impl ValkeyClient {
             config,
             tls_certs: None,
             tls_server_name: None,
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -429,6 +438,7 @@ impl ValkeyClient {
             config,
             tls_certs: tls_certs.cloned(),
             tls_server_name: tls_server_name.map(String::from),
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -463,7 +473,13 @@ impl ValkeyClient {
     }
 
     /// Close the connection.
+    ///
+    /// Idempotent: subsequent calls (and the [`Drop`] impl) are no-ops once teardown
+    /// has been initiated.
     pub async fn close(&self) -> Result<(), ValkeyError> {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
         self.client.quit().await?;
         Ok(())
     }
@@ -838,6 +854,28 @@ impl ValkeyClient {
     // }
 }
 
+impl Drop for ValkeyClient {
+    fn drop(&mut self) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        // fred's router task holds its own Arc<ClientInner>; dropping this handle
+        // does not close the socket. quit() is the only teardown.
+        let client = self.client.clone();
+
+        // Handle::try_current() rather than tokio::spawn: Drop can run outside a
+        // runtime (unit tests, runtime shutdown) where spawn would panic.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = client.quit().await {
+                    debug!(error = %e, "Background client quit failed");
+                }
+            });
+        }
+    }
+}
+
 /// Build a TLS connector from certificate data.
 ///
 /// Creates a rustls ClientConfig with the provided CA certificate and optional
@@ -1095,6 +1133,7 @@ mod tests {
             config: ValkeyClientConfig::default(),
             tls_certs: None,
             tls_server_name: None,
+            closed: AtomicBool::new(false),
         };
         assert!(client.tls_certs().is_none());
     }
@@ -1115,11 +1154,88 @@ mod tests {
             config: ValkeyClientConfig::default(),
             tls_certs: Some(certs.clone()),
             tls_server_name: None,
+            closed: AtomicBool::new(false),
         };
 
         let stored = client.tls_certs().expect("certs should be present");
         assert_eq!(stored.ca_cert_pem, certs.ca_cert_pem);
         assert_eq!(stored.client_cert_pem, certs.client_cert_pem);
         assert_eq!(stored.client_key_pem, certs.client_key_pem);
+    }
+
+    /// Build an unconnected client for exercising teardown paths.
+    fn test_client() -> ValkeyClient {
+        ValkeyClient {
+            client: Builder::default_centralized().build().unwrap(),
+            config: ValkeyClientConfig::default(),
+            tls_certs: None,
+            tls_server_name: None,
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn test_drop_outside_runtime_does_not_panic() {
+        // Drop must tolerate running with no tokio runtime in scope, which is why
+        // it uses Handle::try_current() instead of tokio::spawn.
+        let client = test_client();
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn test_close_is_idempotent() {
+        let client = test_client();
+        assert!(!client.closed.load(Ordering::SeqCst));
+
+        // The client was never connected, so quit() resolves without a socket to
+        // tear down. The first close initiates teardown and flips the flag.
+        assert!(client.close().await.is_ok());
+        assert!(client.closed.load(Ordering::SeqCst));
+
+        // The second close short-circuits on the flag instead of sending QUIT again.
+        assert!(client.close().await.is_ok());
+        assert!(client.closed.load(Ordering::SeqCst));
+    }
+
+    // The two tests below run on a current-thread runtime and read task counts with
+    // no intervening await point, so the runtime cannot have polled (and retired)
+    // a task spawned by Drop before the count is observed.
+
+    #[tokio::test]
+    async fn test_drop_without_close_spawns_quit_task() {
+        let client = test_client();
+        let before = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+
+        drop(client);
+
+        let after = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        assert_eq!(
+            after,
+            before + 1,
+            "Drop must spawn a background quit task for an unclosed client"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_after_close_does_not_quit_again() {
+        let client = test_client();
+        assert!(client.close().await.is_ok());
+        let before = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+
+        drop(client);
+
+        let after = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        assert_eq!(
+            after, before,
+            "Drop after close must not spawn a second quit task"
+        );
     }
 }

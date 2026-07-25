@@ -284,7 +284,7 @@ pub async fn execute_cluster_meet(
     // Give the cluster time to propagate the MEET commands via gossip
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    client.close().await?;
+    let _ = client.close().await;
     info!("CLUSTER MEET complete, all nodes connected");
     Ok(())
 }
@@ -317,7 +317,7 @@ pub async fn assign_slots_to_masters(
     let check_client = ctx.connect_to_cluster(cluster, namespace, 0).await?;
 
     let cluster_info = check_client.cluster_info().await?;
-    check_client.close().await?;
+    let _ = check_client.close().await;
 
     if cluster_info.all_slots_assigned() {
         info!(
@@ -337,7 +337,7 @@ pub async fn assign_slots_to_masters(
     // Get current slot assignments from cluster nodes
     let check_client = ctx.connect_to_cluster(cluster, namespace, 0).await?;
     let cluster_nodes = check_client.cluster_nodes().await?;
-    check_client.close().await?;
+    let _ = check_client.close().await;
 
     // Build a set of already-assigned slots
     let mut assigned_slots: std::collections::HashSet<u16> = std::collections::HashSet::new();
@@ -383,7 +383,7 @@ pub async fn assign_slots_to_masters(
         );
 
         client.cluster_add_slots(slots_to_assign).await?;
-        client.close().await?;
+        let _ = client.close().await;
 
         info!(
             master_index = i,
@@ -432,7 +432,7 @@ pub async fn setup_replicas(
 
     // Get cluster nodes to find master node IDs
     let nodes_raw = client.cluster_nodes_raw().await?;
-    client.close().await?;
+    let _ = client.close().await;
 
     // Parse the cluster nodes output to get master node IDs.
     // CLUSTER NODES leads each address with the pod IP even when
@@ -501,7 +501,7 @@ pub async fn setup_replicas(
                     replica_index = replica_index,
                     "Replica already replicating master, skipping CLUSTER REPLICATE"
                 );
-                replica_client.close().await?;
+                let _ = replica_client.close().await;
                 continue;
             }
 
@@ -525,12 +525,12 @@ pub async fn setup_replicas(
                             "Replica already replicating, continuing"
                         );
                     } else {
-                        replica_client.close().await?;
+                        let _ = replica_client.close().await;
                         return Err(e.into());
                     }
                 }
             }
-            replica_client.close().await?;
+            let _ = replica_client.close().await;
 
             info!(
                 master_index = master_index,
