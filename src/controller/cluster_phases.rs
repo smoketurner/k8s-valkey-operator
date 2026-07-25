@@ -92,8 +92,16 @@ pub struct PhaseContext {
     pub target_masters: i32,
     /// Target replicas per master from spec.
     pub target_replicas_per_master: i32,
-    /// Current number of masters in the cluster (from CLUSTER INFO).
+    /// Number of *healthy* masters in the cluster, from `CLUSTER NODES`.
+    ///
+    /// Healthy means no `fail`/`pfail`/`handshake`/`noaddr` flag and a connected
+    /// link — the same predicate the scaling and evacuation handlers use, so the
+    /// phase transitions and the work they trigger can never disagree.
     pub current_masters: i32,
+    /// Number of masters the cluster knows about but reports as failed or
+    /// unreachable. Non-zero means there is a failure to recover from, which
+    /// blocks scale-down (see [`Self::scale_direction`]).
+    pub unhealthy_masters: i32,
     /// Number of running pods.
     pub running_pods: i32,
     /// Number of ready pods.
@@ -128,13 +136,20 @@ impl PhaseContext {
     /// The phase name encodes direction, but this is useful for Running phase
     /// to determine which phase to transition to.
     pub fn scale_direction(&self) -> ScaleDirection {
+        // A cluster with a failed master is recovering, not scaling. Slots cannot
+        // be evacuated from a master the operator cannot reach, so entering a
+        // scale-down here either spins forever or FORGETs a node that still owns
+        // slots (issue #169). Recover first; the reduction is re-detected once
+        // every master is healthy again.
+        if self.unhealthy_masters > 0 {
+            return ScaleDirection::None;
+        }
         // REDUCTIONS are real, spec-driven scale-downs and are NEVER gated on
-        // `spec_changed`. A failure only ever drops a live count BELOW target
-        // (it never adds masters or pods), so `current_masters > target_masters`
-        // or `running_pods > desired` can only mean the user reduced the spec.
-        // These must always go through graceful evacuation/forget before the
-        // StatefulSet shrinks (data-loss invariant) — even after the operator
-        // restarts mid-scale-down once `observed_generation` has caught up.
+        // `spec_changed`: once every master is healthy, a count above target can
+        // only mean the user reduced the spec. These must always go through
+        // graceful evacuation/forget before the StatefulSet shrinks (data-loss
+        // invariant) — even after the operator restarts mid-scale-down once
+        // `observed_generation` has caught up.
         if self.current_masters > self.target_masters && self.current_masters > 0 {
             return ScaleDirection::Down;
         }
@@ -1213,7 +1228,13 @@ pub async fn handle_degraded(
     // CRITICAL: Detect scale-down BEFORE applying resources to prevent race condition.
     // Same issue as handle_running - we must not reduce StatefulSet replicas until
     // slots are evacuated to prevent data loss.
-    if phase_ctx.current_masters > 0 {
+    //
+    // `unhealthy_masters == 0` keeps this in step with `scale_direction()`: a failed
+    // master means recovery, not scaling. Slots cannot be evacuated from a master the
+    // operator cannot reach, so scaling here either livelocks (the evacuator finds
+    // nothing to move) or FORGETs a node that still owns slots (issue #169). The
+    // reduction is re-detected once every master is healthy again.
+    if phase_ctx.current_masters > 0 && phase_ctx.unhealthy_masters == 0 {
         // Master scale-down: must evacuate slots first. NOT gated on
         // spec_changed — current > target can only be a real scale-down, and
         // skipping evacuation here would shrink the StatefulSet and lose data.
@@ -1354,6 +1375,7 @@ mod tests {
             target_masters: 6,
             target_replicas_per_master: 1,
             current_masters: 3,
+            unhealthy_masters: 0,
             running_pods: 6,
             ready_pods: 6,
             nodes_in_cluster: 6,
@@ -1372,6 +1394,7 @@ mod tests {
             target_masters: 3,
             target_replicas_per_master: 1,
             current_masters: 6,
+            unhealthy_masters: 0,
             running_pods: 12,
             ready_pods: 12,
             nodes_in_cluster: 12,
@@ -1382,6 +1405,87 @@ mod tests {
         assert_eq!(ctx.scale_direction(), ScaleDirection::Down);
     }
 
+    /// A failover must not be mistaken for a user-requested scale-down.
+    ///
+    /// Reproduces the `test_degraded_state` integration failure: a master pod
+    /// dies, its replica is promoted, and `CLUSTER NODES` then reports four
+    /// masters (the dead one plus the promotion) against a target of three.
+    /// Reading that as a scale-down sent the cluster to EvacuatingSlots, where
+    /// the evacuator counted only reachable masters, found 3 == target, did
+    /// nothing, and reported "in progress" forever — 52 identical reconciles
+    /// until stuck detection forced Failed.
+    #[test]
+    fn test_scale_direction_failover_is_not_scale_down() {
+        let ctx = PhaseContext {
+            name: "degraded-test".to_string(),
+            namespace: "default".to_string(),
+            target_masters: 3,
+            target_replicas_per_master: 1,
+            // Only the reachable masters count, and the promoted replica brings
+            // that back to target. The dead master is reported separately.
+            current_masters: 3,
+            unhealthy_masters: 1,
+            running_pods: 6,
+            // The replacement pod fails the `cluster_state:ok` probe until the
+            // operator re-joins it, so it is Running but not Ready.
+            ready_pods: 5,
+            nodes_in_cluster: 6,
+            spec_changed: false,
+            generation: 1,
+        };
+
+        assert_eq!(
+            ctx.scale_direction(),
+            ScaleDirection::None,
+            "a failed master is a recovery, not a scale-down"
+        );
+    }
+
+    /// The recovery guard must not swallow a genuine scale-down.
+    #[test]
+    fn test_scale_direction_down_still_detected_when_all_masters_healthy() {
+        let ctx = PhaseContext {
+            name: "test".to_string(),
+            namespace: "default".to_string(),
+            target_masters: 3,
+            target_replicas_per_master: 1,
+            current_masters: 6,
+            unhealthy_masters: 0,
+            running_pods: 12,
+            ready_pods: 12,
+            nodes_in_cluster: 12,
+            spec_changed: false,
+            generation: 1,
+        };
+
+        assert_eq!(
+            ctx.scale_direction(),
+            ScaleDirection::Down,
+            "scale-down is still never gated on spec_changed"
+        );
+    }
+
+    /// A reduction requested while a master is down waits for recovery rather
+    /// than evacuating slots from a node the operator cannot reach (issue #169).
+    #[test]
+    fn test_scale_direction_down_deferred_while_master_unhealthy() {
+        let ctx = PhaseContext {
+            name: "test".to_string(),
+            namespace: "default".to_string(),
+            target_masters: 3,
+            target_replicas_per_master: 1,
+            current_masters: 5,
+            unhealthy_masters: 1,
+            running_pods: 12,
+            ready_pods: 11,
+            nodes_in_cluster: 12,
+            spec_changed: true,
+            generation: 1,
+        };
+
+        assert_eq!(ctx.scale_direction(), ScaleDirection::None);
+    }
+
     #[test]
     fn test_scale_direction_none() {
         let ctx = PhaseContext {
@@ -1390,6 +1494,7 @@ mod tests {
             target_masters: 3,
             target_replicas_per_master: 1,
             current_masters: 3,
+            unhealthy_masters: 0,
             running_pods: 6,
             ready_pods: 6,
             nodes_in_cluster: 6,
@@ -1408,6 +1513,7 @@ mod tests {
             target_masters: 3,
             target_replicas_per_master: 2, // Changed from 1 to 2
             current_masters: 3,
+            unhealthy_masters: 0,
             running_pods: 6, // Still old count
             ready_pods: 6,
             nodes_in_cluster: 6,
@@ -1426,6 +1532,7 @@ mod tests {
             target_masters: 3,
             target_replicas_per_master: 2,
             current_masters: 3,
+            unhealthy_masters: 0,
             running_pods: 9,
             ready_pods: 9,
             nodes_in_cluster: 9,
@@ -1488,6 +1595,7 @@ mod tests {
             target_masters: 3,
             target_replicas_per_master: 1,
             current_masters: 0,
+            unhealthy_masters: 0,
             running_pods: 0,
             ready_pods: 0,
             nodes_in_cluster: 0,
@@ -1502,17 +1610,18 @@ mod tests {
 
     #[test]
     fn test_phase_context_transient_query_failure_not_scale_up() {
-        // Regression for issue #52: when get_current_master_count() returns
-        // Ok(0) on a transient connection error during Running phase, the
-        // scale direction must NOT flip to Up. This was the root cause of
-        // spurious ScalingUpStatefulSet transitions.
+        // Regression for issue #52: when get_cluster_counts() cannot reach the
+        // cluster it reports zero counts, and during Running phase the scale
+        // direction must NOT flip to Up. This was the root cause of spurious
+        // ScalingUpStatefulSet transitions.
         let ctx = PhaseContext {
             name: "test".to_string(),
             namespace: "default".to_string(),
             target_masters: 3,
             target_replicas_per_master: 1,
             current_masters: 0, // Simulated transient query failure.
-            running_pods: 6,    // Cluster is actually healthy.
+            unhealthy_masters: 0,
+            running_pods: 6, // Cluster is actually healthy.
             ready_pods: 6,
             nodes_in_cluster: 6,
             spec_changed: false,
@@ -1534,6 +1643,7 @@ mod tests {
             target_masters: 6,
             target_replicas_per_master: 1,
             current_masters: 3,
+            unhealthy_masters: 0,
             running_pods: 6,
             ready_pods: 6,
             nodes_in_cluster: 6,
