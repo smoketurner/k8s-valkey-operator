@@ -34,8 +34,14 @@ pub struct MockClusterState {
     pub target_masters: i32,
     /// Target replicas per master from spec.
     pub target_replicas_per_master: i32,
-    /// Current number of masters in the cluster (from CLUSTER INFO).
+    /// Number of *healthy* masters in the cluster (from `CLUSTER NODES`).
     pub current_masters: i32,
+    /// Number of masters the cluster reports as failed or unreachable.
+    ///
+    /// Mirrors `PhaseContext::unhealthy_masters`. A failover leaves the dead
+    /// master in `CLUSTER NODES` alongside the promoted replica, so this is how
+    /// a mock distinguishes "recovering from a failure" from "user scaled down".
+    pub unhealthy_masters: i32,
     /// Number of running pods.
     pub running_pods: i32,
     /// Number of ready pods.
@@ -63,6 +69,7 @@ impl MockClusterState {
             target_masters: masters,
             target_replicas_per_master: replicas_per_master,
             current_masters: 0,
+            unhealthy_masters: 0,
             running_pods: 0,
             ready_pods: 0,
             nodes_in_cluster: 0,
@@ -83,6 +90,7 @@ impl MockClusterState {
             target_masters: masters,
             target_replicas_per_master: replicas_per_master,
             current_masters: masters,
+            unhealthy_masters: 0,
             running_pods: total,
             ready_pods: total,
             nodes_in_cluster: total,
@@ -102,6 +110,7 @@ impl MockClusterState {
             target_masters: masters,
             target_replicas_per_master: replicas_per_master,
             current_masters: masters,
+            unhealthy_masters: 0,
             running_pods: ready,
             ready_pods: ready,
             nodes_in_cluster: ready,
@@ -121,6 +130,7 @@ impl MockClusterState {
             target_masters: masters,
             target_replicas_per_master: replicas_per_master,
             current_masters: masters,
+            unhealthy_masters: 0,
             running_pods: 0,
             ready_pods: 0,
             nodes_in_cluster: 0,
@@ -145,6 +155,7 @@ impl MockClusterState {
             target_masters: self.target_masters,
             target_replicas_per_master: self.target_replicas_per_master,
             current_masters: self.current_masters,
+            unhealthy_masters: self.unhealthy_masters,
             running_pods: self.running_pods,
             ready_pods: self.ready_pods,
             nodes_in_cluster: self.nodes_in_cluster,
@@ -283,6 +294,26 @@ impl MockClusterState {
         self.ready_pods = ready_count;
         self.running_pods = ready_count;
         self.nodes_in_cluster = ready_count;
+    }
+
+    /// Simulate a master pod dying and one of its replicas being promoted.
+    ///
+    /// The dead master stays in `CLUSTER NODES` alongside the promotion, so the
+    /// cluster reports one *more* master-flagged node than the spec asks for
+    /// while the healthy count is unchanged. The replacement pod is Running but
+    /// not Ready until the operator re-joins it (the readiness probe requires
+    /// `cluster_state:ok`).
+    pub fn simulate_master_failover(&mut self) {
+        self.unhealthy_masters += 1;
+        self.ready_pods = (self.ready_pods - 1).max(0);
+        self.phase = ClusterPhase::Degraded;
+    }
+
+    /// Simulate the replacement pod re-joining the cluster after a failover.
+    pub fn simulate_master_recovered(&mut self) {
+        self.unhealthy_masters = 0;
+        self.ready_pods = self.desired_replicas();
+        self.running_pods = self.desired_replicas();
     }
 
     /// Run the state machine until it reaches a stable Running state.

@@ -23,6 +23,7 @@ use kube::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    client::types::ParsedClusterNodes,
     controller::{
         cluster_init,
         cluster_phases::{self, ClusterHealthResult, FailedSpecChange, PhaseContext},
@@ -45,6 +46,20 @@ pub const FIELD_MANAGER: &str = "valkey-operator";
 
 /// Finalizer name for graceful deletion
 pub const FINALIZER: &str = "valkey-operator.smoketurner.com/finalizer";
+
+/// Record that stuck detection forced a resource to Failed.
+///
+/// Both stuck-detection branches return early, so they never reach the metric
+/// block at the end of `reconcile` — the phase gauge has to be set here or a
+/// wedged cluster would keep reporting whatever phase it was in when it jammed.
+fn record_stuck(ctx: &Context, namespace: &str, name: &str) {
+    if let Some(ref health_state) = ctx.health_state {
+        health_state.metrics.record_stuck_detection(namespace, name);
+        health_state
+            .metrics
+            .set_resource_phase(namespace, name, ClusterPhase::Failed);
+    }
+}
 
 /// Get the requeue duration for a given phase.
 fn requeue_duration(phase: ClusterPhase) -> std::time::Duration {
@@ -160,6 +175,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                 current_phase, reconcile_count, MAX_RECONCILE_COUNT, diagnostic_hint
             );
             error!(name = %name, phase = %current_phase, reconcile_count, "Stuck detection triggered");
+            record_stuck(&ctx, &namespace, &name);
             ctx.publish_warning_event(&obj, "StuckDetected", "Reconciling", Some(event_msg))
                 .await;
             StatusUpdate {
@@ -191,6 +207,7 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
                     current_phase, elapsed, MAX_STUCK_DURATION_SECS, diagnostic_hint
                 );
                 error!(name = %name, phase = %current_phase, elapsed_secs = elapsed, "Stuck detection triggered");
+                record_stuck(&ctx, &namespace, &name);
                 ctx.publish_warning_event(&obj, "StuckDetected", "Reconciling", Some(event_msg))
                     .await;
                 StatusUpdate {
@@ -216,22 +233,18 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
     let ready_pods = check_ready_replicas(&obj, &ctx, &namespace)
         .await
         .unwrap_or(0);
-    let current_masters = get_current_master_count(&obj, &ctx, &namespace)
-        .await
-        .unwrap_or(0);
-    let nodes_in_cluster = get_nodes_in_cluster_count(&obj, &ctx, &namespace)
-        .await
-        .unwrap_or(0);
+    let counts = get_cluster_counts(&obj, &ctx, &namespace).await;
 
     let phase_ctx = PhaseContext {
         name: name.clone(),
         namespace: namespace.clone(),
         target_masters: obj.spec.masters,
         target_replicas_per_master: obj.spec.replicas_per_master,
-        current_masters,
+        current_masters: counts.healthy_masters,
+        unhealthy_masters: counts.unhealthy_masters,
         running_pods,
         ready_pods,
-        nodes_in_cluster,
+        nodes_in_cluster: counts.nodes_in_cluster,
         spec_changed,
         generation: current_gen.unwrap_or(0),
     };
@@ -287,6 +300,9 @@ pub async fn reconcile(obj: Arc<ValkeyCluster>, ctx: Arc<Context>) -> Result<Act
             i64::from(desired_replicas),
             i64::from(ready_replicas_final),
         );
+        health_state
+            .metrics
+            .set_resource_phase(&namespace, &name, next_phase);
     }
 
     Ok(Action::requeue(requeue_duration(next_phase)))
@@ -1240,21 +1256,57 @@ async fn observe_replica_lags(
     lags
 }
 
-async fn get_current_master_count(
-    obj: &ValkeyCluster,
-    ctx: &Context,
-    namespace: &str,
-) -> Result<i32, Error> {
-    let pod_addresses = cluster_init::master_pod_dns_names(obj);
-    if pod_addresses.is_empty() {
-        return Ok(0);
+/// Counts derived from a single `CLUSTER NODES` snapshot.
+///
+/// Deriving every count from one snapshot is load-bearing. These counts used to
+/// come from two separate `CLUSTER NODES` calls, and the master count fed to the
+/// phase transitions counted *every* node flagged master while the scaling
+/// handlers counted only reachable ones. A promoted replica makes those two
+/// numbers disagree permanently, which livelocked recovery from a dead master.
+/// See [`crate::controller::cluster_phases::PhaseContext::scale_direction`].
+#[derive(Debug, Clone, Copy, Default)]
+struct ClusterCounts {
+    /// Masters the cluster reports as healthy: no `fail`/`pfail`/`handshake`/
+    /// `noaddr` flag, and a connected link.
+    healthy_masters: i32,
+    /// Masters known to the cluster but flagged failed or unreachable.
+    unhealthy_masters: i32,
+    /// Total nodes known to the cluster, healthy or not.
+    nodes_in_cluster: i32,
+}
+
+impl ClusterCounts {
+    /// Derive the counts from a parsed `CLUSTER NODES` snapshot.
+    ///
+    /// Split out from the I/O so the classification is unit-testable: this is
+    /// the step that decides whether a cluster is scaling or recovering.
+    fn from_nodes(nodes: &ParsedClusterNodes) -> Self {
+        let masters = nodes.masters();
+        let healthy = masters.iter().filter(|m| m.is_healthy()).count();
+
+        Self {
+            healthy_masters: healthy as i32,
+            unhealthy_masters: masters.len().saturating_sub(healthy) as i32,
+            nodes_in_cluster: nodes.nodes.len() as i32,
+        }
+    }
+}
+
+/// Read `CLUSTER NODES` once and derive every count the reconciler needs.
+///
+/// Returns all-zero counts when the cluster is unreachable. Callers must treat
+/// that as "no information" rather than "no masters" — `scale_direction()`
+/// requires `current_masters > 0` for exactly this reason (issue #52).
+async fn get_cluster_counts(obj: &ValkeyCluster, ctx: &Context, namespace: &str) -> ClusterCounts {
+    if cluster_init::master_pod_dns_names(obj).is_empty() {
+        return ClusterCounts::default();
     }
 
     let client = match ctx.connect_to_cluster(obj, namespace, 0).await {
         Ok(c) => c,
         Err(e) => {
-            debug!(error = %e, "Failed to connect to cluster for master count");
-            return Ok(0);
+            debug!(error = %e, "Failed to connect to cluster for counts");
+            return ClusterCounts::default();
         }
     };
 
@@ -1263,40 +1315,13 @@ async fn get_current_master_count(
         Err(e) => {
             debug!(error = %e, "Failed to get cluster nodes");
             let _ = client.close().await;
-            return Ok(0);
+            return ClusterCounts::default();
         }
     };
 
     let _ = client.close().await;
 
-    let masters = cluster_nodes.masters();
-    Ok(masters.len() as i32)
-}
-
-async fn get_nodes_in_cluster_count(
-    obj: &ValkeyCluster,
-    ctx: &Context,
-    namespace: &str,
-) -> Result<i32, Error> {
-    let client = match ctx.connect_to_cluster(obj, namespace, 0).await {
-        Ok(c) => c,
-        Err(e) => {
-            debug!(error = %e, "Failed to connect to cluster for node count");
-            return Ok(0);
-        }
-    };
-
-    let cluster_nodes = match client.cluster_nodes().await {
-        Ok(nodes) => nodes,
-        Err(e) => {
-            let _ = client.close().await;
-            debug!(error = %e, "Failed to get cluster nodes");
-            return Ok(0);
-        }
-    };
-
-    let _ = client.close().await;
-    Ok(cluster_nodes.nodes.len() as i32)
+    ClusterCounts::from_nodes(&cluster_nodes)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1456,6 +1481,60 @@ mod tests {
         SecretKeyRef, TlsSpec, ValkeyClusterSpec,
     };
     use std::collections::BTreeMap;
+
+    /// `CLUSTER NODES` for a 3-master cluster after the `10.0.0.2` master died
+    /// and its replica (`10.0.0.4`) was promoted, taking over slots 5461-10922.
+    ///
+    /// Four nodes carry the `master` flag but only three are reachable. This is
+    /// the state that livelocked `test_degraded_state`.
+    const NODES_AFTER_FAILOVER: &str = "\
+1111111111111111111111111111111111111111 10.0.0.1:6379@16379 myself,master - 0 1426238317239 1 connected 0-5460
+2222222222222222222222222222222222222222 10.0.0.2:6379@16379 master,fail - 0 1426238316232 2 disconnected
+3333333333333333333333333333333333333333 10.0.0.3:6379@16379 master - 0 1426238316232 3 connected 10923-16383
+4444444444444444444444444444444444444444 10.0.0.4:6379@16379 master - 0 1426238316232 7 connected 5461-10922
+5555555555555555555555555555555555555555 10.0.0.5:6379@16379 slave 1111111111111111111111111111111111111111 0 1426238316232 1 connected
+6666666666666666666666666666666666666666 10.0.0.6:6379@16379 slave 3333333333333333333333333333333333333333 0 1426238316232 3 connected";
+
+    /// A failed master must not inflate the count the phase transitions use.
+    ///
+    /// Counting every `master`-flagged node reported 4 against a target of 3,
+    /// which `scale_direction()` read as a user-requested scale-down. The
+    /// evacuation handler then counted only reachable masters, saw 3 == target,
+    /// did nothing, and reported "still in progress" on every reconcile.
+    #[test]
+    fn cluster_counts_exclude_failed_masters() {
+        let nodes = ParsedClusterNodes::parse(NODES_AFTER_FAILOVER).expect("fixture should parse");
+
+        let counts = ClusterCounts::from_nodes(&nodes);
+
+        assert_eq!(
+            counts.healthy_masters, 3,
+            "the promoted replica restores the master count to target"
+        );
+        assert_eq!(
+            counts.unhealthy_masters, 1,
+            "the dead master is still in CLUSTER NODES and must be reported separately"
+        );
+        assert_eq!(counts.nodes_in_cluster, 6);
+    }
+
+    /// The healthy case must be unaffected: no node is filtered out.
+    #[test]
+    fn cluster_counts_all_masters_healthy() {
+        let healthy = NODES_AFTER_FAILOVER
+            .replace("master,fail", "master")
+            .replace(
+                "1426238316232 2 disconnected",
+                "1426238316232 2 connected 5461-10922",
+            );
+        let nodes = ParsedClusterNodes::parse(&healthy).expect("should parse");
+
+        let counts = ClusterCounts::from_nodes(&nodes);
+
+        assert_eq!(counts.healthy_masters, 4);
+        assert_eq!(counts.unhealthy_masters, 0);
+        assert_eq!(counts.nodes_in_cluster, 6);
+    }
 
     fn create_test_cluster(name: &str, masters: i32, replicas_per_master: i32) -> ValkeyCluster {
         ValkeyCluster {

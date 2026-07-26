@@ -53,10 +53,16 @@ check: ## Run cargo check
 test: ## Run unit tests
 	$(CARGO) test --test unit
 
+test-lib: ## Run inline tests in src/ (the largest suite)
+	$(CARGO) test --lib
+
 test-functional: ## Run functional tests (no cluster required)
 	$(CARGO) test --test functional
 
-test-all: test test-functional ## Run all non-integration tests
+test-proptest: ## Run property-based tests
+	$(CARGO) test --test proptest
+
+test-all: test-lib test test-functional test-proptest ## Run all non-integration tests
 
 audit: ## Run security audit on dependencies
 	$(CARGO) audit

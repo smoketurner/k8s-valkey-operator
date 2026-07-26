@@ -36,9 +36,19 @@ jobs:
   integration:
     name: Integration Tests (kind)
     runs-on: ubuntu-latest
+    # issues: write is for the failure report at the end of the job. A failed
+    # scheduled run notifies nobody by default, which is how this suite stayed
+    # red for 17 consecutive nights without being noticed.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # This job holds an issues:write token; do not also leave git
+          # credentials in the checkout. gh uses GH_TOKEN, not git creds.
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -105,4 +115,29 @@ jobs:
               cargo test --test integration -- --ignored --test-threads=1 "${filters[@]}"
           else
             cargo test --test integration -- --ignored --test-threads=1
+          fi
+
+      # Only for scheduled runs: a workflow_dispatch failure is already in front
+      # of whoever triggered it. Keeps a single open issue and comments on it,
+      # so a suite that stays broken does not open one issue per night.
+      - name: Report nightly failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create integration-failure \
+            --color b60205 \
+            --description "Nightly integration suite is failing" \
+            --force
+          existing=$(gh issue list --state open --label integration-failure \
+            --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body "Still failing: ${RUN_URL}"
+          else
+            gh issue create \
+              --title "Nightly integration tests are failing" \
+              --label integration-failure \
+              --body "$(printf 'The nightly integration suite failed.\n\nRun: %s\n\nThis issue is updated on each failing nightly run. Close it once the suite is green.' "${RUN_URL}")"
           fi

@@ -5,6 +5,7 @@
 //! interruption handling.
 
 use crate::mock_state::{MockClusterState, expected_sequences};
+use valkey_operator::controller::cluster_phases::ScaleDirection;
 use valkey_operator::controller::cluster_state_machine::{ClusterEvent, TransitionResult};
 use valkey_operator::crd::ClusterPhase;
 
@@ -175,6 +176,43 @@ fn test_replica_scale_down_from_degraded() {
     // Complete the scale-down
     state.simulate_cluster_healthy();
     state.run_until_running(20);
+    assert_eq!(state.phase, ClusterPhase::Running);
+    assert_eq!(state.running_pods, 6);
+}
+
+/// A master failover must be recovered, never mistaken for a scale-down.
+///
+/// Regression for the `test_degraded_state` integration failure. Killing a
+/// master promotes one of its replicas, so `CLUSTER NODES` reports four
+/// master-flagged nodes against a target of three. Counting the dead master
+/// made `scale_direction()` return `Down`, which sent the cluster to
+/// EvacuatingSlots; the evacuator then counted only reachable masters, found
+/// three (already at target), did nothing, and reported "in progress" forever.
+#[test]
+fn test_master_failover_recovers_without_scale_down() {
+    let mut state = MockClusterState::running("failover-recovery", 3, 1);
+    state.simulate_master_failover();
+
+    // The spec did not change, so this is a recovery and not a reduction.
+    assert_eq!(
+        state.scale_direction(),
+        ScaleDirection::None,
+        "a failed master must not be read as a user-requested scale-down"
+    );
+
+    // Once the replacement pod re-joins, the cluster returns to Running without
+    // ever evacuating slots or shrinking the StatefulSet.
+    state.simulate_master_recovered();
+    let phases = state.run_until_running(20);
+
+    assert!(
+        !phases.contains(&ClusterPhase::EvacuatingSlots),
+        "recovery must not evacuate slots, got: {phases:?}"
+    );
+    assert!(
+        !phases.contains(&ClusterPhase::ScalingDownStatefulSet),
+        "recovery must not shrink the StatefulSet, got: {phases:?}"
+    );
     assert_eq!(state.phase, ClusterPhase::Running);
     assert_eq!(state.running_pods, 6);
 }

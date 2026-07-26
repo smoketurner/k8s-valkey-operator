@@ -928,6 +928,35 @@ pub enum ClusterPhase {
     Deleting,
 }
 
+impl ClusterPhase {
+    /// Every phase, for exhaustive iteration.
+    ///
+    /// Used by the per-phase gauge in [`crate::health`], which must zero the
+    /// phases a resource is *not* in so a stale series cannot keep reporting an
+    /// old phase after a transition.
+    pub const ALL: [ClusterPhase; 19] = [
+        ClusterPhase::Pending,
+        ClusterPhase::Creating,
+        ClusterPhase::WaitingForPods,
+        ClusterPhase::InitializingCluster,
+        ClusterPhase::AssigningSlots,
+        ClusterPhase::ConfiguringReplicas,
+        ClusterPhase::Running,
+        ClusterPhase::ScalingUpStatefulSet,
+        ClusterPhase::WaitingForNewPods,
+        ClusterPhase::AddingNodesToCluster,
+        ClusterPhase::RebalancingSlots,
+        ClusterPhase::ConfiguringNewReplicas,
+        ClusterPhase::EvacuatingSlots,
+        ClusterPhase::RemovingNodesFromCluster,
+        ClusterPhase::ScalingDownStatefulSet,
+        ClusterPhase::VerifyingClusterHealth,
+        ClusterPhase::Degraded,
+        ClusterPhase::Failed,
+        ClusterPhase::Deleting,
+    ];
+}
+
 impl std::fmt::Display for ClusterPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
