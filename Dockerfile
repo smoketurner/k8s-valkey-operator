@@ -1,5 +1,5 @@
 # Build stage - using Alpine for musl toolchain
-FROM rust:1.96-alpine AS builder
+FROM rust:1.98-alpine AS builder
 
 WORKDIR /app
 
